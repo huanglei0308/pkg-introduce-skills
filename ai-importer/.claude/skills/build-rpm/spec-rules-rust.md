@@ -1,0 +1,171 @@
+# Rust spec 规范
+
+当 `<lang>=rust` 时，spec 初稿应遵循以下规范，优先保证离线可重复构建。
+
+## 1. 适用范围
+
+适用于：
+- 存在 `Cargo.toml` + `Cargo.lock` 的 Rust 项目
+- 生成二进制（bin）或 C 动态库（cdylib）的项目
+
+不适用（直接阻断）：
+- `rust-toolchain.toml` 指定 `channel = "nightly"` → 标准容器不支持
+- 需要 `wasm32` 或其他非标准 target
+- 依赖私有 registry（非 crates.io）
+
+## 2. 构建前必检（生成 spec 前执行）
+
+```bash
+# 检查工具链要求
+if [ -f rust-toolchain.toml ]; then
+    REQUIRED=$(grep 'channel' rust-toolchain.toml | grep -oP '"[^"]+"' | tr -d '"')
+    if echo "$REQUIRED" | grep -q "nightly\|beta"; then
+        echo "BLOCK: 需要 $REQUIRED 工具链，标准容器不支持"
+        exit 1
+    fi
+fi
+
+# 检查 MSRV（Minimum Supported Rust Version）
+MSRV=$(grep 'rust-version' Cargo.toml | grep -oP '"[^"]+"' | tr -d '"')
+CONTAINER_RUSTC=$(docker exec ${SESSION_CONTAINER} rustc --version | grep -oP '\d+\.\d+\.\d+')
+# 若 MSRV > 容器 rustc，必须阻断，不得用 --ignore-rust-version 绕过
+```
+
+## 3. vendor 构建（强制要求）
+
+Rust RPM **必须使用 vendor + offline + locked 三件套**，不支持在线构建。
+
+### 3.1 生成 vendor
+
+```bash
+# 在容器内执行（必须记录 action_type=vendor_fetch 到 build_actions.json）
+docker exec ${SESSION_CONTAINER} bash -c "
+  cd /build/source
+  cargo vendor vendor/
+  # 验证完整性（每个 crate 必须有 .cargo-checksum.json）
+  find vendor/ -name '.cargo-checksum.json' | wc -l
+"
+# 导出 vendor tarball
+docker exec ${SESSION_CONTAINER} bash -c "
+  cd /build/source && tar czf /tmp/${pkgname}-vendor.tar.gz vendor/
+"
+docker cp ${SESSION_CONTAINER}:/tmp/${pkgname}-vendor.tar.gz \
+  ./sources/${pkgname}/${pkgname}-vendor.tar.gz
+```
+
+### 3.2 spec 结构
+
+```spec
+Source0: https://github.com/<owner>/<repo>/archive/v%{version}.tar.gz#/%{name}-%{version}.tar.gz
+Source1: %{name}-vendor.tar.gz
+
+%prep
+%autosetup -n %{name}-%{version}
+tar xf %{SOURCE1}
+
+# 配置 cargo 使用本地 vendor
+mkdir -p .cargo
+cat > .cargo/config.toml << 'EOF'
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+EOF
+
+%build
+export RUSTFLAGS="%{build_rustflags}"
+cargo build --release --offline --locked
+
+%install
+install -Dm755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
+```
+
+### 3.3 关键参数说明
+
+| 参数 | 原因 |
+|------|------|
+| `--offline` | 禁止访问网络，确保离线可重复构建 |
+| `--locked` | 强制使用 Cargo.lock，不更新依赖版本 |
+| `%{build_rustflags}` | 注入 openEuler 标准编译 flags（ASLR、PIE 等安全加固） |
+
+**严禁**：`--ignore-rust-version`（掩盖 MSRV 冲突，review-rpm 会标记 E 级错误）
+
+## 4. git 依赖处理
+
+Cargo.toml 中含 `git = "..."` 的依赖需特殊处理：
+
+```bash
+# 检查 git 依赖数量
+git_deps=$(grep -c 'git = ' Cargo.toml || true)
+if [ "$git_deps" -gt 0 ]; then
+    echo "WARN: 存在 $git_deps 个 git 依赖，需人工确认 vendor/ checksum"
+fi
+```
+
+git 依赖在 vendor/ 中以 checksum 方式固定版本，`cargo vendor` 会自动处理。若 `.cargo-checksum.json` 缺失或为空对象 `{}`，表示 vendor 不完整，构建会失败。
+
+## 5. 命名规则
+
+| 类型 | 命名规则 | 示例 |
+|------|---------|------|
+| 二进制工具 | 直接用项目名 | `ripgrep`、`fd-find` |
+| 库（cdylib） | `rust-<name>` | `rust-openssl` |
+| 系统库包装 | 与 C 库同名 | `libssl-devel` |
+
+## 6. BuildRequires / Requires
+
+```spec
+BuildRequires: rust
+BuildRequires: cargo
+# C 绑定项目额外需要：
+BuildRequires: gcc
+BuildRequires: openssl-devel  # 按实际依赖填写
+
+# 纯 Rust 静态链接通常无运行时 Requires
+# cdylib 项目按实际 .so 填写 Requires
+```
+
+## 7. MSRV 冲突处理
+
+| 情况 | 处理 |
+|------|------|
+| 容器 rustc >= MSRV | 正常构建 |
+| 容器 rustc < MSRV | **阻断**，不得使用 `--ignore-rust-version` |
+| MSRV 未声明 | 先尝试构建，失败再判断 |
+
+MSRV 冲突的正确解决方案：
+1. 引入更新版本的上游（若有低 MSRV 的旧版本）
+2. 等待 openEuler 升级 rust 版本
+3. 向上游提 PR 降低 MSRV
+
+## 8. 多二进制项目
+
+```spec
+%build
+export RUSTFLAGS="%{build_rustflags}"
+cargo build --release --offline --locked --bins
+
+%install
+for bin in target/release/%{name}*; do
+    [ -x "$bin" ] && install -Dm755 "$bin" %{buildroot}%{_bindir}/$(basename "$bin")
+done
+```
+
+## 9. %check
+
+```spec
+%check
+# 离线测试（不访问网络）
+cargo test --offline --locked -- --test-threads=1
+```
+
+## 10. 常见问题
+
+| 问题 | 原因 | 处理 |
+|------|------|------|
+| `cargo: no internet` | 未配置 vendored-sources | 检查 `.cargo/config.toml` |
+| `checksum mismatch` | vendor 与 Cargo.lock 不一致 | 重新执行 `cargo vendor` |
+| `crate not found in vendor` | vendor 不完整（git 依赖未下载）| `cargo vendor --sync Cargo.toml` |
+| `error: package ... not found` | `--locked` 与 Cargo.lock 版本不符 | 用同版本 Cargo.lock 重新生成 vendor |
+| `RUSTFLAGS` 导致链接失败 | openEuler flags 与某些 crate 不兼容 | 在 spec 中 unset 冲突 flag |

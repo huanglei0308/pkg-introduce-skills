@@ -1,0 +1,10 @@
+{
+  "aivideo_be": "/tmp/claude-ws/aivideo_be-791341ab",
+  "aivideo_be_test": "/tmp/claude-ws/aivideo_be_test-791341ab",
+  "aivideo_be_timing_test": "/tmp/claude-ws/aivideo_be_timing_test-791341ab",
+  "sites-faciles": "/tmp/claude-ws/sites-faciles-96aecea3",
+  "yellhorn-mcp": "/tmp/claude-ws/yellhorn-mcp-dfab918d",
+  "ome-zarr-py": "/tmp/claude-ws/ome-zarr-py-b5f36c3f",
+  "addons-code-manager": "/tmp/claude-ws/addons-code-manager-8dfc7862",
+  "fluentui": "/tmp/claude-ws/fluentui-e65df664"
+}

@@ -1,0 +1,149 @@
+{
+  "lang": "python",
+  "lessons": [
+    {
+      "pkgname": "python-diskcache",
+      "version": "5.6.3",
+      "date": "2026-05-21",
+      "applies_to": "python/setup.py-legacy",
+      "finding": "对仅有 setup.py、无 pyproject.toml 的 Python 包，%py3_build + %py3_install 是正确的保守构建路径。现代 setuptools（>= 58）会对直接调用 setup.py 输出 SetuptoolsDeprecationWarning，但不影响构建结果。不应在没有 pyproject.toml 的情况下强行使用 %pyproject_build，否则构建失败。",
+      "suggestion": "检查上游源码根目录：有 pyproject.toml → 用 %pyproject_build；仅有 setup.py → 用 %py3_build；同时存在 → 优先 %pyproject_build。可在 spec 注释标注所用构建系统及原因。"
+    },
+    {
+      "pkgname": "python-diskcache",
+      "version": "5.6.3",
+      "date": "2026-05-21",
+      "applies_to": "python/buildrequires-placement",
+      "finding": "openEuler Python 包 spec 中，BuildRequires 应统一声明在第一个 %package 指令之前的主包 preamble 区。将 BuildRequires 放入子包（如 %package -n python3-xxx）stanza 内，RPM 可接受但违反社区惯例，影响 spec 可读性和自动化审查工具的解析。",
+      "suggestion": "生成 spec 时将所有 BuildRequires 集中放在主 preamble（Name/Version/Release/... 之后，%description 之前），子包 stanza 内不重复声明 BuildRequires。"
+    },
+    {
+      "pkgname": "python-diskcache",
+      "version": "5.6.3",
+      "date": "2026-05-21",
+      "applies_to": "python/compat-provides",
+      "finding": "为保持兼容性添加 Provides: python-<pkgname>（不带版本号）时，rpmlint 2.7+ 会报 W: unversioned-explicit-provides。这是社区已知误报：Python 包的兼容名 Provides 本身就不应约束版本，属正常用法。",
+      "suggestion": "此 W 可忽略，无需为兼容性 Provides 添加版本号。若 CI 对 rpmlint W 有零容忍要求，可在 rpmlint 配置中添加 unversioned-explicit-provides 的包名过滤规则。"
+    },
+    {
+      "pkgname": "python-schedule",
+      "version": "1.2.2",
+      "date": "2026-05-21",
+      "applies_to": "python/pyproject-license-table",
+      "finding": "部分使用旧版 pyproject.toml 写法（project.license 为 TOML table，如 {text = 'MIT'}）的包，在 setuptools>=77 构建时会产生 SetuptoolsDeprecationWarning，License classifier 也同样触发警告。这些均为上游 pyproject.toml 历史写法问题，不影响当前 RPM 构建结果，spec 无需修改。",
+      "suggestion": "构建日志出现此类 SetuptoolsDeprecationWarning 时不必修改 spec，只需在引入记录中备注。若未来 setuptools 将其升级为构建错误，需向上游提 patch 或在 spec %prep 中 patch pyproject.toml 改为 SPDX string 格式（project.license = 'MIT'）。"
+    },
+    {
+      "pkgname": "graphql-core",
+      "version": "3.2.8",
+      "date": "2026-05-21",
+      "applies_to": "python/no-buildroot-tag",
+      "finding": "现代 RPM 无需显式 BuildRoot 字段，rpmlint 2.7 仍会对不含 BuildRoot 的 spec 报 W: no-buildroot-tag，属于已知误报。在 openEuler 构建环境中此警告普遍存在，无需在 spec 中加回 BuildRoot 行。",
+      "suggestion": "遇到 W: no-buildroot-tag 时直接忽略，不必在 spec 中添加 BuildRoot: %{_tmppath}/... 行。若 CI 对此有零容忍，可在 rpmlint 配置中过滤该规则。"
+    },
+    {
+      "pkgname": "graphql-core",
+      "version": "3.2.8",
+      "date": "2026-05-21",
+      "applies_to": "python/poetry-core-pyproject",
+      "finding": "以 poetry-core 为构建后端的 Python 包（pyproject.toml 中 build-backend = 'poetry.core.masonry.api'），最小 BuildRequires 为 python3-devel + pyproject-rpm-macros + python3-poetry-core，构建用 %pyproject_build + %pyproject_install。从 PyPI 下载的 source tarball 无需 lockfile 参数，因为 tarball 已固定所有文件版本。",
+      "suggestion": "凡 pyproject.toml 声明 poetry-core 后端的包，直接添加 python3-poetry-core 到 BuildRequires；%build/%install 使用 %pyproject_build/%pyproject_install；Source0 用 %{pypi_source} 宏保证不可变 URL。"
+    },
+    {
+      "pkgname": "ngs_mapper",
+      "version": "1.5.0",
+      "date": "2026-05-26",
+      "applies_to": "python/py2-codebase-packaging",
+      "finding": "Python 2 遗留代码库（含 print 语句、except X, e: 语法）用 Python 3 工具链打包时，直接用 %py3_install 或让 brp-python-bytecompile 处理安装文件会导致 SyntaxError。需两步规避：①spec 顶部用 %global __os_install_post 抑制 brp-python-bytecompile；②%install 中用 python3 setup.py install --no-compile --skip-build --root %{buildroot} 代替 %py3_install，--no-compile 避免安装阶段字节编译。%py3_build（bdist）阶段不受影响，可正常使用。",
+      "suggestion": "遇到 Python 2 代码库时，spec 顶部加 %global __os_install_post 行抑制 brp-python-bytecompile，%install 改用 python3 setup.py install --no-compile --skip-build --root %{buildroot}，并在注释中说明原因（Python 2 codebase）。%check section 可省略，因 Python 2 测试在 Python 3 解释器下无法运行，但建议在 spec 注释中说明。"
+    },
+    {
+      "pkgname": "atlassian-python-api",
+      "version": "4.0.8",
+      "date": "2026-05-26",
+      "applies_to": "python/network-api-wrapper",
+      "finding": "纯 REST API 客户端包（如 atlassian-python-api）的测试套件依赖真实外部服务（Jira/Confluence/Bitbucket 等），在离线 RPM 构建环境中无法运行。省略 %check section 是合理选择，但必须在 spec 中添加注释说明原因，否则维护者会误以为遗漏了测试。",
+      "suggestion": "对需要外部服务的 API 客户端包，在 spec 的 %check 位置添加注释：# Tests require live <ServiceName> access and cannot run in offline build environment。不要添加空的 %check section，也不要强行 mock 测试（会引入额外 BuildRequires）。"
+    },
+    {
+      "pkgname": "atlassian-python-api",
+      "version": "4.0.8",
+      "date": "2026-05-27",
+      "applies_to": "python/help-subpkg-requires",
+      "finding": "%package help 必须声明 Requires: python3-<pkgname>，否则 help 包安装后主包未被自动拉入。rpmlint 不会对此告警，需人工检查。",
+      "suggestion": "生成含 %package help 的 Python spec 时，自动在 %package help 下添加 Requires: python3-<pkgname>。"
+    },
+    {
+      "pkgname": "atlassian-python-api",
+      "version": "4.0.8",
+      "date": "2026-05-27",
+      "applies_to": "python/help-subpkg-license",
+      "finding": "%files help 必须包含 %license LICENSE，否则 help 包缺少 license 信息。rpmlint 不会对此告警，需人工检查。",
+      "suggestion": "生成含 %files help 的 Python spec 时，在 %files help section 中自动包含 %license LICENSE。"
+    },
+    {
+      "pkgname": "httpx",
+      "version": "0.28.1",
+      "date": "2026-05-27",
+      "applies_to": "python/dist-metadata-wildcard-dep",
+      "finding": "httpx 的 dist-info/METADATA 含 'Requires-Dist: httpcore==1.*'，RPM 自动依赖生成脚本 pythondistdeps.py 读取此字段时产生 'Illegal char * in 1.*' 构建错误。需在 %install 后用 find+xargs+sed 删除 METADATA 中含通配符的 Requires-Dist 行。__requires_exclude 宏无效，必须直接修改文件。",
+      "suggestion": "遇到 'Illegal char * in ...' 错误时，检查 dist-info/METADATA 的 Requires-Dist 字段是否含 == N.* 通配符。用以下 %install 后补丁处理：find %{buildroot}%{python3_sitelib} -name 'METADATA' -path '*/<pkgname>*' | xargs -r sed -i '/^Requires-Dist: <dep>/d'"
+    },
+    {
+      "pkgname": "rabbitmq-amqp-python-client",
+      "version": "0.1.0",
+      "date": "2026-05-28",
+      "applies_to": "python/versioned-requires-pkgname",
+      "finding": "手写 Requires 时将版本号嵌入包名（如 python3-python-qpid-proton-0.39）是非标准写法，与 pythondistdeps.py 自动生成的 python3.11dist(...) Requires 不一致，可能导致依赖解析异常或安装时找不到对应包名。",
+      "suggestion": "生成 Python spec 时，手写 Requires 统一使用 python3-<pkgname> >= <version> 格式，不在包名中嵌入版本号。若 pythondistdeps.py 已自动生成正确的 dist Requires，可省略手写 Requires 避免重复。"
+    },
+    {
+      "pkgname": "rabbitmq-amqp-python-client",
+      "version": "0.1.0",
+      "date": "2026-05-28",
+      "applies_to": "python/hatchling-pip-wheel-fallback",
+      "finding": "以 hatchling 为构建后端的 Python 包（pyproject.toml build-backend = 'hatchling.build'），若容器内 %pyproject_build 宏链不可用，可用 pip3 wheel --no-build-isolation --no-deps -w wheelhouse . + pip3 install --no-build-isolation --no-deps --prefix=%{_prefix} --root %{buildroot} wheelhouse/*.whl 作为 fallback。需在 %build 前 export PYTHONPATH 指向 pip 安装的 hatchling 路径（如 /usr/local/lib/python3.11/site-packages）。",
+      "suggestion": "优先尝试 %pyproject_build + %pyproject_install（需 BuildRequires: python3-hatchling + pyproject-rpm-macros）。若宏不可用，使用 pip-wheel fallback 并在 spec 注释中说明原因。Source0 用 PyPI 不可变 tarball URL，无需 lockfile。"
+    },
+    {
+      "pkgname": "pyyaml",
+      "version": "6.0.3",
+      "date": "2026-05-28",
+      "applies_to": "python/c-extension-lto-flags",
+      "finding": "含 Cython C 扩展且链接系统 C 库（如 libyaml）的 Python 包，在 openEuler aarch64 构建环境中需在 spec %build section 顶部加 %define _lto_cflags %{nil} 和 %undefine _hardened_build，否则 LTO/BTI 相关编译标志可能导致链接失败或运行时崩溃。",
+      "suggestion": "凡 Python 包含 Cython 扩展并链接外部 C 库（libyaml、libxml2 等），在 %build section 顶部加两行：%define _lto_cflags %{nil} 和 %undefine _hardened_build，并在注释中说明原因（C extension: disable LTO/BTI for aarch64 compatibility）。"
+    },
+    {
+      "pkgname": "ome-zarr-py",
+      "version": "0.3.2.dev0",
+      "date": "2026-05-29",
+      "applies_to": "python/github-archive-tarball-naming",
+      "finding": "GitHub archive URL（/archive/<commit>.tar.gz）生成的 tarball 解压目录名为 <repo_name>-<commit>，其中 repo_name 是 GitHub 仓库名（如 ome-zarr-py），而非 PyPI 包名（如 ome-zarr）。两者不一致时，spec 的 Source0 文件名和 %autosetup -n 参数必须使用仓库名，否则 %prep 阶段报 No such file or directory。",
+      "suggestion": "生成 spec 前确认 GitHub 仓库名与 PyPI 包名是否一致。若不一致，Source0 tarball 文件名和 %autosetup -n 参数均使用仓库名（如 ome-zarr-py-%{upstream_version}），而非 PyPI 包名（如 ome-zarr-%{version}）。"
+    },
+    {
+      "pkgname": "ome-zarr-py",
+      "version": "0.3.2.dev0",
+      "date": "2026-05-29",
+      "applies_to": "python/dev-version-spec-version",
+      "finding": "PyPI dev 版本（如 0.3.2.dev0）在 RPM spec 中需转换为 0.3.2~dev0（用 ~ 替换 .dev），同时用 %global upstream_version 保留原始版本字符串供 Source0 URL 和 %autosetup -n 使用。两套版本号并存是正确做法，不应统一为 RPM 格式或 PyPI 格式。",
+      "suggestion": "遇到 .devN、.aN、.bN、.rcN 等 PEP 440 预发布版本时，spec Version 字段用 ~ 替换分隔符（0.3.2.dev0 → 0.3.2~dev0），并用 %global upstream_version 0.3.2.dev0 保留原始字符串。"
+    },
+    {
+      "pkgname": "ome-zarr-py",
+      "version": "0.10.3",
+      "date": "2026-05-30",
+      "applies_to": "python/setuptools-scm-version-compat",
+      "finding": "使用 setuptools_scm 的包若 pyproject.toml [tool.setuptools_scm] 含 `version_file = \".../_version.py\"` 字段（setuptools_scm 8.0+ 语法），在 openEuler 容器中 setuptools_scm 7.x 环境下会报 KeyError 或配置解析错误导致构建失败。修复方式：在 spec %prep 中用 sed 将 `version_file = \"...\"` 替换为 `fallback_version = \"%{version}\"`，并在 %build 和 %install 中 export SETUPTOOLS_SCM_PRETEND_VERSION=%{version}，防止 setuptools_scm 尝试从 git tag 推断版本（构建环境无 git history）。",
+      "suggestion": "凡 pyproject.toml [tool.setuptools_scm] 含 version_file 字段的包，在 spec %prep 中加：sed -i 's/version_file = \"<path>\"/fallback_version = \"%{version}\"/' pyproject.toml，并在 %build/%install 中 export SETUPTOOLS_SCM_PRETEND_VERSION=%{version}。两者配合使用，缺一则可能因 git history 缺失导致版本推断失败。"
+    },
+    {
+      "pkgname": "ome-zarr-py",
+      "version": "0.10.3",
+      "date": "2026-05-30",
+      "applies_to": "python/pypi-tarball-module-name",
+      "finding": "PyPI source tarball（%pypi_source 宏生成 URL）下载解压后，目录名为 <module_name>-<version>，module_name 是 Python import 名（下划线分隔，如 ome_zarr），而非 PyPI 包名（连字符分隔，如 ome-zarr）。若 %autosetup -n 使用 %{pypi_name}-%{version}（连字符），%prep 阶段报 'no such file or directory'。此问题与 GitHub archive tarball 命名规则无关，是 PyPI sdist 的固有命名约定。",
+      "suggestion": "生成 Python spec 时同时定义 %global pypi_name（连字符，供 %pypi_source URL 使用）和 %global module_name（下划线，供 %autosetup -n 使用）。%autosetup 行写作 %autosetup -n %{module_name}-%{version} -p1，不要写 %{pypi_name}-%{version}。"
+    }
+  ]
+}

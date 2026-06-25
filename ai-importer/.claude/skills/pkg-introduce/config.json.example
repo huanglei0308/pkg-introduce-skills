@@ -1,0 +1,25 @@
+{
+  "gitcode": {
+    "base_url": "https://gitcode.com/api/v5",
+    "token": "<YOUR_GITCODE_TOKEN>"
+  },
+  "repo": {
+    "remote_url": "https://gitcode.com/<org>/<rpm-repo>.git",
+    "branch": "main",
+    "local_dir": "/root/.claude/skills/rpm-repo"
+  },
+  "repo_check": {
+    "inactive_days_threshold": 1825,
+    "blocking": false
+  },
+  "license_check": {
+    "enabled": false
+  },
+  "version_check": {
+    "allow_unstable": true
+  },
+  "dep_conflict": {
+    "mode": "force_compat",
+    "_comment": "block: 社区源有旧版时阻断（默认安全）; compat: 用 compat 包名引入新版本与社区版本共存，仅对 nodejs/c/cpp/java/ruby 生效，Python/Go/Rust 因路径冲突强制 block; force_compat: 所有语言均强制 compat，包名格式为 <原包名>-<主版本号>，如 python3-requests-2.32"
+  }
+}

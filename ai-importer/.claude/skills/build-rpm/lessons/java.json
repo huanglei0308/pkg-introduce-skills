@@ -1,0 +1,57 @@
+[
+  {
+    "applies_to": "maven/multi-module",
+    "lesson": "When a project's processor module uses annotation processing in its own compilation (e.g., mapstruct-processor uses gem-processor to generate *Gem.java classes), xmvn offline cannot resolve annotationProcessorPaths entries. Use a three-phase build: (1) build only the core/API modules with 'xmvn ... --projects parent,build-config,core package', (2) run 'javac -proc:only' manually using system-installed processor jars, copy generated sources into the source tree, (3) run full '%mvn_build -f'. Also add '%pom_xpath_remove' on annotationProcessorPaths and '%pom_xpath_inject' '<compilerArgs><arg>-proc:none</arg></compilerArgs>' to stop Maven from re-running annotation processing during step 3.",
+    "example": "mapstruct 1.6.3"
+  },
+  {
+    "applies_to": "maven/annotation-processor",
+    "lesson": "After manually pre-generating annotation-processor output via 'javac -proc:only', you MUST both remove annotationProcessorPaths from maven-compiler-plugin config AND inject '-proc:none' as a compilerArg. Removing only annotationProcessorPaths is insufficient: Maven will still run annotation discovery and may attempt to re-invoke processors found on the classpath, causing conflicts or redundant generation.",
+    "example": "mapstruct 1.6.3"
+  },
+  {
+    "applies_to": "maven/osgi",
+    "lesson": "Removing maven-bundle-plugin cascades to maven-jar-plugin: any module that references bundle-generated OSGi manifests via '<archive><manifestFile>target/classes/META-INF/MANIFEST.MF</manifestFile></archive>' in maven-jar-plugin configuration will fail with a missing-file error once maven-bundle-plugin is gone. After '%pom_remove_plugin -r :maven-bundle-plugin', scan each module's pom.xml for maven-jar-plugin archive/manifestFile references and remove them with '%pom_xpath_remove ... pom:plugin[pom:artifactId=\\'maven-jar-plugin\\']/pom:configuration/pom:archive'.",
+    "example": "mapstruct 1.6.3 (core/pom.xml)"
+  },
+  {
+    "applies_to": "maven/jakarta",
+    "lesson": "jakarta.xml.bind:jakarta.xml.bind-api 3.x (Jakarta EE 9+ JAXB) is not available on openEuler. Source files that import jakarta.xml.bind.* must be removed with 'rm -f', and any class references in surviving files must be purged via 'sed -i'. The older javax.xml.bind (JAXB 2.x, available as jaxb-api package) still works. Use '%pom_remove_dep jakarta.xml.bind:jakarta.xml.bind-api <module>/pom.xml' to drop the Maven dependency.",
+    "example": "mapstruct 1.6.3 (JakartaGemGenerator.java, JakartaCdiComponentProcessor.java, JakartaComponentProcessor.java, JakartaXmlElementDeclSelector.java)"
+  },
+  {
+    "applies_to": "maven/shade",
+    "lesson": "Dependencies that are shaded into a fat jar via maven-shade-plugin should be marked '<optional>true</optional>' in pom.xml using '%pom_xpath_inject'. This prevents xmvn from emitting runtime RPM Requires for libraries that are already bundled inside the jar. Without optional marking, xmvn generates Requires for shaded libs that consumers do not actually need as separate packages.",
+    "example": "mapstruct 1.6.3 (freemarker and gem-api shaded into mapstruct-processor)"
+  },
+  {
+    "applies_to": "maven/annotation-processor",
+    "lesson": "When running a gem-processor (or any annotation processor) via 'javac -proc:only' to regenerate *Gem.java files, delete the existing hand-written or Java-8-era stub for any *Gem.java that uses Java 9+ @Deprecated(since=, forRemoval=) attributes BEFORE running javac. The old source-tree version and the freshly generated one will conflict at compile time if both exist. In mapstruct: rm -f processor/src/main/java/org/mapstruct/ap/internal/gem/DeprecatedGem.java before the javac step.",
+    "example": "mapstruct 1.6.3 (DeprecatedGem.java lacks since/forRemoval attributes in Java 8 version)"
+  },
+  {
+    "applies_to": "maven/multi-module",
+    "lesson": "For partial reactor builds that must precede the main %mvn_build, call 'xmvn --batch-mode --offline' directly rather than using %mvn_build. The %mvn_build macro always appends 'xmvn-mojo:install xmvn-mojo:builddep maven-javadoc-plugin:aggregate' goals which are inappropriate for a partial/bootstrap build and may fail if not all modules are present.",
+    "example": "mapstruct 1.6.3 step 1: xmvn ... --projects parent,build-config,core package"
+  },
+  {
+    "applies_to": "maven/multi-module",
+    "lesson": "%pom_disable_module calls must come before any '%pom_remove_plugin -r' or '%pom_remove_dep -r' sweeps. The -r (recursive) flag processes all sub-module pom.xml files; if a disabled module's directory does not exist or has already been excluded, the recursive sweep may error on missing pom.xml. Disable modules first, then do the recursive plugin/dep removal.",
+    "example": "mapstruct 1.6.3 (core-jdk8, integrationtest, distribution, documentation disabled before -r sweeps)"
+  },
+  {
+    "applies_to": "maven/multi-module",
+    "lesson": "arquillian BOM imports in <dependencyManagement> (org.jboss.arquillian:arquillian-bom) block offline xmvn builds even when the arquillian integration test module is disabled via %pom_disable_module. xmvn resolves dependencyManagement imports from the parent POM before checking whether the modules that use them are enabled. Always remove arquillian/weld BOM entries from parent/pom.xml with '%pom_remove_dep -r'.",
+    "example": "mapstruct 1.6.3 (parent/pom.xml had arquillian-bom even though integrationtest module was disabled)"
+  },
+  {
+    "applies_to": "maven/annotation-processor",
+    "lesson": "On openEuler, org.mapstruct.tools.gem jars are installed under /usr/share/java/tools-gem/ (gem-api.jar and gem-processor.jar), not under the standard xmvn artifact path. When constructing the -processorpath and -classpath for a manual 'javac -proc:only' invocation, reference these system paths directly. BuildRequires should list 'mvn(org.mapstruct.tools.gem:gem-api)' and 'mvn(org.mapstruct.tools.gem:gem-processor)'.",
+    "example": "mapstruct 1.6.3: -processorpath /usr/share/java/tools-gem/gem-processor.jar -classpath ...:/usr/share/java/tools-gem/gem-api.jar"
+  },
+  {
+    "applies_to": "maven/javadoc",
+    "lesson": "maven-javadoc-plugin 3.x emits '[ERROR] no module descriptor for <artifact>' for projects that lack module-info.java (non-modular projects). These are informational errors only and do NOT fail the build. Suppress the noise mentally — the javadoc aggregation still succeeds and the javadoc files are installed correctly.",
+    "example": "mapstruct 1.6.3 (all 5 modules triggered this message; build still succeeded)"
+  }
+]

@@ -1,0 +1,15 @@
+{
+  "image": {
+    "base_url": "https://repo.openeuler.org",
+    "branch": "openEuler-24.03-LTS-SP3",
+    "build": "",
+    "arch": "aarch64",
+    "tag": "openeuler-24.03-lts-sp3:latest",
+    "filename_prefix": "openEuler-docker"
+  },
+  "container": {
+    "name": "oe-build-env",
+    "source_mount": "/build/source",
+    "platform": "linux/arm64"
+  }
+}

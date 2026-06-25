@@ -1,0 +1,94 @@
+{
+  "lang": "go",
+  "lessons": [
+    {
+      "pkgname": "woodpecker",
+      "version": "0.15.0",
+      "date": "2026-05-26",
+      "applies_to": "go/embed",
+      "finding": "使用 go:embed 内嵌静态资源（如 web/dist）的 Go 项目，在离线 RPM 构建中需要在 %prep 阶段创建占位目录和最小占位文件，否则 go build 报 'pattern web/dist: directory prefix web/dist does not exist' 错误",
+      "suggestion": "在 %prep 末尾添加 mkdir -p <embed-dir> && echo '<placeholder>' > <embed-dir>/index.html；并在 %description 中说明'不包含完整前端 UI'"
+    },
+    {
+      "pkgname": "woodpecker",
+      "version": "0.15.0",
+      "date": "2026-05-26",
+      "applies_to": "go/offline-build",
+      "finding": "Go 离线构建（GOPROXY=off）依赖 vendor 目录时，go build 命令应显式添加 -mod=vendor，尽管 Go toolchain 会自动探测 vendor/；未显式声明在 vendor 目录缺失时错误信息不够清晰",
+      "suggestion": "所有 go build / go install 命令统一添加 -mod=vendor；若确实需要 GOPROXY=off 且无 vendor，则需在 Source 中打包 vendor tarball"
+    },
+    {
+      "pkgname": "woodpecker",
+      "version": "0.15.0",
+      "date": "2026-05-26",
+      "applies_to": "go/multi-binary",
+      "finding": "含多个 cmd/* 入口点的 Go 项目（如 woodpecker 的 agent/server/cli），建议拆分为多个子包（%package agent/server/cli），主包作为元包仅含 %license/%doc，可执行文件按功能归入对应子包",
+      "suggestion": "主包 %files 只写 %license 和 %doc；各子包 %files 各写对应的 %{_bindir}/<binary>；子包 Summary 简述各组件职责"
+    },
+    {
+      "pkgname": "woodpecker",
+      "version": "0.15.0",
+      "date": "2026-05-26",
+      "applies_to": "go/cgo-sqlite",
+      "finding": "引入依赖 SQLite 的 Go 项目时，必须设置 CGO_ENABLED=1 并添加 BuildRequires: sqlite-devel 和 glibc-devel，否则 CGO 调用链接阶段报找不到 sqlite3.h",
+      "suggestion": "BuildRequires 最小集合：golang >= <min-version>、gcc、glibc-devel、sqlite-devel（sqlite 依赖场景）；%build 开头 export CGO_ENABLED=1"
+    },
+    {
+      "pkgname": "kthena",
+      "version": "0.2.0~rc0.20260123git236cfeaf",
+      "date": "2026-05-26",
+      "applies_to": "go/buildvcs-false",
+      "finding": "Go 1.18+ 默认会尝试从 VCS（git/svn 等）读取提交信息嵌入二进制；在 RPM %build 环境中源码从 tarball 解压，无 VCS 元数据，go build 会报 'error obtaining VCS status: exit status 128'。设置 GOFLAGS=-buildvcs=false 或在 go build 命令追加 -buildvcs=false 可安全关闭此行为",
+      "suggestion": "所有通过 tarball 构建的 Go 包（非 git clone），%build 均应设置 export GOFLAGS=-buildvcs=false；同时可移除 BuildRequires: git，因为 VCS 查询已被关闭"
+    }
+    ,
+    {
+      "pkgname": "php-parser",
+      "version": "0.8.0~rc2.20210731git44bbff6",
+      "date": "2026-05-26",
+      "applies_to": "go/vendor-missing",
+      "finding": "Go spec 中若同时出现 GOPROXY=<外部镜像地址>（如 goproxy.cn）和 GONOSUMDB=*，通常表明作者依赖在线下载依赖而非 vendor 目录；这是在线构建的诊断信号，在离线 RPM 构建（OBS/mock）中将失败",
+      "suggestion": "发现 GOPROXY 指向非 off 地址时，检查源码包是否含 vendor 目录；若无，需执行 go mod vendor 生成 vendor tarball，以 Source1 形式打包，%prep 中解包，go build 添加 -mod=vendor，GOPROXY 改为 off，删除 GONOSUMDB"
+    },
+    {
+      "pkgname": "vega",
+      "version": "0.23.1.20200903gitd44074135",
+      "date": "2026-05-26",
+      "applies_to": "go/license-missing",
+      "finding": "Go RPM 包中容易遗漏 %license 宏：仅写 %doc README.md 而不写 %license LICENSE，导致安装后缺少 license 文件。含多个子包时每个 %files section 都需要单独声明 %license",
+      "suggestion": "Go spec 的每个 %files section（主包和所有子包）均应包含 %license LICENSE 行；构建前先确认源码包内 license 文件的实际名称（LICENSE、LICENSE.md、LICENSE.txt 等）"
+    },
+    {
+      "pkgname": "g0s",
+      "version": "0.0.1",
+      "date": "2026-05-26",
+      "applies_to": "go/vendor-tarball-source1",
+      "finding": "vendor tarball 以 Source1 形式打包时，rpmlint 会报 W: invalid-url Source1，因为本地生成的 tarball 无上游 URL；这是预期行为，不需要修复，也不应将其误判为 E 级问题",
+      "suggestion": "遇到 Source1 为 vendor tarball 时，W: invalid-url Source1 可直接忽略；在 spec 注释中说明 'vendor tarball generated locally via go mod vendor' 有助于维护者理解"
+    },
+    {
+      "pkgname": "g0s",
+      "version": "0.0.1",
+      "date": "2026-05-26",
+      "applies_to": "go/cgo-disabled-gcc",
+      "finding": "CGO_ENABLED=0 的纯 Go 项目不需要 C 编译器，BuildRequires: gcc 是多余的；仅在 CGO_ENABLED=1 或依赖 cgo 的包（如 sqlite、openssl 绑定）时才需要 gcc",
+      "suggestion": "纯 Go 项目（CGO_ENABLED=0）的 BuildRequires 最小集合为 golang >= <min-version>，无需 gcc；检查 spec %build 中 CGO_ENABLED 值来决定是否需要 gcc"
+    },
+    {
+      "pkgname": "status-go",
+      "version": "2.3.0",
+      "date": "2026-05-26",
+      "applies_to": "go/cgo-vendor-patch",
+      "finding": "CGO 项目 vendor 目录中的 C 源文件可能包含 GCC 版本相关的 target attribute 语法差异：GCC 12+ 在 ARM64 上要求 __attribute__((target(\"+aes,+crypto\")))，而旧版写法 __attribute__((target(\"aes,crypto\"))) 会导致编译报错。需在 %prep 中用 sed 对 vendor 内 C 文件打补丁",
+      "suggestion": "在 %prep 末尾添加针对性 sed 补丁，格式：sed -i 's/__attribute__((target(\"aes,crypto\")))/__attribute__((target(\"+aes,+crypto\")))/g' vendor/<path>/<file>.c；并在注释中说明 GCC 版本和上游 issue"
+    },
+    {
+      "pkgname": "status-go",
+      "version": "2.3.0",
+      "date": "2026-05-26",
+      "applies_to": "go/vendor-direct-edit-antipattern",
+      "finding": "CGO 项目 vendor 目录中的 C 文件需要补丁时，build-rpm 可能先直接编辑 vendor 文件（edit_file），再在 spec %prep 中补充等效 sed 补丁。这种'双重修改'模式违反了 vendor 不可直接编辑的原则：直接编辑会导致本地 vendor 与上游 tarball 不一致，归档后其他机器重新构建时 sed 补丁会重复应用（幂等 sed 无害，但非幂等补丁会出错）",
+      "suggestion": "发现需要修补 vendor C 文件时，只在 spec %prep 中添加 sed 补丁，不直接编辑 vendor 文件。若补丁较复杂，可生成 .patch 文件作为 Source1 并在 %prep 中用 %patch 应用"
+    }
+  ]
+}

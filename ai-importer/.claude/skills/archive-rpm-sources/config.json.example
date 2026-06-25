@@ -1,0 +1,11 @@
+{
+  "github": {
+    "token": "<YOUR_GITHUB_TOKEN>",
+    "username": "<YOUR_GITHUB_USERNAME>"
+  },
+  "repo": {
+    "remote_url": "https://github.com/<org>/<rpm-repo>.git",
+    "branch": "arm_test",
+    "local_dir": "/root/.claude/skills/rpm-repo-github"
+  }
+}

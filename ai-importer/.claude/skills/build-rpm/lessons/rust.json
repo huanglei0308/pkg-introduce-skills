@@ -1,0 +1,101 @@
+{
+  "lang": "rust",
+  "lessons": [
+    {
+      "pkgname": "dust",
+      "version": "1.2.4",
+      "date": "2026-05-20",
+      "applies_to": "rust/binary-crate",
+      "finding": "Rust 二进制包 Source0 若仅写 %{name}-%{version}.tar.gz 而不含完整 URL，rpmlint 会报 invalid-url Source0，不符合社区可验证性要求",
+      "suggestion": "Source0 统一写为 https://github.com/<author>/%{name}/archive/refs/tags/v%{version}/%{name}-%{version}.tar.gz"
+    },
+    {
+      "pkgname": "dust",
+      "version": "1.2.4",
+      "date": "2026-05-20",
+      "applies_to": "rust/binary-crate",
+      "finding": "Rust 包离线构建缺少 %check section 时 rpmlint 报 no-%check-section；cargo test --offline 通常需要额外 vendored test fixtures 才能运行",
+      "suggestion": "添加 %check section，内含注释说明为何跳过（如 '# offline build; test fixtures not vendored'），既满足 rpmlint 又传达意图"
+    },
+    {
+      "pkgname": "dust",
+      "version": "1.2.4",
+      "date": "2026-05-20",
+      "applies_to": "rpm/spec-quality",
+      "finding": "Packager: 字段硬编码在 spec 中会触发 rpmlint hardcoded-packager-tag 警告；该字段应由打包基础设施注入而非写死",
+      "suggestion": "spec 中删除 Packager: 字段"
+    },
+    {
+      "pkgname": "dust",
+      "version": "1.2.4",
+      "date": "2026-05-20",
+      "applies_to": "rpm/spec-quality",
+      "finding": "Group: 字段在现代 RPM 规范（RHEL 8+ / openEuler）中已废弃，写入后 rpmlint 不报错但属于冗余字段，不符合最简化原则",
+      "suggestion": "spec 中删除 Group: 字段"
+    },
+    {
+      "pkgname": "bottom",
+      "version": "0.12.3",
+      "date": "2026-05-20",
+      "applies_to": "rust/binary-crate",
+      "finding": "cargo build 中的 --ignore-rust-version 会静默掩盖传递依赖的 MSRV 声明；移除该 flag 后，若传递依赖声明了高于容器 rustc 的 rust-version，构建将以 MSRV 冲突失败。初始 spec 中存在该 flag 时，必须在 Round 1 移除并验证是否暴露结构性冲突，而非保留。",
+      "suggestion": "生成 Rust spec 时不得包含 --ignore-rust-version；若传递依赖 MSRV 冲突在移除后暴露，应立即 ABORT 并说明具体冲突的依赖名称、版本和要求的 rustc 版本，由用户决策解决方案。"
+    },
+    {
+      "pkgname": "bottom",
+      "version": "0.12.3",
+      "date": "2026-05-20",
+      "applies_to": "rust/msrv",
+      "finding": "传递依赖（非直接依赖）也可声明 rust-version，且 --locked 会固定其版本使该约束不可自动规避。当 cargo build --locked 失败并输出 'rustc X.Y.Z is not supported by package foo@W requires rustc A.B' 时，属于结构性约束冲突，有两条解决路径：(1) 升级容器 rustc（无需改 Cargo.lock）；(2) 用 cargo update <dep>@<ver> --precise <compat-ver> 降级该传递依赖并重新生成 Cargo.lock、重新打包 Source tarball（需在开发环境而非构建容器内操作）。",
+      "suggestion": "遇到此类失败时，在 ABORT 信息中明确标注冲突依赖的包名、当前版本、要求 rustc 版本和容器实际 rustc 版本，便于用户快速决策。"
+    },
+    {
+      "pkgname": "starship",
+      "version": "1.25.1",
+      "date": "2026-05-21",
+      "applies_to": "rust/msrv",
+      "finding": "当目标包本身（非传递依赖）的 Cargo.toml 声明 rust-version 高于构建容器 rustc 版本时，属于「直接 MSRV 冲突」，在 spec_generation_pre_check 阶段即可检测，无需进入构建循环。此类冲突无法通过调整 Cargo.lock 规避（MSRV 由 Cargo.toml 本身声明，不随依赖版本变化）。解决路径仅有两条：(1) 升级容器 rustc；(2) 改引入 rust-version <= 容器 rustc 的历史版本。",
+      "suggestion": "pre-check 阶段若检测到包直接声明 rust-version > 容器 rustc，应在 ABORT 报告中同时说明：(a) 当前冲突版本差（例如：需要 1.90，实际 1.88）；(b) 建议的历史兼容版本查找方式（如 git tag 列表 + Cargo.toml 历史 rust-version 对照）。"
+    },
+    {
+      "pkgname": "sora2-network",
+      "version": "4.8.5",
+      "date": "2026-05-26",
+      "applies_to": "rust/nightly-toolchain",
+      "finding": "Substrate/Polkadot 类区块链节点项目通常通过 rust-toolchain.toml 声明 nightly channel + wasm32-unknown-unknown target。标准 openEuler 构建容器仅有 stable rustc 且无 rustup，无法满足此类 toolchain 要求，属于结构性阻断，无法通过修改 spec 解决。",
+      "suggestion": "引入前在 pre-check 阶段检查 rust-toolchain.toml：若 channel 为 nightly 或含 wasm32-unknown-unknown target，立即 ABORT 并提示用户需要专用 nightly 构建环境或预装 rustup 的容器镜像。"
+    },
+    {
+      "pkgname": "sora2-network",
+      "version": "4.8.5",
+      "date": "2026-05-26",
+      "applies_to": "rust/incomplete-vendor",
+      "finding": "vendor 目录不完整（缺少 .cargo-checksum.json 或 git 依赖未 vendor 化）时，cargo build --offline 会失败。Cargo.toml 中 git = 依赖数量可作为 vendor 完整性的快速预判指标：git 依赖 > 0 且 vendor 目录无对应 checksum 文件，说明 vendor 化未完成。",
+      "suggestion": "pre-check 阶段统计 Cargo.toml 中 git 依赖数量，并检查 vendor/.cargo-checksum.json 是否存在；若 git 依赖 > 10 且 checksum 缺失，提前 ABORT 并要求用户在开发环境重新执行 cargo vendor 生成完整 vendor 目录。"
+    },
+    {
+      "pkgname": "servo",
+      "version": "0.0.6",
+      "date": "2026-05-27",
+      "applies_to": "rust/toolchain-toml-channel-version",
+      "finding": "rust-toolchain.toml 的 channel 字段可以写具体版本号（如 channel = \"1.92.0\"），而非 stable/nightly/beta 关键字。此种写法与 Cargo.toml 的 rust-version 字段是两个独立的 MSRV 声明路径：rust-version 在 cargo build 时由 cargo 自身检查，channel 版本则要求 rustup 或匹配版本的 rustc 才能满足。pre-check 必须同时检查这两个字段，否则遗漏 channel 版本约束会导致构建失败。servo 0.0.6 即属此类：Cargo.toml 无 rust-version 字段，MSRV 约束完全由 rust-toolchain.toml channel=1.92.0 承载。",
+      "suggestion": "pre-check 阶段同时读取 rust-toolchain.toml（若存在）：若 channel 为具体版本号且 > 容器 rustc，立即 ABORT 并说明冲突来源是 rust-toolchain.toml channel 而非 Cargo.toml rust-version，避免用户误以为可通过降级依赖解决。"
+    },
+    {
+      "pkgname": "publicsuffix",
+      "version": "1.5.4-alpha.0",
+      "date": "2026-05-27",
+      "applies_to": "rust/library-crate",
+      "finding": "Rust 库包（仅含 -devel 子包）的初始 spec 生成时容易遗漏 --locked 参数，导致 cargo build --offline 在 vendor 目录内可能解析出与 Cargo.lock 不一致的版本，破坏可复现性。publicsuffix 1.5.4-alpha.0 即属此类：初始 spec 为 `cargo build --release --offline --no-default-features`，缺少 --locked。",
+      "suggestion": "生成 Rust spec 时，无论是二进制包还是库包，%build 中的 cargo build 命令必须同时包含 --offline 和 --locked；两者缺一不可：--offline 防止网络访问，--locked 保证依赖版本与 Cargo.lock 严格一致。"
+    },
+    {
+      "pkgname": "publicsuffix",
+      "version": "1.5.4-alpha.0",
+      "date": "2026-05-27",
+      "applies_to": "rust/vendor-wasm",
+      "finding": "vendor 目录中若包含 wit-bindgen 等含 WASM target 的 crate，其 .a 静态库文件（如 libwit_bindgen_cabi.a）为 WASM 格式，brp-strip 无法识别会输出 'file format not recognized' 警告，但不影响 RPM 打包结果（brp-strip 继续执行，最终 RPM 正常产出）。publicsuffix 1.5.4-alpha.0 的 vendor 目录含 wit-bindgen-0.51.0，触发此类警告。",
+      "suggestion": "遇到 brp-strip 对 vendor 内 .a 文件报 'file format not recognized' 时，确认文件来自 WASM target crate（如 wit-bindgen）即可忽略；若需彻底消除警告，可在 spec %install 后添加 `find %{buildroot} -name '*.a' -path '*/wit-bindgen*' -delete` 清理 WASM 静态库。"
+    }
+  ]
+}
