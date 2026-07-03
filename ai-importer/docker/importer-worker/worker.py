@@ -94,13 +94,15 @@ def main():
                 time.sleep(1)
                 continue
 
-            locked = r.set(f"{LOCK_PREFIX}{proj}", job_id, nx=True, ex=LOCK_TTL)
+            # 检查任务是否已被取消（排队中被取消的任务仍在队列中）
+            job_status = r.hget(f"{JOB_PREFIX}{job_id}", "status")
+            if job_status == "cancelled":
+                log.info("Job %s was cancelled while queued, skipping", job_id)
+                continue
+
+            locked = r.set(f"{LOCK_PREFIX}{job_id}", "1", nx=True, ex=LOCK_TTL)
             if not locked:
-                # Another worker is handling this project; put job back and wait
-                r.rpush(f"{QUEUE_PREFIX}{proj}", job_id)
-                r.sadd(ACTIVE_SET, proj)
-                log.info("Project %s already locked, skipping", proj)
-                time.sleep(2)
+                log.warning("Job %s lock conflict (should not happen), skipping", job_id)
                 continue
 
             log.info("Starting job %s for project %s", job_id, proj)
@@ -114,8 +116,8 @@ def main():
                 r.rpush(f"{LOGS_PREFIX}{job_id}",
                         _j.dumps({"msg": "Worker internal error", "done": True, "status": "failed"}))
             finally:
-                r.delete(f"{LOCK_PREFIX}{proj}")
-                log.info("Released lock for %s", proj)
+                r.delete(f"{LOCK_PREFIX}{job_id}")
+                log.info("Released lock for %s", job_id)
 
         except redis.RedisError as exc:
             log.error("Redis error: %s — retry in 5s", exc)

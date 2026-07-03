@@ -100,6 +100,20 @@ def _sync_copr_result(session_dir: Path, pkgname: str, job_id: str = "") -> None
         # 查当前状态，如果还在跑就等完
         data = get_build(build_id, login, token)
         state = data.get("state", "unknown")
+
+        # 校验包名：防止 pkg-builder 提交了错误的包
+        actual_pkg = data.get("source_package", {}).get("name", "")
+        if actual_pkg and actual_pkg != pkgname:
+            br["status"] = "failed"
+            br["failure_reason"] = (
+                f"Package name mismatch: build {build_id} "
+                f"is '{actual_pkg}', expected '{pkgname}'"
+            )
+            br_path.write_text(_json.dumps(br, indent=2, ensure_ascii=False))
+            print(f"[sync_copr][{job_id}] MISMATCH: build {build_id} is {actual_pkg}, expected {pkgname}",
+                  flush=True)
+            return
+
         terminal = {"succeeded", "failed", "canceled", "skipped"}
         if state not in terminal:
             state = poll_build_until_done(build_id, login, token, _log_fn)
@@ -172,6 +186,11 @@ def run_job(r, proj, job_id):
     copr_login  = job.get("copr_login", "")
     copr_token  = job.get("copr_token", "")
     copr_chroot = job.get("copr_chroot", "")
+
+    # 防御：任务在排队期间被取消，直接退出
+    if job.get("status") == "cancelled":
+        _log(r, job_id, "Job was cancelled before start, exiting")
+        return
 
     if not copr_login or not copr_token:
         _log(r, job_id, "ERROR: job 缺少 copr_login/copr_token")
