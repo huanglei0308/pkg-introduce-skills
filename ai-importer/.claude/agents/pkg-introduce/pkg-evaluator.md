@@ -52,7 +52,7 @@ if [ "$MODE" = "top-level" ]; then
   CONSTRAINT=""
 else
   UPSTREAM_URL="$(python3 $SCRIPTS_DIR/read-dep-registry.py --session-dir . --pkg $PKGNAME --field url)"
-  CONSTRAINT="<constraint>"
+  CONSTRAINT="$(python3 $SCRIPTS_DIR/read-dep-registry.py --session-dir . --pkg $PKGNAME --field constraint)"
   VERSION=""
 fi
 VERSION_ARG=""; [ -n "$VERSION" ] && VERSION_ARG="--version $VERSION"

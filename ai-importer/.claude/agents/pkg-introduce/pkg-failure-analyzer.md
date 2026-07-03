@@ -28,12 +28,27 @@ cd "$SESSION_DIR"
 LANG="$(python3 $SCRIPTS_DIR/read-gate-fields.py --session-dir . --pkg $PKGNAME --field lang)"
 BUILD_RESULT="./pkgs/${PKGNAME}/build_rpm_result.json"
 SPEC_FILE="./pkgs/${PKGNAME}/${PKGNAME}.spec"
+FIX_FILE="./pkgs/${PKGNAME}/fix_instructions.md"
 COPR_BUILD_ID="$(python3 -c "import json; print(json.load(open('$BUILD_RESULT')).get('copr_build_id',''))" 2>/dev/null)"
+```
+
+**诊断前必须读取以下内容，缺一不可：**
+
+```bash
+# 1. 当前 spec 完整内容（理解 spec 现状，避免推断错误）
+cat "$SPEC_FILE"
+
+# 2. 历史修法（了解已尝试过哪些修复，避免重复或反向操作）
+cat "$FIX_FILE" 2>/dev/null || echo "(无历史修法)"
+
+# 3. 构建日志
+python3 -c "import json; d=json.load(open('$BUILD_RESULT')); print(d.get('build_log_tail','') or d.get('build_log',''))"
 ```
 
 ## 步骤 1：诊断——判断失败根因
 
-读取 `build_log_tail`、`failure_reason`，结合 `${LANG}` 判断失败根因，映射到以下类别：
+**必须结合 spec 现状、历史修法和构建日志三者**综合判断，不得仅凭日志推断 spec 的当前状态。
+结合 `${LANG}` 判断失败根因，映射到以下类别：
 
 ### 类别 A：基础设施 / 网络问题（与语言无关）
 
@@ -129,6 +144,34 @@ python3 $SCRIPTS_DIR/register-dep.py \
   --required-by ${PKGNAME}
 ```
 
+> **`--constraint` 必填，不得为空**。按以下优先级确定版本约束：
+>
+> **1. 先查 build log**：
+> - `No matching package to install: 'xxx >= y.z'` → 直接用 `>= y.z`
+> - `nothing provides xxx >= y.z needed by` → 直接用 `>= y.z`
+>
+> **2. log 无版本信息时，读被构建包的源码**（路径：`./sources/${PKGNAME}/`）：
+> ```bash
+> # meson 版本要求
+> grep -m1 'meson_version' ./sources/${PKGNAME}/meson.build 2>/dev/null
+> # cmake 版本要求
+> grep -m1 'cmake_minimum_required' ./sources/${PKGNAME}/CMakeLists.txt 2>/dev/null
+> # autoconf 版本要求
+> grep -m1 'AC_PREREQ' ./sources/${PKGNAME}/configure.ac 2>/dev/null
+> # Python 构建依赖
+> python3 -c "
+> import tomllib, pathlib
+> p = pathlib.Path('./sources/${PKGNAME}/pyproject.toml')
+> d = tomllib.loads(p.read_text()) if p.exists() else {}
+> for r in d.get('build-system', {}).get('requires', []):
+>     print(r)
+> " 2>/dev/null
+> ```
+>
+> **3. 源码也找不到** → web search 查该包对依赖的版本要求，或用 `> <官方源当前版本>` 作为保守下限
+>
+> 任何情况下都不得把 `--constraint` 留空或写成过宽的约束（如 `>= 0`）。
+
 > **严禁降低主包版本**：主包（`${PKGNAME}`）的版本是用户指定的目标，任何情况下都不得在 fix_instructions 或 spec 修改中降低其 `Version:` 字段。遇到构建工具版本不足、meson 模块缺失等环境约束，必须引入更新的构建工具到 dep_registry，让 supervisor 先构建工具再重建主包。
 
 ### verdict = rebuild（修改 spec，重新构建）
@@ -148,16 +191,28 @@ python3 $SCRIPTS_DIR/register-dep.py \
 
 ## 步骤 3：输出
 
-写入 `./pkgs/${PKGNAME}/failure_analysis_${PKGNAME}_${COPR_BUILD_ID}.json`：
+写入 `./pkgs/${PKGNAME}/failure_analysis_${PKGNAME}_${COPR_BUILD_ID}.json`（`COPR_BUILD_ID` 为空时用 `failure_analysis_${PKGNAME}.json`，不要加尾部下划线）：
 
 ```json
 {
   "verdict": "retry" | "rebuild" | "abort",
   "reason": "简短说明失败原因",
   "fix_instructions": "修法说明（所有 verdict 均填写，供下次构建参考）",
-  "missing_deps": ["dep1", "dep2"]
+  "missing_deps": ["dep1", "dep2"],
+  "spec_patch": [
+    {
+      "description": "一句话说明此处改动的目的",
+      "before": "spec 中需要替换的原始文本（精确匹配，可多行）",
+      "after": "替换后的文本"
+    }
+  ]
 }
 ```
+
+`spec_patch` 规则：
+- **`rebuild` 时必须填写**，每条对应一处 spec 改动，`before` 必须是 spec 中能精确匹配的实际文本
+- 若改动是"新增内容"（无原文可替换），用 `before` 标注插入位置的前一行
+- `retry` / `abort` 时留空数组 `[]`
 
 `rebuild` 时同时直接修改 spec 文件。
 

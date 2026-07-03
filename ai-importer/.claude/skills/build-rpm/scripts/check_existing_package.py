@@ -231,18 +231,12 @@ gpgcheck=0
     repo_file = Path("/etc/yum.repos.d/oe-check-tmp.repo")
     try:
         repo_file.write_text(repo_content, encoding="utf-8")
-        # 清除 dnf 缓存（只针对临时 repo），超时或失败不阻断后续查询
-        enable_repos = "oe-check-official,oe-check-update,oe-check-epol"
+        # 只刷新 COPR 源缓存：官方源大且引包过程中不变，保留缓存；COPR 小且频繁更新，每次必须刷
         if copr_section:
-            enable_repos += ",oe-check-copr"
-        try:
-            subprocess.run(
-                ["dnf", "clean", "metadata", "--disablerepo=*",
-                 f"--enablerepo={enable_repos}"],
-                capture_output=True, timeout=30,
-            )
-        except Exception:
-            pass  # 清缓存失败不阻断，repo 文件已写入
+            # 直接删除 oe-check-copr 的 cache 目录，绕过 DNF lock（避免与 warm_repo_cache 后台线程争锁超时）
+            import shutil as _shutil
+            for _d in Path("/var/cache/dnf").glob("oe-check-copr-*"):
+                _shutil.rmtree(_d, ignore_errors=True)
         _ACTIVE_REPO_FILE = repo_file
         return True
     except PermissionError:
@@ -442,6 +436,7 @@ def summarize_copr_project(pkgname: str, lang: str, requested_version: str,
     """查询 COPR project 中是否有此包。
 
     优先通过 dnf repoquery 查询（需要 setup_repo_for_chroot 已写入 oe-check-copr）。
+    若 dnf 路径失败，回退到 COPR API（/api_3/build/list）。
     """
     found = _dnf_repoquery_copr(pkgname, lang)
     req_info = parse_requirement(requirement)
@@ -533,7 +528,9 @@ def check_existing_package(pkgname: str, version: str = "", requirement: str = "
                                                    owner=owner, project=project)
 
         official = summarize_official_repo(pkgname, lang, version, requirement)
-        copr     = summarize_copr_project(pkgname, lang, version, requirement)
+        copr     = summarize_copr_project(pkgname, lang, version, requirement,
+                                          copr_url=copr_url, owner=owner, project=project,
+                                          login=login, token=token)
     finally:
         if repo_switched:
             teardown_repo()

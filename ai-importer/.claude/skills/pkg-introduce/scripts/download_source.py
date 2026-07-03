@@ -245,10 +245,12 @@ def clone_repo_at_ref(url: str, dest: Path, ref: str) -> None:
 
     if ref.startswith("refs/tags/"):
         tag = ref.removeprefix("refs/tags/")
-        command = ["git", "clone", "--depth=1", "--branch", tag, url, str(dest)]
+        command = ["git", "clone", "--depth=1", "--recurse-submodules",
+                   "--branch", tag, url, str(dest)]
     else:
         branch = ref.removeprefix("refs/heads/")
-        command = ["git", "clone", "--depth=1", "--branch", branch, "--single-branch", url, str(dest)]
+        command = ["git", "clone", "--depth=1", "--recurse-submodules",
+                   "--branch", branch, "--single-branch", url, str(dest)]
 
     print(f"[INFO] git clone --depth=1 定向检出 {ref}")
     result = subprocess.run(command, capture_output=False, timeout=300)
@@ -280,6 +282,74 @@ def list_remote_tags(url: str) -> list[str]:
         nums = re.findall(r"\d+", t)
         return tuple(int(n) for n in nums) if nums else (0,)
     return sorted(tags, key=sort_key, reverse=True)
+
+
+def _parse_version_tuple(version_str: str) -> tuple:
+    """Parse a version string like 'v1.4.0' or '1.4.0' into a comparable tuple."""
+    normalized = version_str.lstrip("vV")
+    parts = re.findall(r"\d+", normalized)
+    return tuple(int(p) for p in parts) if parts else (0,)
+
+
+def _meets_constraint(tag: str, constraint: str) -> bool:
+    """Check if a tag satisfies a constraint like '>= 1.4.0' or '== 1.4.0'."""
+    if not constraint:
+        return True
+    tag_ver = _parse_version_tuple(tag)
+    for part in re.split(r"\s*,\s*", constraint.strip()):
+        part = part.strip()
+        m = re.match(r"(>=|<=|==|!=|>|<)\s*(.+)", part)
+        if not m:
+            continue
+        op, ver_str = m.group(1), m.group(2).strip()
+        req_ver = _parse_version_tuple(ver_str)
+        if op == ">=" and not (tag_ver >= req_ver):
+            return False
+        elif op == "<=" and not (tag_ver <= req_ver):
+            return False
+        elif op == "==" and not (tag_ver == req_ver):
+            return False
+        elif op == "!=" and not (tag_ver != req_ver):
+            return False
+        elif op == ">" and not (tag_ver > req_ver):
+            return False
+        elif op == "<" and not (tag_ver < req_ver):
+            return False
+    return True
+
+
+def select_stable_version(url: str, constraint: str = "") -> Optional[str]:
+    """从远端 tags 中选出满足 constraint 的最小稳定版本。
+
+    - constraint 为精确版本（如 '1.4.0' 或 '== 1.4.0'）时直接返回该版本
+    - constraint 为区间（如 '>= 1.4.0'）时选满足条件的最小稳定版
+    - constraint 为空时选最新稳定版
+    返回 None 表示找不到合适版本。
+    """
+    # 精确版本：直接返回，不查 tags
+    if constraint:
+        exact = re.match(r"^(?:==\s*)?([0-9][^\s,]*)$", constraint.strip())
+        if exact:
+            return exact.group(1).strip()
+
+    tags = list_remote_tags(url)
+    if not tags:
+        return None
+
+    stable = [t for t in tags if not UNSTABLE_SUFFIXES.search(t)]
+    if not stable:
+        return None
+
+    if not constraint:
+        # 无约束：返回最新稳定版（列表已降序，第一个就是最新）
+        return stable[0]
+
+    # 有区间约束：找满足条件的最小稳定版（最小 = 列表中最后一个满足的）
+    satisfying = [t for t in stable if _meets_constraint(t, constraint)]
+    if not satisfying:
+        return None
+    # stable 列表降序，satisfying[-1] 是最小满足版本
+    return satisfying[-1]
 
 
 def detect_project_version(dest: Path) -> Optional[str]:
@@ -323,8 +393,15 @@ def detect_project_version(dest: Path) -> Optional[str]:
     return None
 
 
-def download_git_repo(url: str, output_dir: Path, version: Optional[str] = None, ref: Optional[str] = None) -> Path:
-    """下载 git 仓库，支持按版本解析 branch/tag。"""
+def download_git_repo(url: str, output_dir: Path, version: Optional[str] = None,
+                      ref: Optional[str] = None, constraint: Optional[str] = None) -> Path:
+    """下载 git 仓库，支持按版本解析 branch/tag。
+
+    version 优先级：
+    1. 精确版本（已指定）→ 直接用
+    2. constraint 区间 → select_stable_version 选最小满足的稳定版
+    3. 都没有 → clone main，检测到开发版时自动切换稳定 tag
+    """
     repo_name = url.rstrip("/").split("/")[-1]
     if repo_name.endswith(".git"):
         repo_name = repo_name[:-4]
@@ -337,6 +414,18 @@ def download_git_repo(url: str, output_dir: Path, version: Optional[str] = None,
     output_dir.mkdir(parents=True, exist_ok=True)
 
     resolved_ref = ref
+
+    # 若没有明确版本但有 constraint，先从远端 tags 选版本
+    if not version and not resolved_ref and constraint:
+        print(f"[INFO] dependency mode：根据 constraint '{constraint}' 从远端 tags 选稳定版本...",
+              file=sys.stderr)
+        selected = select_stable_version(url, constraint)
+        if selected:
+            print(f"[INFO] 选定版本: {selected}", file=sys.stderr)
+            version = selected
+        else:
+            print(f"[WARN] 未找到满足 '{constraint}' 的稳定版本，回退到默认分支", file=sys.stderr)
+
     if version and not resolved_ref:
         resolved_ref = resolve_git_ref(url, version)
 
@@ -345,7 +434,7 @@ def download_git_repo(url: str, output_dir: Path, version: Optional[str] = None,
     else:
         print(f"[INFO] git clone --depth=1 {url}")
         result = subprocess.run(
-            ["git", "clone", "--depth=1", url, str(dest)],
+            ["git", "clone", "--depth=1", "--recurse-submodules", url, str(dest)],
             capture_output=False,
             timeout=300,
         )
@@ -444,18 +533,19 @@ def download_tarball(url: str, output_dir: Path) -> Path:
     return entries[0] if entries else output_dir
 
 
-def download_source(url: str, output_dir: Path, version: Optional[str] = None, ref: Optional[str] = None) -> Path:
+def download_source(url: str, output_dir: Path, version: Optional[str] = None,
+                    ref: Optional[str] = None, constraint: Optional[str] = None) -> Path:
     """根据 URL 类型自动选择下载方式"""
     url_type = detect_url_type(url)
     print(f"[INFO] URL 类型: {url_type}")
 
     if url_type == "git_repo":
-        return download_git_repo(url, output_dir, version=version, ref=ref)
+        return download_git_repo(url, output_dir, version=version, ref=ref, constraint=constraint)
     elif url_type == "tarball":
         return download_tarball(url, output_dir)
     else:
         print(f"[WARN] 未知 URL 类型，尝试 git clone: {url}")
-        return download_git_repo(url, output_dir, version=version, ref=ref)
+        return download_git_repo(url, output_dir, version=version, ref=ref, constraint=constraint)
 
 
 # ── 3. 主入口 ─────────────────────────────────────────────────────────────────
@@ -467,6 +557,7 @@ def main():
     group.add_argument("--upstream-url", help="直接指定上游 URL（跳过 PR 解析）")
     parser.add_argument("--output-dir", default="./sources", help="源码下载目录（默认 ./sources）")
     parser.add_argument("--version", default="", help="期望版本，用于按版本选择 git tag/branch")
+    parser.add_argument("--constraint", default="", help="版本约束（dependency mode），如 '>= 1.4.0'")
     parser.add_argument("--ref", default="", help="显式指定 git ref（内部扩展参数）")
     parser.add_argument("-o", "--output", default="", help="将结果写入 JSON 文件")
     args = parser.parse_args()
@@ -486,7 +577,9 @@ def main():
 
     requested_version = args.version.strip() or None
     requested_ref = args.ref.strip() or None
-    source_dir = download_source(url, output_dir, version=requested_version, ref=requested_ref)
+    requested_constraint = args.constraint.strip() or None
+    source_dir = download_source(url, output_dir, version=requested_version,
+                                 ref=requested_ref, constraint=requested_constraint)
     print(f"\nSOURCE_DIR={source_dir}")
 
     if args.output:

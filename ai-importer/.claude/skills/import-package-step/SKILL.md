@@ -136,6 +136,22 @@ wait)
   # 不 spawn agent，直接返回；下次 cron 循环 supervisor 会继续轮询
   ;;
 
+analyze_evaluate_main)
+  # evaluate_main gate 失败，AI 分析是临时错误（retry）还是硬失败（abort）
+  Agent(
+    subagent_type="pkg-evaluate-analyzer",
+    prompt=f"pkgname: {TARGET}\nmode: top-level\nsession_dir: {SESSION_DIR}"
+  )
+  ;;
+
+analyze_evaluate)
+  # dep evaluate gate 失败，AI 分析是临时错误（retry）还是硬失败（abort）
+  Agent(
+    subagent_type="pkg-evaluate-analyzer",
+    prompt=f"pkgname: {TARGET}\nmode: dependency\nsession_dir: {SESSION_DIR}"
+  )
+  ;;
+
 analyze_failure)
   Agent(
     subagent_type="pkg-failure-analyzer",

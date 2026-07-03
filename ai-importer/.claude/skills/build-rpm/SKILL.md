@@ -122,13 +122,23 @@ SPEC_FILE="./pkgs/<pkgname>/<pkgname>.spec"
 
 #### rebuild 模式（fix_instructions.md 和 spec 均已存在）
 
-**不重新生成 spec**，直接在现有 spec 上打补丁：
+**不重新生成 spec**，只应用最新一次失败分析的修法：
 
-1. 读取 `fix_instructions.md` 全部内容
-2. 读取现有 `<pkgname>.spec`
-3. 用 Edit 工具逐条应用每条修法
-4. 应用完毕后，逐条比对 fix_instructions，确认每条都已体现在 spec 中
-5. 若某条修法无法在现有 spec 上应用（spec 结构差异太大）→ fallback：删除 spec，走下方"首次构建"流程重新生成
+```bash
+# 找最新的 failure_analysis 文件
+LATEST_ANALYSIS=$(ls -t ./pkgs/<pkgname>/failure_analysis_<pkgname>*.json 2>/dev/null | head -1)
+```
+
+**优先使用 `spec_patch`（精确替换）**：
+
+1. 读取 `$LATEST_ANALYSIS` 的 `spec_patch` 数组
+2. 对每条 patch，在现有 spec 中精确匹配 `before` 文本，用 Edit 工具替换为 `after`
+3. 找不到 `before` 文本时，读取该条 `description` 和 `fix_instructions` 字段，用 AI 判断等效位置并应用
+4. 所有 patch 应用完毕后，逐条确认改动已体现在 spec 中
+
+**`spec_patch` 为空或不存在时 fallback**：读取 `fix_instructions.md` 最后一个 `## build_id=` 块（仅最新，不读全部），根据描述修改 spec。
+
+5. 若上述两种方式均无法应用（spec 结构差异太大）→ 删除 spec，走下方"首次构建"流程重新生成
 6. 直接跳到 §3.5 rpmlint 校验，不执行"首次构建"步骤
 
 #### 首次构建（无 fix_instructions.md 或无 spec）
@@ -168,9 +178,14 @@ mkdir -p ./srpms ./build/SOURCES ./build/SPECS
 
 VERSION_STR=<version>
 
+# 若有 git submodule，先初始化
+if [ -f "./sources/<pkgname>/.gitmodules" ]; then
+  git -C ./sources/<pkgname> submodule update --init --recursive
+fi
+
+# 用 --hard-dereference 消除硬链接（GitHub clone 可能含硬链接）
 # 用 --transform 把源码目录统一重命名为 <pkgname>-<version>
-# spec 里 %autosetup -n 永远用 %{name}-%{version}，不需要猜实际目录名
-tar -czf ./build/SOURCES/<pkgname>-${VERSION_STR}.tar.gz \
+tar --hard-dereference -czf ./build/SOURCES/<pkgname>-${VERSION_STR}.tar.gz \
   --transform "s|^./sources/<pkgname>|<pkgname>-${VERSION_STR}|" \
   ./sources/<pkgname>/
 

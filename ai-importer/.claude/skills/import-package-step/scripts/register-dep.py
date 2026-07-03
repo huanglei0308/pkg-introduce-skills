@@ -94,6 +94,11 @@ def main():
         if reason != "ok":
             print(f"[register-dep] {reason}", file=sys.stderr)
 
+    # constraint 为空时警告
+    if not args.constraint:
+        print(f"[register-dep] WARNING: --constraint 未指定，evaluator 将选最新稳定版而非最小满足版本。"
+              f"建议明确指定版本约束（如 '>= 1.4.0'）。", file=sys.stderr)
+
     reg_path = Path(args.session_dir) / "dep_registry.json"
     reg = json.loads(reg_path.read_text(encoding="utf-8")) if reg_path.exists() else {}
 

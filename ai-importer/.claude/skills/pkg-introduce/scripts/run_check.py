@@ -115,9 +115,10 @@ def _run_repo_check(report: dict, pkgname: str, upstream_url: str, reports_dir: 
 
 
 def _run_download(report: dict, pkgname: str, upstream_url: str, version: str,
-                  sources_dir: Path, reports_dir: Path) -> None:
+                  sources_dir: Path, reports_dir: Path, constraint: str = "") -> None:
     try:
-        result = run_download(pkgname, upstream_url, version, sources_dir, reports_dir)
+        result = run_download(pkgname, upstream_url, version, sources_dir, reports_dir,
+                              constraint=constraint)
         report["steps"]["download"] = {
             "status": "done",
             "version": result.get("version", ""),
@@ -248,7 +249,8 @@ def run_check(args: argparse.Namespace) -> int:
         # ── download ──────────────────────────────────────────────────────
         if not _already_done(steps["download"]):
             _run_download(report, args.pkg, args.upstream_url, args.version or "",
-                          sources_dir, reports_dir)
+                          sources_dir, reports_dir,
+                          constraint=args.constraint if args.mode == "dependency" else "")
             _save(report, report_path)
 
         # ── license_check ─────────────────────────────────────────────────
@@ -295,6 +297,7 @@ def main() -> int:
     parser.add_argument("--pkg", required=True)
     parser.add_argument("--url", required=True, dest="upstream_url")
     parser.add_argument("--version", default="")
+    parser.add_argument("--constraint", default="", help="版本约束（dependency mode），如 '>= 1.4.0'")
     parser.add_argument("--mode", default="top-level", choices=["top-level", "dependency"])
     parser.add_argument("--reports-dir", default="./reports", dest="reports_dir")
     parser.add_argument("--pkg-dir", default=None, dest="pkg_dir")

@@ -187,7 +187,8 @@ def _split_github_tree_url(upstream_url: str) -> tuple[str, str]:
     return upstream_url, ""
 
 
-def run_download(pkgname: str, upstream_url: str, expected_version: str, sources_dir: Path, reports_dir: Path) -> dict[str, Any]:
+def run_download(pkgname: str, upstream_url: str, expected_version: str, sources_dir: Path,
+                 reports_dir: Path, constraint: str = "") -> dict[str, Any]:
     source_dir = sources_dir / pkgname
     shutil.rmtree(source_dir, ignore_errors=True)
     path = reports_dir / f"download_result_{pkgname}.json"
@@ -208,8 +209,10 @@ def run_download(pkgname: str, upstream_url: str, expected_version: str, sources
     if expected_version:
         command[4:4] = ["--version", expected_version]
     elif extracted_ref:
-        # Pass the ref extracted from the URL directly so the script checks it out
         command.extend(["--ref", extracted_ref])
+    elif constraint:
+        # dependency mode：无精确版本，用 constraint 选稳定版
+        command.extend(["--constraint", constraint])
     proc = run_command(command)
     if proc.returncode != 0:
         mark_step(pkgname, reports_dir, "download", "failed")

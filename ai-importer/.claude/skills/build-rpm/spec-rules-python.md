@@ -2,31 +2,33 @@
 
 ## Source0 规则（最高优先级）
 
-**优先使用 PyPI sdist 作为 Source0**，不用 GitHub archive/tarball：
+**统一使用 GitHub 源码（git clone），不使用 PyPI sdist**。
 
+原因：PyPI sdist 不包含 git submodule（如 vendored-meson、vendored 构建工具等），会导致依赖 submodule 的包构建失败。GitHub 源码包含完整内容，是最可靠的来源。
+
+**Source0 写法**：
 ```spec
-Source0: https://files.pythonhosted.org/packages/source/%{pypi_name_first}/%{pypi_name}/%{pypi_name}-%{version}.tar.gz
+Source0: https://github.com/<owner>/<repo>/archive/refs/tags/v%{version}/%{name}-%{version}.tar.gz
 ```
 
-或直接用完整 URL：
-```spec
-Source0: https://files.pythonhosted.org/packages/source/n/numpy/numpy-2.2.6.tar.gz
-```
+或直接用 commit/tag 的 archive URL。
 
-**原因**：GitHub clone 打出的 tarball 含硬链接，COPR builder 的 `%prep` 阶段会报 `tar: Cannot hard link: Not a directory`。PyPI sdist 是标准分发包，无硬链接，目录结构固定（`<name>-<version>/`），`%autosetup -n %{pypi_name}-%{version}` 可直接匹配。
+**硬链接问题处理**：GitHub archive 含硬链接，`tar --transform` 会报 `Cannot hard link: Not a directory`。
+build-rpm skill 在 §4 打包时必须加 `--hard-dereference`：
 
-查询 PyPI sdist URL：
 ```bash
-curl -s "https://pypi.org/pypi/<pkgname>/json" | python3 -c "
-import sys,json
-d=json.load(sys.stdin)
-for u in d['urls']:
-    if u['packagetype']=='sdist':
-        print(u['url'])
-"
+tar --hard-dereference -czf ./build/SOURCES/<pkgname>-${VERSION_STR}.tar.gz \
+  --transform "s|^./sources/<pkgname>|<pkgname>-${VERSION_STR}|" \
+  ./sources/<pkgname>/
 ```
 
-若 PyPI 无 sdist（仅有 wheel）→ 才考虑 GitHub archive，并在 `%prep` 里用 `find . -type l -delete` 清除符号链接。
+**vendored 构建工具**：若 `pyproject.toml` 里有 `[tool.meson-python] meson = 'vendored-xxx/...'`，说明包使用自带的构建工具，spec 里**不加系统 meson/cmake 等 BuildRequires**，也**不在 %prep 里删除 vendored 目录**。
+
+**git submodule**：若源码有 submodule（`git submodule status` 有输出），build-rpm skill 在 clone 后必须执行：
+```bash
+git -C ./sources/<pkgname> submodule update --init --recursive
+```
+确保 vendored 内容完整后再打包。
 
 ---
 
@@ -53,14 +55,20 @@ for u in d['urls']:
 ### 判断3：项目用什么构建系统？
 
 ```
-pyproject.toml 存在？
-├── build-backend = setuptools.build_meta  → 方案 pip（setuptools 路径）
-├── build-backend = hatchling/flit/pdm 等  → 方案 pyproject（SP2+）或 方案 pip（其他）
-└── 无 build-backend 字段                  → 方案 pip（setuptools 路径）
+判断顺序：
 
-setup.py 存在（无论 pyproject.toml 是否存在）→ 方案 setup.py
+1. setup.py 存在且无 pyproject.toml → **方案 setup.py**
+   原因：setup.py 方案使用 %py3_build/%py3_install，不依赖 wheel/pip，构建最简单稳定
 
-既无 pyproject.toml 也无 setup.py → 询问用户
+2. pyproject.toml 存在：
+   ├── build-backend = mesonpy / meson-python → **方案 pyproject**
+   │   BuildRequires 必须包含 python3-pip、pyproject-rpm-macros、python3-meson-python、ninja-build
+   │   不加 BuildRequires: meson（若 pyproject.toml 里有 [tool.meson-python] meson = 'vendored-xxx'，用 vendored meson）
+   ├── build-backend = setuptools.build_meta  → **方案 setup.py**（setuptools 路径）
+   ├── build-backend = hatchling/flit/pdm 等  → **方案 pyproject**（SP2+）或 **方案 pip**（其他）
+   └── 无 build-backend 字段                  → **方案 setup.py**（setuptools 路径）
+
+3. 既无 pyproject.toml 也无 setup.py → 方案 pip-bootstrap
 ```
 
 ---

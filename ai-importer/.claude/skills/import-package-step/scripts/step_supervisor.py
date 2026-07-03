@@ -122,6 +122,23 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
     """返回 (action, target, delay_seconds)。delay=None 表示停止循环。"""
     PKGNAME = wf["pkgname"]
 
+    # 优先级 -1：evaluate_main 失败，等待 AI 分析
+    if wf.get("evaluate_failed"):
+        analysis_file = sd / f"pkgs/{PKGNAME}/evaluate_analysis_{PKGNAME}.json"
+        if not analysis_file.exists():
+            return ("analyze_evaluate_main", PKGNAME, 0)
+        data = read_json(analysis_file)
+        verdict = data.get("verdict", "abort")
+        if verdict == "retry":
+            wf.pop("evaluate_failed", None)
+            wf_files = list(sd.glob("workflow_*.json"))
+            if wf_files:
+                write_json(wf_files[0], wf)
+            (sd / f"pkgs/{PKGNAME}/gate_result_{PKGNAME}.json").unlink(missing_ok=True)
+            analysis_file.unlink(missing_ok=True)
+            return ("evaluate_main", PKGNAME, 60)
+        return ("fail", data.get("reason", wf.get("evaluate_failed", "evaluate failed")), None)
+
     # 优先级 0：主包 gate_result 不存在或内容无效 → evaluate_main
     gate_path = sd / f"pkgs/{PKGNAME}/gate_result_{PKGNAME}.json"
     gate_valid = False
@@ -170,7 +187,26 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
         except Exception:
             pass
 
-    # 优先级 1：有 dep 待 evaluate
+    # 优先级 1a：有 dep evaluate 失败，等待 AI 分析
+    failed_eval_deps = [k for k, v in reg.items() if v["status"] == "evaluate_failed"]
+    if failed_eval_deps:
+        dep = failed_eval_deps[0]
+        analysis_file = sd / f"pkgs/{dep}/evaluate_analysis_{dep}.json"
+        if not analysis_file.exists():
+            return ("analyze_evaluate", dep, 0)
+        data = read_json(analysis_file)
+        verdict = data.get("verdict", "abort")
+        if verdict == "retry":
+            reg[dep]["status"] = "pending_evaluate"
+            reg[dep].pop("error", None)
+            write_json(sd / "dep_registry.json", reg)
+            analysis_file.unlink(missing_ok=True)
+            (sd / f"pkgs/{dep}/gate_result_{dep}.json").unlink(missing_ok=True)
+            return ("evaluate", dep, 60)
+        reason = data.get("reason", reg[dep].get("error", f"dep {dep} evaluate failed"))
+        return ("fail", reason, None)
+
+    # 优先级 1b：有 dep 待 evaluate
     pending_eval = [k for k, v in reg.items() if v["status"] == "pending_evaluate"]
     if pending_eval:
         over_depth = [k for k in pending_eval if compute_depth(k, reg, PKGNAME) > MAX_DEP_DEPTH]
@@ -263,8 +299,13 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
         dep = failed_deps[0]
         dep_build_id = reg[dep].get("copr_build_id")
         analysis_file = sd / f"pkgs/{dep}/failure_analysis_{dep}_{dep_build_id}.json" if dep_build_id else sd / f"pkgs/{dep}/failure_analysis_{dep}.json"
+        # 兜底：agent 在 build_id 为空时可能写成 failure_analysis_{dep}_.json（尾部多下划线）
         if not analysis_file.exists():
-            return ("analyze_failure_dep", dep, 0)
+            fallback = sd / f"pkgs/{dep}/failure_analysis_{dep}_.json"
+            if fallback.exists():
+                analysis_file = fallback
+            else:
+                return ("analyze_failure_dep", dep, 0)
         verdict = read_json(analysis_file).get("verdict", "abort")
         if verdict in ("rebuild", "retry"):
             reg[dep]["status"] = "evaluate_done"
@@ -380,7 +421,11 @@ def update_after_evaluate_main(sd: Path, wf: dict, wf_path: Path, gate_decision:
         if PKGNAME not in wf["reused_pkgs"]:
             wf["reused_pkgs"].append(PKGNAME)
         wf["goal_achieved"] = True  # 下一轮 determine_action 直接返回 done
-    # introduce_new: 什么都不做，gate_result 文件已存在，下一轮走 build_main
+    elif gate_decision == "introduce_new":
+        pass  # gate_result 文件已存在，下一轮走 build_main
+    else:
+        # gate 失败（空 decision 或未知值）：写入 evaluate_failed，等待 AI 分析
+        wf["evaluate_failed"] = gate_decision or "evaluate_main gate failed"
     wf["loop_count"] = wf.get("loop_count", 0) + 1
     write_json(wf_path, wf)
 
@@ -396,8 +441,9 @@ def update_after_evaluate(sd: Path, reg: dict, reg_path: Path, target: str, gate
     elif gate_decision in ("introduce_new", "upgrade_user_repo"):
         reg[target]["status"] = "evaluate_done"
     else:
-        reg[target]["status"] = "build_failed"
-        reg[target]["error"] = gate_decision
+        # gate 失败：写入 evaluate_failed，等待 AI 分析
+        reg[target]["status"] = "evaluate_failed"
+        reg[target]["error"] = gate_decision or "evaluate gate failed"
     write_json(reg_path, reg)
 
 
