@@ -109,7 +109,34 @@ PRECHECK_RC=$?
 - `PRECHECK_RC=1`（blocked）：终止，不生成 spec。
 - `PRECHECK_RC=2`（dep_needed）：将缺包写入 `dep_registry.json`，退出等待 lead 处理。
 - `PRECHECK_RC=3`（needs_ai）：web search 补全 upstream URL 后重新执行本步骤。
-- `PRECHECK_RC=0`（precheck_done）：继续 §3。
+- `PRECHECK_RC=0`（precheck_done）：继续 §2.5。
+
+### 2.5 检查 openEuler 源仓库中的已有 spec（参考源）
+
+**仅首次构建时执行**（rebuild 模式跳过）。检查 `https://gitcode.com/src-openeuler/<pkgname>` 是否有已维护的 spec 文件，有则拉取作为 spec 生成起点。
+
+```bash
+REF_DIR="./pkgs/<pkgname>/reference"
+REF_RESULT="./pkgs/<pkgname>/reference_result.json"
+
+# 幂等：已拉取过则跳过（reference_result.json 由 fetch 脚本写入）
+if [ ! -f "$REF_RESULT" ]; then
+  python3 /app/.claude/skills/build-rpm/scripts/fetch_reference_spec.py \
+    --pkgname <pkgname> \
+    --output-dir "$REF_DIR" \
+    --output-json "$REF_RESULT"
+fi
+```
+
+参考源拉取到的目录结构（如找到）：
+```
+./pkgs/<pkgname>/reference/
+  <pkgname>.spec      # 已有 spec（参考起点）
+  <pkgname>.yaml      # 元数据（上游仓库、tag 前缀等，可选）
+  *.patch             # patch 文件（可选）
+```
+
+**若 gitcode.com 不可达或仓库不存在**：脚本输出 `{"found": false}`，后续 §3 自动回退到从头生成，不阻断流程。
 
 ### 3. 生成 spec
 
@@ -151,7 +178,28 @@ if [ -f "$FIX_FILE" ]; then
 fi
 ```
 
-**第二步：读取通用规范**，根据 `<lang>` 读规范文件：
+**第二步：检查 openEuler 已有 spec 作为参考**
+
+```bash
+REF_SPEC="./pkgs/<pkgname>/reference/<pkgname>.spec"
+REF_YAML="./pkgs/<pkgname>/reference/<pkgname>.yaml"
+
+if [ -f "$REF_SPEC" ]; then
+  echo "=== 发现 openEuler 已有 spec 参考，以此为基础适配 ==="
+  echo "--- 参考 spec ---"
+  cat "$REF_SPEC"
+  echo "--- 参考 spec 结束 ---"
+  if [ -f "$REF_YAML" ]; then
+    echo "--- 参考 yaml 元数据 ---"
+    cat "$REF_YAML"
+    echo "--- 参考 yaml 结束 ---"
+  fi
+  echo "参考 patches:"
+  ls ./pkgs/<pkgname>/reference/*.patch 2>/dev/null || echo "(无)"
+fi
+```
+
+**第三步：读取通用规范**，根据 `<lang>` 读规范文件：
 
 - `python`：Read `/app/.claude/skills/build-rpm/spec-rules-python.md`
 - `nodejs`：Read `/app/.claude/skills/build-rpm/spec-rules-nodejs.md`
@@ -163,6 +211,30 @@ fi
 **使用预检结果填写 BuildRequires：** 读 `./pkgs/<pkgname>/pre_check.json` 的 `resolved[].rpm_requirement` 直接填入。
 
 **注入历史经验：** 若传入 `--lessons`，读取并筛选相关条目注入 spec 生成推理。
+
+**第四步：根据是否有参考 spec 选择生成策略**
+
+##### A. 有参考 spec（`$REF_SPEC` 存在时）
+
+你**必须**以 openEuler 已有 spec 为起点进行适配，而不是从头生成：
+
+1. **保留结构**：保留参考 spec 的整体结构、`%package` 子包定义（devel/help 等）、RPM 宏使用习惯（`%cmake`、`%autosetup`、`%cmake_build` 等）
+2. **更新版本**：将 `Version` 更新为当前目标版本 `<version>`，`Release` 重置为 `1%{?dist}`
+3. **更新 Source0**：将 `Source0` URL 更新为当前上游 URL（`<upstream_url>`）
+4. **评估 patches**：
+   - 读取每个参考 patch 的内容，判断是否仍然需要
+   - 架构适配类 patch（如 RISC-V 修复、字节序修复）通常保留
+   - 已合入上游的 patch 或针对旧版本的补丁应删除
+   - 无法判断时保留并在 `%prep` 中应用，让 rpmbuild 验证
+5. **更新 BuildRequires**：使用 `./pkgs/<pkgname>/pre_check.json` 中的预检结果替换/补充 BuildRequires，移除参考 spec 中不再需要的依赖
+6. **清理 %changelog**：保留最近的条目格式作为参考，更新日期和版本号
+7. **检查宏兼容性**：确保使用的 RPM 宏在目标 openEuler 版本中存在
+
+> 参考 spec 来自 openEuler 社区维护者，经过了社区审查。**你的工作是把它适配到新版本，不是重写它。** 只有当参考 spec 与实际情况严重不符（如构建系统完全不同、上游项目重构）时，才回退到从头生成。
+
+##### B. 无参考 spec（`$REF_SPEC` 不存在时）
+
+从头生成 spec，遵循通用规范、预检结果和历史经验（当前行为不变）。
 
 ### 3.5 rpmlint 校验
 
