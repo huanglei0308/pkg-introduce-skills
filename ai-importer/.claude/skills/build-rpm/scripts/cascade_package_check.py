@@ -298,6 +298,51 @@ def _check_src_openeuler(pkgname: str, lang: str) -> Optional[dict]:
     return None
 
 
+# ── Level 0: 用户 COPR project ─────────────────────────────────────────────────
+
+def _check_user_copr_project(pkgname: str, copr_url: str, owner: str,
+                              project: str, login: str, token: str) -> Optional[dict]:
+    """检查用户自己的 COPR project 是否已有此包（避免重复构建）。"""
+    if not (copr_url and owner and project and login and token):
+        return None
+
+    import base64
+    creds = base64.b64encode(f"{login}:{token}".encode()).decode()
+    headers = {"Authorization": f"Basic {creds}"}
+
+    params = urllib.parse.urlencode({
+        "ownername": owner,
+        "projectname": project,
+        "packagename": pkgname,
+        "limit": "10",
+    })
+    url = f"{copr_url.rstrip('/')}/api_3/build/list?{params}"
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        items = data.get("items", [])
+        best = None
+        for build in items:
+            if build.get("state") != "succeeded":
+                continue
+            ver = build.get("source_package", {}).get("version", "")
+            if ver and (best is None or _checker.compare_versions(ver, best["version"]) > 0):
+                best = {"name": pkgname, "version": ver}
+        if best:
+            return {
+                "level": 0,
+                "decision": "reuse_copr_project",
+                "rpm_name": pkgname,
+                "version": best["version"],
+                "source": f"{owner}/{project}",
+            }
+    except Exception:
+        pass
+    return None
+
+
 # ── 主入口 ──────────────────────────────────────────────────────────────────────
 
 def check_package_existence(
@@ -306,6 +351,11 @@ def check_package_existence(
     version: str = "",
     requirement: str = "",
     target: str = "",
+    copr_url: str = "",
+    copr_owner: str = "",
+    copr_project: str = "",
+    copr_login: str = "",
+    copr_token: str = "",
 ) -> dict:
     """4 级级联查找包的处置策略。
 
@@ -315,11 +365,13 @@ def check_package_existence(
         version: 目标版本号
         requirement: 版本约束（如 >= 1.0）
         target: 目标 openEuler 版本（如 openEuler-24.03-LTS-SP3）
+        copr_url / copr_owner / copr_project / copr_login / copr_token:
+            用户 COPR 凭据，用于 L0 检查自己的 project 是否已有此包。
 
     Returns:
         {
             "pkgname": str,
-            "level": int (1-4),
+            "level": int (0-4),
             "decision": str,
             "match": { ... } | None,
             "reference": { ... } | None,
@@ -332,6 +384,14 @@ def check_package_existence(
         "match": None,
         "reference": None,
     }
+
+    # ── Level 0: 用户 COPR project ──────────────────────────────────────────
+    user_result = _check_user_copr_project(
+        pkgname, copr_url, copr_owner, copr_project, copr_login, copr_token
+    )
+    if user_result:
+        result.update(user_result)
+        return result
 
     # ── Level 1: EUR fulltext search ─────────────────────────────────────────
     eur_projects = _eur_fulltext_search(pkgname)

@@ -181,13 +181,23 @@ def run_gate(args: argparse.Namespace) -> int:
                 version=version,
                 requirement=args.constraint,
                 target=chroot,
+                copr_url=copr_url,
+                copr_owner=owner,
+                copr_project=project,
+                copr_login=login,
+                copr_token=token,
             )
             decision = cascade_result["decision"]
             level = cascade_result["level"]
 
             # 生成 reason 文本
             match_info = cascade_result.get("match") or {}
-            if decision == "reuse_eur_srpm":
+            if decision == "reuse_copr_project":
+                reason = (
+                    f"用户 COPR project 已有构建：{match_info.get('source', '')} "
+                    f"version={match_info.get('version', '')}，直接复用"
+                )
+            elif decision == "reuse_eur_srpm":
                 reason = (
                     f"EUR 找到 {match_info.get('eur_owner', '')}/{match_info.get('eur_project', '')} "
                     f"chroot={match_info.get('chroot', '')} "
