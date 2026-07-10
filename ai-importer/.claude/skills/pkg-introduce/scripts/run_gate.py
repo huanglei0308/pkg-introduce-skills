@@ -26,7 +26,7 @@ from pathlib import Path
 _PKG_SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(_PKG_SCRIPTS))
 
-from check_existing_package import check_existing_package  # noqa: E402
+from cascade_package_check import check_package_existence  # noqa: E402
 
 GATE_STEPS = ["existing_check"]
 
@@ -128,24 +128,53 @@ def run_gate(args: argparse.Namespace) -> int:
 
     try:
         if not _already_done(steps["existing_check"]):
-            result = check_existing_package(
+            # 4 级级联查找（Level 1-4）：EUR → 官方源 → gitcode → 全新
+            cascade_result = check_package_existence(
                 args.pkg,
+                lang=lang,
                 version=version,
                 requirement=args.constraint,
-                lang=lang,
-                copr_url=copr_url,
-                owner=owner,
-                project=project,
-                login=login,
-                token=token,
-                chroot=chroot,
+                target=chroot,
             )
-            decision = result["decision"]
+            decision = cascade_result["decision"]
+            level = cascade_result["level"]
+
+            # 生成 reason 文本
+            match_info = cascade_result.get("match") or {}
+            if decision == "reuse_eur_srpm":
+                reason = (
+                    f"EUR 找到 {match_info.get('eur_owner', '')}/{match_info.get('eur_project', '')} "
+                    f"chroot={match_info.get('chroot', '')} "
+                    f"version={match_info.get('version', '')}，下载 SRPM 重建"
+                )
+            elif decision == "reuse_official":
+                reason = (
+                    f"openEuler 目标版本已有满足要求的包："
+                    f"{match_info.get('rpm_name', '')} {match_info.get('version', '')}"
+                )
+            elif decision == "evaluate":
+                reason = (
+                    f"openEuler 目标版本有包但版本不满足要求："
+                    f"{match_info.get('rpm_name', '')} {match_info.get('version', '')}"
+                )
+            elif decision == "introduce_new_with_ref":
+                reason = (
+                    f"src-openeuler 仓库存在：{match_info.get('gitcode_repo', '')}，"
+                    f"以参考 spec 为起点构建"
+                )
+            elif decision == "introduce_new":
+                reason = "所有来源均未找到，从头构建"
+            else:
+                reason = f"decision={decision}"
+
             steps["existing_check"] = {
                 "status":   "done",
                 "decision": decision,
-                "reason":   result.get("reason", ""),
+                "level":    level,
+                "reason":   reason,
                 "chroot":   chroot,
+                "match":    cascade_result.get("match"),
+                "reference": cascade_result.get("reference"),
             }
             _save(report, gate_report_path)
 

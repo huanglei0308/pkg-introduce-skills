@@ -15,6 +15,7 @@ log = logging.getLogger("worker")
 
 REDIS_HOST = os.environ.get("REDIS_HOST", "redis")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
+REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "")
 CANCEL_PORT = int(os.environ.get("CANCEL_PORT", 8080))
 
 QUEUE_PREFIX = "queue:ai:"
@@ -26,7 +27,7 @@ LOCK_TTL     = 7200
 
 
 def make_redis():
-    return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
+    return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASSWORD or None, decode_responses=True)
 
 
 def pick_next_job(r):
