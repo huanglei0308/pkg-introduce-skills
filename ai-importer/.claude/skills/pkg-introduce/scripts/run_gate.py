@@ -4,11 +4,15 @@
 前提：run_check.py 已成功跑完（overall_status=done），
       check_result_<pkgname>.json 中有确认的 lang/version。
 
-步骤：existing_check（直接本地 dnf + COPR API，无需容器）
+步骤：existing_check（4 级级联：EUR → 官方源 → gitcode → 全新）
+
+gate 阶段完成决策后动作：
+  - reuse_eur_srpm：下载 EUR SRPM，提取 spec 到 reference
+  - introduce_new_with_ref：拉取 gitcode 参考源到 reference
 
 输出 gate_result_<pkgname>.json，格式：
   overall_status: "done" | "failed"
-  result.decision: "reuse_official" | "reuse_copr_project" | "introduce_new"
+  result.decision: "reuse_eur_srpm" | "reuse_official" | "introduce_new_with_ref" | "introduce_new"
 
 exit codes:
   0  overall_status=done
@@ -20,6 +24,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -42,7 +48,6 @@ def _get_project_chroots(copr_url: str, owner: str, project: str,
         with urllib.request.urlopen(req, timeout=10) as r:
             d = json.loads(r.read())
         chroots = list(d.get("chroot_repos", {}).keys())
-        # 优先取 x86_64，否则取第一个
         x86 = [c for c in chroots if c.endswith("-x86_64")]
         return x86 if x86 else chroots
     except Exception:
@@ -56,6 +61,49 @@ def _save(report: dict, path: Path) -> None:
 
 def _already_done(step_data: dict) -> bool:
     return step_data.get("status") in ("done", "skipped")
+
+
+def _download_eur_srpm(match_info: dict, pkgname: str, pkgs_dir: Path, srpms_dir: Path) -> None:
+    """下载 EUR SRPM 并提取 spec 到 reference 目录。"""
+    srpm_url = match_info["srpm_url"]
+    srpm_file = match_info.get("srpm_file", f"{pkgname}.src.rpm")
+    srpms_dir.mkdir(parents=True, exist_ok=True)
+    srpm_path = srpms_dir / srpm_file
+    if srpm_path.exists():
+        return
+    try:
+        print(f"[gate] 下载 EUR SRPM: {srpm_url}", file=sys.stderr)
+        subprocess.run(["curl", "-sL", "-o", str(srpm_path), srpm_url], check=True, timeout=120)
+        print(f"[gate] SRPM 已保存: {srpm_path}", file=sys.stderr)
+        ref_dir = pkgs_dir / "reference"
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            f"cd {shlex.quote(str(ref_dir))} && rpm2cpio {shlex.quote(str(srpm_path))} | cpio -idmv '*.spec' 2>/dev/null",
+            shell=True, timeout=30,
+        )
+        print(f"[gate] spec 已提取到: {ref_dir}", file=sys.stderr)
+    except Exception as exc:
+        print(f"[gate] WARN: 下载/提取 SRPM 失败: {exc}", file=sys.stderr)
+
+
+def _fetch_reference(match_info: dict, pkgname: str, pkgs_dir: Path) -> None:
+    """从 gitcode src-openeuler 拉取参考 spec/yaml/patches。"""
+    repo_name = match_info["repo_name"]
+    ref_dir = pkgs_dir / "reference"
+    if (ref_dir / f"{repo_name}.spec").exists() or (ref_dir / f"{pkgname}.spec").exists():
+        return
+    ref_result = ref_dir.parent / "reference_result.json"
+    try:
+        fetch_script = Path(__file__).resolve().parent / "../../build-rpm/scripts/fetch_reference_spec.py"
+        print(f"[gate] 拉取参考源: gitcode.com/src-openeuler/{repo_name}", file=sys.stderr)
+        subprocess.run(
+            ["python3", str(fetch_script), "--pkgname", repo_name,
+             "--output-dir", str(ref_dir), "--output-json", str(ref_result)],
+            check=True, timeout=60,
+        )
+        print(f"[gate] 参考源已拉取到: {ref_dir}", file=sys.stderr)
+    except Exception as exc:
+        print(f"[gate] WARN: 拉取参考源失败: {exc}", file=sys.stderr)
 
 
 def run_gate(args: argparse.Namespace) -> int:
@@ -105,12 +153,11 @@ def run_gate(args: argparse.Namespace) -> int:
     login    = args.copr_login  or os.environ.get("COPR_API_LOGIN", "")
     token    = args.copr_token  or os.environ.get("COPR_API_TOKEN", "")
 
-    # chroot 优先从 session.json 读，避免重新查 COPR API
+    # chroot 优先从 session.json 读
     chroot = args.copr_chroot or os.environ.get("COPR_CHROOT", "")
     if not chroot:
         session_json = Path(args.reports_dir).parents[1] / "session.json"
         if not session_json.exists():
-            # 兜底：向上查找 session.json
             for p in Path(args.reports_dir).parents:
                 candidate = p / "session.json"
                 if candidate.exists():
@@ -122,7 +169,6 @@ def run_gate(args: argparse.Namespace) -> int:
             except Exception:
                 pass
     if not chroot:
-        # 最后兜底：从 COPR API 查（向后兼容）
         chroots = _get_project_chroots(copr_url, owner, project, login, token)
         chroot  = chroots[0] if chroots else ""
 
@@ -177,6 +223,15 @@ def run_gate(args: argparse.Namespace) -> int:
                 "reference": cascade_result.get("reference"),
             }
             _save(report, gate_report_path)
+
+            # ── 决策后动作：下载 SRPM 或拉取参考源 ────────────────────
+            session_dir = reports_dir.parent
+            pkgs_dir = session_dir / "pkgs" / args.pkg
+            srpms_dir = session_dir / "srpms"
+            if decision == "reuse_eur_srpm" and match_info.get("srpm_url"):
+                _download_eur_srpm(match_info, args.pkg, pkgs_dir, srpms_dir)
+            elif decision == "introduce_new_with_ref" and match_info.get("repo_name"):
+                _fetch_reference(match_info, args.pkg, pkgs_dir)
 
     except Exception as exc:
         report["overall_status"] = "failed"
