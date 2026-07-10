@@ -159,34 +159,9 @@ PRECHECK_RC=$?
 - `PRECHECK_RC=1`（blocked）：终止，不生成 spec。
 - `PRECHECK_RC=2`（dep_needed）：将缺包写入 `dep_registry.json`，退出等待 lead 处理。
 - `PRECHECK_RC=3`（needs_ai）：web search 补全 upstream URL 后重新执行本步骤。
-- `PRECHECK_RC=0`（precheck_done）：继续 §2.5。
+- `PRECHECK_RC=0`（precheck_done）：继续 §3。
 
-### 2.5 检查 openEuler 源仓库中的已有 spec（参考源）
-
-**仅首次构建时执行**（rebuild 模式或 gate 已拉取参考源时跳过）。若 gate 已在 §0 将参考源放入 `./pkgs/<pkgname>/reference/`，本步自动跳过。否则检查 `https://gitcode.com/src-openeuler/<pkgname>` 是否有已维护的 spec 文件。
-
-```bash
-REF_DIR="./pkgs/<pkgname>/reference"
-REF_RESULT="./pkgs/<pkgname>/reference_result.json"
-
-# 幂等：已拉取过则跳过（reference_result.json 由 fetch 脚本写入）
-if [ ! -f "$REF_RESULT" ]; then
-  python3 /app/.claude/skills/build-rpm/scripts/fetch_reference_spec.py \
-    --pkgname <pkgname> \
-    --output-dir "$REF_DIR" \
-    --output-json "$REF_RESULT"
-fi
-```
-
-参考源拉取到的目录结构（如找到）：
-```
-./pkgs/<pkgname>/reference/
-  <pkgname>.spec      # 已有 spec（参考起点）
-  <pkgname>.yaml      # 元数据（上游仓库、tag 前缀等，可选）
-  *.patch             # patch 文件（可选）
-```
-
-**若 gitcode.com 不可达或仓库不存在**：脚本输出 `{"found": false}`，后续 §3 自动回退到从头生成，不阻断流程。
+> **§2.5（检查参考源）已移除。** 参考源的查询和拉取由 gate 阶段的 4 级级联查找统一完成。若 gate 决定 `introduce_new_with_ref`，参考 spec/yaml/patches 已在 `./pkgs/<pkgname>/reference/` 中；若 gate 决定 `introduce_new`，说明 gitcode 也没有参考源，无需再查。
 
 ### 3. 生成 spec
 
