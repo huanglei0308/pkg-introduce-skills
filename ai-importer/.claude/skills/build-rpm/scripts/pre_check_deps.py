@@ -36,6 +36,12 @@ from constraint_parser import parse_constraint as _parse_constraint  # noqa: E40
 CHECK_EXISTING_SCRIPT = SCRIPT_DIR / "check_existing_package.py"
 ANALYZE_PYTHON_SCRIPT = SCRIPT_DIR / "analyze_python_deps.py"
 
+# Cascade package check 用于依赖预检时的级联查找（EUR / gitcode 命中则跳过 evaluate）
+try:
+    from cascade_package_check import check_package_existence as _cascade_check  # noqa: E402
+except Exception:
+    _cascade_check = None  # type: ignore[assignment]
+
 
 def _load_pkg_introduce_config() -> dict:
     config_path = SCRIPT_DIR.parent.parent / "pkg-introduce" / "config.json"
@@ -700,6 +706,29 @@ def classify_dependency(dep: dict[str, Any], lang: str, source_index: dict[tuple
         else:
             action = "recurse"
             reason = existing_check["reason"]
+
+    # ── 依赖预检级联优化 ──────────────────────────────────────────
+    if action == "recurse" and _cascade_check is not None:
+        dep_lang = dep.get("type") or lang
+        try:
+            cascade_result = _cascade_check(dep["name"], lang=dep_lang)
+            cascade_decision = cascade_result.get("decision", "")
+            cascade_match = cascade_result.get("match") or {}
+            if cascade_decision == "reuse_eur_srpm":
+                action = "resolved"
+                decision = "reuse_eur"
+                reason = (
+                    f"EUR 找到 {cascade_match.get('eur_owner', '')}/{cascade_match.get('eur_project', '')} "
+                    f"SRPM（{cascade_match.get('version', '')}），直接复用，跳过构建"
+                )
+                dep["cascade_match"] = cascade_match
+                dep["eur_srpm_url"] = cascade_match.get("srpm_url")
+            elif cascade_decision == "introduce_new_with_ref":
+                dep["cascade_level"] = 3
+                dep["cascade_match"] = cascade_match
+                dep["reference_repo"] = cascade_match.get("gitcode_repo", "")
+        except Exception:
+            pass  # cascade 不可用时降级，不阻塞
 
     debug_flow["after"] = {
         "constraint_type": dep.get("constraint_type", "unknown"),
