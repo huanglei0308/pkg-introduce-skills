@@ -88,11 +88,27 @@ def _eur_fulltext_search(pkgname: str) -> list[dict[str, str]]:
     return projects
 
 
+def _eur_pkgname_matches(build_dir_name: str, pkgname: str) -> bool:
+    """检查 build 目录中的包名是否与目标包匹配。
+
+    上游包名可能与 RPM 包名不同（如 requests vs python-requests），
+    使用包含匹配（考虑到连字符分隔的包名）。
+    """
+    bd = build_dir_name.lower().replace("_", "-")
+    pn = pkgname.lower().replace("_", "-")
+    if bd == pn:
+        return True
+    # 模糊匹配：python-requests 匹配 requests, nodejs-lodash 匹配 lodash
+    parts = bd.split("-")
+    return pn in parts or any(p.startswith(pn) or pn.startswith(p) for p in parts if len(p) >= 3)
+
+
 def _scan_eur_results(projects: list[dict[str, str]], pkgname: str,
-                      target_chroot: str = "") -> Optional[dict]:
+                      target_chroot: str = "", target_version: str = "") -> Optional[dict]:
     """扫描 EUR project 的 results 目录，匹配包名。
 
     返回命中的第一个匹配结果，含 srpm_url / binary_rpm_url / version / chroot。
+    若 target_version 指定，EUR 版本必须 >= 目标版本才返回命中。
     """
     for proj in projects:
         owner = proj["owner"]
@@ -131,7 +147,7 @@ def _scan_eur_results(projects: list[dict[str, str]], pkgname: str,
                     continue
                 build_pkgname = parts[1]
 
-                if build_pkgname != pkgname:
+                if not _eur_pkgname_matches(build_pkgname, pkgname):
                     continue
 
                 # 进入 build 目录，列出文件
@@ -175,13 +191,18 @@ def _scan_eur_results(projects: list[dict[str, str]], pkgname: str,
                     "chroot": chroot,
                 }
 
-                # 判断决策类型
-                if binary_files:
-                    match_info["decision"] = "reuse_eur_srpm"
-                elif srpm_files:
+                # 版本匹配检查：EUR 版本必须 >= 目标版本
+                if target_version and version:
+                    try:
+                        if _checker.compare_versions(version, target_version) < 0:
+                            continue  # EUR 版本太低，继续搜下一个
+                    except Exception:
+                        pass  # 版本比较失败不阻塞
+
+                if binary_files or srpm_files:
                     match_info["decision"] = "reuse_eur_srpm"
                 else:
-                    continue  # 没有 RPM 文件，跳过
+                    continue
 
                 return match_info
 
@@ -396,7 +417,7 @@ def check_package_existence(
     # ── Level 1: EUR fulltext search ─────────────────────────────────────────
     eur_projects = _eur_fulltext_search(pkgname)
     if eur_projects:
-        eur_match = _scan_eur_results(eur_projects, pkgname, target_chroot=target)
+        eur_match = _scan_eur_results(eur_projects, pkgname, target_chroot=target, target_version=version)
         if eur_match:
             result["level"] = 1
             result["decision"] = "reuse_eur_srpm"
