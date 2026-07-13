@@ -20,6 +20,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -743,6 +744,110 @@ def print_pending_to_stdout(pending: list[dict[str, Any]]) -> None:
         print(f"{item['name']} {item.get('upstream_url', '')}".rstrip())
 
 
+# ── Rust MSRV / toolchain 预检 ────────────────────────────────────────────────
+# 背景：Rust 项目常通过 Cargo.toml 的 rust-version 字段或 rust-toolchain.toml 的
+# channel 字段声明编译器版本要求。这类冲突是结构性的（改 spec 无法解决，只能
+# 换编译器版本或换包版本），若不提前检查，只能等 cargo build 失败后走一轮完整
+# 的"失败诊断 → 判定 abort"循环才能确认，白白浪费一次编译+诊断的时间。
+#
+# 历史上 spec-rules-rust.md 文档里有一段用 `docker exec ${SESSION_CONTAINER}
+# rustc --version` 查编译器版本的检查脚本，但当前架构已不再使用容器构建
+# （pkg-builder.md 明确标注"COPR 模式下无 SESSION_CONTAINER"），这段检查从未
+# 被接入过实际的预检流程。真正决定构建时用哪个 rustc 版本的，是 COPR 目标
+# chroot 仓库里 rust 包的版本，不是本地环境的 rustc（本地 worker 容器里也
+# 根本没装 rustc），所以这里改用 dnf repoquery 查 chroot 仓库里的 rust 包版本，
+# 复用 check_existing_package.py 里已有的 repo 切换机制。
+def _read_rust_toolchain_channel(source_dir: Path) -> str:
+    """读取 rust-toolchain.toml 的 channel 字段，取不到返回空串。"""
+    for fname in ("rust-toolchain.toml", "rust-toolchain"):
+        f = source_dir / fname
+        if not f.exists():
+            continue
+        try:
+            content = f.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        m = re.search(r'channel\s*=\s*["\']([^"\']+)["\']', content)
+        if m:
+            return m.group(1).strip()
+        # rust-toolchain（无 .toml 后缀）历史格式：文件内容直接是版本号/channel 名
+        if fname == "rust-toolchain" and content.strip():
+            return content.strip().splitlines()[0].strip()
+    return ""
+
+
+def _read_cargo_rust_version(source_dir: Path) -> str:
+    """读取 Cargo.toml 的 rust-version 字段（MSRV），取不到返回空串。"""
+    f = source_dir / "Cargo.toml"
+    if not f.exists():
+        return ""
+    try:
+        content = f.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+    m = re.search(r'^\s*rust-version\s*=\s*["\']([^"\']+)["\']', content, re.MULTILINE)
+    return m.group(1).strip() if m else ""
+
+
+def _query_chroot_rustc_version(copr_chroot: str) -> str:
+    """查 COPR 目标 chroot 仓库里 rust 包的版本，查不到返回空串。"""
+    if not copr_chroot:
+        return ""
+    repo_switched = False
+    try:
+        repo_switched = EXISTING_CHECKER.setup_repo_for_chroot(copr_chroot)
+        found = EXISTING_CHECKER._dnf_repoquery("rust", "rust")
+        return (found or {}).get("version", "")
+    except Exception:
+        return ""
+    finally:
+        if repo_switched:
+            EXISTING_CHECKER.teardown_repo()
+
+
+def check_rust_toolchain(pkgname: str, source_dir: str) -> dict[str, Any] | None:
+    """Rust MSRV / toolchain channel 预检。返回 None 表示无冲突或无法判断（放行）。
+
+    返回非 None 时表示确认存在结构性冲突，调用方应直接判定 blocked，
+    不进入 vendor/构建流程。
+    """
+    src = Path(source_dir)
+
+    channel = _read_rust_toolchain_channel(src)
+    if channel and channel.lower() in ("nightly", "beta"):
+        return {
+            "name": pkgname,
+            "reason": f"rust-toolchain 要求 channel={channel!r}，标准 COPR chroot 只提供 stable 版 rustc，"
+                       f"无法满足 nightly/beta 工具链要求",
+        }
+
+    msrv = _read_cargo_rust_version(src)
+    # channel 为具体版本号（如 "1.92.0"）时，与 Cargo.toml 的 rust-version 是两条独立的
+    # MSRV 声明路径，须分别与 chroot rustc 版本比较（参考 lessons/rust.json 中 servo 案例）。
+    required_versions = [v for v in (msrv, channel) if v and re.match(r'^\d+\.\d+', v)]
+    if not required_versions:
+        return None  # 未声明版本要求，先尝试构建，失败再判断（既有行为不变）
+
+    copr_chroot = os.environ.get("COPR_CHROOT", "")
+    chroot_rustc = _query_chroot_rustc_version(copr_chroot)
+    if not chroot_rustc:
+        return None  # 查不到 chroot rustc 版本时保守放行，不误判
+
+    for required in required_versions:
+        try:
+            from packaging.version import Version
+            if Version(chroot_rustc) < Version(required):
+                return {
+                    "name": pkgname,
+                    "reason": f"要求 rustc >= {required}，但目标 chroot（{copr_chroot}）"
+                               f"提供的 rustc 版本为 {chroot_rustc}，无法通过修改 spec 解决",
+                }
+        except Exception:
+            continue  # 版本号解析失败时跳过这一条，不误判
+
+    return None
+
+
 # ── 主流程 ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -766,6 +871,19 @@ def main():
 
     out_file = make_output_path(args.pkgname, args.output)
     analysis_path = make_analysis_path(out_file, args.pkgname)
+
+    # ── Rust MSRV / toolchain 结构性冲突检查（vendor 早退之前，见函数注释）──────
+    # 这类冲突无法通过修改 spec 解决，提前拦截可以省掉一整轮"编译失败→AI诊断"。
+    if lang == "rust":
+        conflict = check_rust_toolchain(args.pkgname, args.source_dir)
+        if conflict:
+            output_path = Path(out_file)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            summary = build_summary(args.pkgname, lang, args.source_dir, "", [])
+            summary["blocked"] = [conflict]
+            output_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"[BLOCK] {conflict['name']}: {conflict['reason']}", file=sys.stderr)
+            sys.exit(1)
 
     # ── vendor 语言早退：Go/Rust 永远 vendor，跳过语言级依赖存在性检查 ──────────
     # 构建环境离线，这两种语言没有"不 vendor"的场景。

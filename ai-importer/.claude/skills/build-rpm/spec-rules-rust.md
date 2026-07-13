@@ -15,6 +15,13 @@
 
 ## 2. 构建前必检（生成 spec 前执行）
 
+> **已自动化，无需手动执行**（更新于 2026-07-13）：以下脚本基于已废弃的容器架构
+> （`docker exec ${SESSION_CONTAINER}`），当前 COPR 模式下无此容器，本节代码不会
+> 被执行。MSRV / `rust-toolchain.toml` channel 检查现由预检阶段自动完成，见
+> `build-rpm/scripts/pre_check_deps.py` 的 `check_rust_toolchain()`（查询 COPR
+> 目标 chroot 仓库里 rust 包的实际版本，而非本地/容器内的 rustc）。此处代码块
+> 保留仅作历史参考，不应再照此手动执行。
+
 ```bash
 # 检查工具链要求
 if [ -f rust-toolchain.toml ]; then

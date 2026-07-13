@@ -6,12 +6,20 @@
     --url https://github.com/mesonbuild/meson \
     --constraint ">= 1.4.0" \
     --required-by python-numpy
+
+若该依赖已登记过且新旧 --constraint 不同：两者不冲突时自动合并为同时满足
+两者的约束；冲突时（如已登记 ">=2.0"，新约束要求 "<1.5"）报错退出（exit 1），
+不静默覆盖旧约束，调用方（pkg-failure-analyzer 等）需要处理这种不可能同时
+满足的依赖版本要求。
 """
 import argparse
 import json
 import re
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from constraint_conflict import has_conflict, merge_constraints  # noqa: E402
 
 # 可信的 git 仓库主机
 _TRUSTED_GIT_HOSTS = (
@@ -114,9 +122,22 @@ def main():
                     sys.exit(1)
             old["url"] = args.url
             changed.append("url")
-        if args.constraint and not old.get("constraint"):
-            old["constraint"] = args.constraint
-            changed.append("constraint")
+        if args.constraint and args.constraint != old.get("constraint", ""):
+            old_constraint = old.get("constraint", "")
+            if old_constraint:
+                conflict, reason = has_conflict(old_constraint, args.constraint)
+                if conflict:
+                    print(f"[register-dep] ERROR: {args.pkg} 版本约束冲突 — "
+                          f"已登记 {old_constraint!r}，新约束 {args.constraint!r}：{reason}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                merged = merge_constraints(old_constraint, args.constraint)
+                if merged != old_constraint:
+                    old["constraint"] = merged
+                    changed.append("constraint")
+            else:
+                old["constraint"] = args.constraint
+                changed.append("constraint")
         if changed:
             reg_path.write_text(json.dumps(reg, indent=2, ensure_ascii=False), encoding="utf-8")
             print(f"[register-dep] updated {args.pkg}: {changed}")

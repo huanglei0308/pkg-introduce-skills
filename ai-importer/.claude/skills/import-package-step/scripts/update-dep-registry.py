@@ -3,10 +3,20 @@
 
 用法：
   python3 update-dep-registry.py --session-dir . --pkg hello-openeuler
+
+若某个依赖已登记过且新旧约束不同：两者不冲突时自动合并为同时满足两者的
+约束；冲突时（如已登记 ">=2.0"，新约束要求 "<1.5"）保留旧约束不覆盖，
+并在 stdout 打印 conflicts 列表、以非零状态退出——与 register-dep.py 对
+同一种情况的处理方式保持一致，不静默覆盖旧约束。一次调用可能同时处理
+多个依赖，冲突只影响冲突的那一条，其余依赖仍正常写入。
 """
 import argparse
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from constraint_conflict import has_conflict, merge_constraints  # noqa: E402
 
 
 def main():
@@ -64,6 +74,8 @@ def main():
                 "constraint": pc_info.get("constraint", ""),
             })
 
+    conflicts = []
+
     for dep in deps:
         name = dep["name"]
         new_constraint = dep.get("constraint", "")
@@ -78,11 +90,29 @@ def main():
         else:
             old_constraint = reg[name].get("constraint", "")
             if new_constraint and new_constraint != old_constraint:
-                reg[name]["constraint"] = new_constraint
-                updated.append(name)
+                if old_constraint:
+                    conflict, reason = has_conflict(old_constraint, new_constraint)
+                    if conflict:
+                        conflicts.append({
+                            "name": name,
+                            "old_constraint": old_constraint,
+                            "new_constraint": new_constraint,
+                            "reason": reason,
+                        })
+                        continue
+                    merged = merge_constraints(old_constraint, new_constraint)
+                    if merged != old_constraint:
+                        reg[name]["constraint"] = merged
+                        updated.append(name)
+                else:
+                    reg[name]["constraint"] = new_constraint
+                    updated.append(name)
 
     reg_path.write_text(json.dumps(reg, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"[update-dep-registry] added={added} updated={updated}")
+    if conflicts:
+        print(f"[update-dep-registry] conflicts={json.dumps(conflicts, ensure_ascii=False)}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
