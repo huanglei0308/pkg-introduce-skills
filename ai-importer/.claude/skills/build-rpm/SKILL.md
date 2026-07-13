@@ -74,6 +74,56 @@ MAX_ROUNDS = 10
 
 ## 主流程
 
+### 0. 读取 gate 决策，确定构建路径
+
+**在开始任何操作之前**，先读取 gate_result 获取处置策略：
+
+```bash
+GATE_RESULT="./reports/gate_result_<pkgname>.json"
+GATE_DECISION=""
+if [ -f "$GATE_RESULT" ]; then
+  GATE_DECISION=$(python3 -c "import json; d=json.load(open('$GATE_RESULT')); print(d.get('result',{}).get('decision',''))" 2>/dev/null)
+  echo "[build-rpm] gate decision: $GATE_DECISION"
+fi
+```
+
+根据 `GATE_DECISION` 分支：
+
+#### `reuse_eur_srpm` — EUR SRPM 重建
+
+gate 阶段已下载 SRPM 到 `./srpms/` 并提取 spec 到 `./pkgs/<pkgname>/reference/`。
+
+**跳过 §1-§5，直接到 §6 提交 COPR 构建**：
+
+```bash
+echo "[build-rpm] EUR SRPM 重建模式 — 跳过 spec 生成，直接提交 COPR"
+SRPM_FILE=$(ls ./srpms/<pkgname>*.src.rpm 2>/dev/null | head -1)
+if [ -f "$SRPM_FILE" ]; then
+  python3 $SCRIPTS_DIR/copr_client.py \
+    "$SRPM_FILE" \
+    --output ./pkgs/<pkgname>/build_rpm_result.json \
+    --chroot "$COPR_CHROOT"
+  echo "✓ EUR SRPM 已提交 COPR 构建"
+  exit 0
+else
+  echo "[build-rpm] WARN: EUR SRPM 未找到，回退到完整构建流程"
+fi
+```
+
+若 SRPM 下载失败（网络问题），回退到完整构建流程。
+
+#### `introduce_new_with_ref` — 有参考源的新引入
+
+gate 阶段已拉取参考 spec/yaml/patches 到 `./pkgs/<pkgname>/reference/`。
+
+**跳过 §2.5**（参考源已在 gate 阶段拉取），§3 会自动检测参考 spec 并进入适配模式。
+
+#### 其他决策（`introduce_new` / 空）
+
+走完整流程（§1 → §2 → §2.5 → §3 → ...）。
+
+---
+
 ### 1. 读取源码中的构建说明
 
 若 `./sources/<pkgname>/` 不存在，先 clone：
@@ -109,34 +159,9 @@ PRECHECK_RC=$?
 - `PRECHECK_RC=1`（blocked）：终止，不生成 spec。
 - `PRECHECK_RC=2`（dep_needed）：将缺包写入 `dep_registry.json`，退出等待 lead 处理。
 - `PRECHECK_RC=3`（needs_ai）：web search 补全 upstream URL 后重新执行本步骤。
-- `PRECHECK_RC=0`（precheck_done）：继续 §2.5。
+- `PRECHECK_RC=0`（precheck_done）：继续 §3。
 
-### 2.5 检查 openEuler 源仓库中的已有 spec（参考源）
-
-**仅首次构建时执行**（rebuild 模式跳过）。检查 `https://gitcode.com/src-openeuler/<pkgname>` 是否有已维护的 spec 文件，有则拉取作为 spec 生成起点。
-
-```bash
-REF_DIR="./pkgs/<pkgname>/reference"
-REF_RESULT="./pkgs/<pkgname>/reference_result.json"
-
-# 幂等：已拉取过则跳过（reference_result.json 由 fetch 脚本写入）
-if [ ! -f "$REF_RESULT" ]; then
-  python3 /app/.claude/skills/build-rpm/scripts/fetch_reference_spec.py \
-    --pkgname <pkgname> \
-    --output-dir "$REF_DIR" \
-    --output-json "$REF_RESULT"
-fi
-```
-
-参考源拉取到的目录结构（如找到）：
-```
-./pkgs/<pkgname>/reference/
-  <pkgname>.spec      # 已有 spec（参考起点）
-  <pkgname>.yaml      # 元数据（上游仓库、tag 前缀等，可选）
-  *.patch             # patch 文件（可选）
-```
-
-**若 gitcode.com 不可达或仓库不存在**：脚本输出 `{"found": false}`，后续 §3 自动回退到从头生成，不阻断流程。
+> **§2.5（检查参考源）已移除。** 参考源的查询和拉取由 gate 阶段的 4 级级联查找统一完成。若 gate 决定 `introduce_new_with_ref`，参考 spec/yaml/patches 已在 `./pkgs/<pkgname>/reference/` 中；若 gate 决定 `introduce_new`，说明 gitcode 也没有参考源，无需再查。
 
 ### 3. 生成 spec
 

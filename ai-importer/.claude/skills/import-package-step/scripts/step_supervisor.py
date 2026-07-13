@@ -147,7 +147,9 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
             g = read_json(gate_path)
             decision = g.get("result", {}).get("decision", "")
             if g.get("overall_status") == "done" and \
-               decision in ("introduce_new", "reuse_official", "reuse_copr_project"):
+               decision in ("introduce_new", "introduce_new_with_ref",
+                            "reuse_official", "reuse_copr_project",
+                            "reuse_eur_srpm"):
                 gate_valid = True
             elif decision == "check_failed":
                 # 网络/下载临时失败，删除后重试（不算损坏，delay 长一些）
@@ -421,8 +423,8 @@ def update_after_evaluate_main(sd: Path, wf: dict, wf_path: Path, gate_decision:
         if PKGNAME not in wf["reused_pkgs"]:
             wf["reused_pkgs"].append(PKGNAME)
         wf["goal_achieved"] = True  # 下一轮 determine_action 直接返回 done
-    elif gate_decision == "introduce_new":
-        pass  # gate_result 文件已存在，下一轮走 build_main
+    elif gate_decision in ("introduce_new", "introduce_new_with_ref", "reuse_eur_srpm"):
+        pass  # gate_result 文件已存在，需要走 COPR 构建
     else:
         # gate 失败（空 decision 或未知值）：写入 evaluate_failed，等待 AI 分析
         wf["evaluate_failed"] = gate_decision or "evaluate_main gate failed"
@@ -432,13 +434,14 @@ def update_after_evaluate_main(sd: Path, wf: dict, wf_path: Path, gate_decision:
 
 def update_after_evaluate(sd: Path, reg: dict, reg_path: Path, target: str, gate_decision: str) -> None:
     """evaluate 完成后更新 dep_registry。"""
-    if "reuse" in gate_decision:
+    if gate_decision in ("reuse_official", "reuse_copr_project"):
         reg[target]["status"] = "reused"
         # 记录实际解析版本，用于后续约束降级检查
         v = _get_resolved_version(sd, target)
         if v:
             reg[target]["resolved_version"] = v
-    elif gate_decision in ("introduce_new", "upgrade_user_repo"):
+    elif gate_decision in ("introduce_new", "introduce_new_with_ref",
+                           "reuse_eur_srpm", "upgrade_user_repo"):
         reg[target]["status"] = "evaluate_done"
     else:
         # gate 失败：写入 evaluate_failed，等待 AI 分析
