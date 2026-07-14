@@ -65,20 +65,16 @@ go mod verify
 
 #### B. 预生成 vendor（上游无 vendor/）
 
+> COPR 模式下无 `SESSION_CONTAINER`（pkg-builder.md 明确标注），以下命令直接在
+> 当前工作目录本地执行，不经过容器。`go mod vendor` 本身需要联网拉取模块源码
+> 才能生成 vendor（这是预检/构建准备阶段，不是离线的 rpmbuild 执行阶段），
+> 与 pre_check_deps.py 里 dnf repoquery 联网查询社区源用的是同一个执行环境。
+
 ```bash
-# 在容器内预生成（action_type=vendor_fetch，必须记录到 build_actions.json）
-docker exec ${SESSION_CONTAINER} bash -c "
-  cd /build/source
-  go mod vendor
-  # 验证版本一致性
-  go mod verify
-"
+# action_type=vendor_fetch，必须记录到 build_actions.json
+(cd ./sources/${pkgname} && go mod vendor && go mod verify)
 # 将 vendor/ 打包为额外 Source
-docker exec ${SESSION_CONTAINER} bash -c "
-  cd /build/source && tar czf /tmp/${pkgname}-vendor.tar.gz vendor/
-"
-docker cp ${SESSION_CONTAINER}:/tmp/${pkgname}-vendor.tar.gz \
-  ./sources/${pkgname}/${pkgname}-vendor.tar.gz
+tar czf ./sources/${pkgname}/${pkgname}-vendor.tar.gz -C ./sources/${pkgname} vendor/
 ```
 
 spec 中声明：
