@@ -109,7 +109,14 @@ def _scan_eur_results(projects: list[dict[str, str]], pkgname: str,
 
     返回命中的第一个匹配结果，含 srpm_url / binary_rpm_url / version / chroot。
     若 target_version 指定，EUR 版本必须 >= 目标版本才返回命中。
+    若 target_chroot 指定，仅扫描匹配的目标版本 chroot（如 openeuler-24.03-lts-sp3）。
     """
+    # Normalize target for chroot matching
+    target_base = ""
+    if target_chroot:
+        target_base = re.sub(r"-(x86_64|aarch64|noarch|i686|i386)$", "", target_chroot)
+        target_base = target_base.replace("_", "-").lower()
+
     for proj in projects:
         owner = proj["owner"]
         project_name = proj["project"]
@@ -123,7 +130,13 @@ def _scan_eur_results(projects: list[dict[str, str]], pkgname: str,
         except Exception:
             continue
 
-        chroot_dirs = re.findall(r'href="([^"]+/)"', html)
+        chroot_dirs: list[str] = re.findall(r'href="([^"]+/)"', html)
+        # If target_base is specified, prioritize matching chroots first
+        if target_base:
+            matching = [c for c in chroot_dirs if c.rstrip("/").replace("_", "-").lower().startswith(target_base)]
+            non_matching = [c for c in chroot_dirs if c not in matching]
+            chroot_dirs = matching + non_matching
+
         for chroot_dir in chroot_dirs:
             chroot = chroot_dir.rstrip("/")
             if not chroot or chroot.startswith(".."):
