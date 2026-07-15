@@ -334,8 +334,13 @@ def _check_src_openeuler(pkgname: str, lang: str, target: str = "") -> Optional[
 # ── Level 0: 用户 COPR project ─────────────────────────────────────────────────
 
 def _check_user_copr_project(pkgname: str, copr_url: str, owner: str,
-                              project: str, login: str, token: str) -> Optional[dict]:
-    """检查用户自己的 COPR project 是否已有此包（避免重复构建）。"""
+                              project: str, login: str, token: str,
+                              target: str = "") -> Optional[dict]:
+    """检查用户自己的 COPR project 是否已有此包（避免重复构建）。
+
+    仅当已有构建的 chroot 与 target 匹配时才返回复用结果，
+    避免将不同目标版本的构建误判为可复用。
+    """
     if not (copr_url and owner and project and login and token):
         return None
 
@@ -356,10 +361,21 @@ def _check_user_copr_project(pkgname: str, copr_url: str, owner: str,
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
         items = data.get("items", [])
+        # Normalize target for comparison (strip arch suffix)
+        target_base = ""
+        if target:
+            target_base = re.sub(r"-(x86_64|aarch64|noarch|i686|i386)$", "", target)
+            target_base = target_base.replace("_", "-").lower()
+
         best = None
         for build in items:
             if build.get("state") != "succeeded":
                 continue
+            # If target is specified, ensure at least one chroot matches
+            if target_base:
+                build_chroots = [c.lower().replace("_", "-") for c in build.get("chroots", [])]
+                if not any(c.startswith(target_base) for c in build_chroots):
+                    continue
             ver = build.get("source_package", {}).get("version", "")
             if ver and (best is None or _checker.compare_versions(ver, best["version"]) > 0):
                 best = {"name": pkgname, "version": ver}
@@ -420,7 +436,7 @@ def check_package_existence(
 
     # ── Level 0: 用户 COPR project ──────────────────────────────────────────
     user_result = _check_user_copr_project(
-        pkgname, copr_url, copr_owner, copr_project, copr_login, copr_token
+        pkgname, copr_url, copr_owner, copr_project, copr_login, copr_token, target
     )
     if user_result:
         result.update(user_result)
