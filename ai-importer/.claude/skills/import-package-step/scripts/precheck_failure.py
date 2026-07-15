@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Build failure pre-check: scan build log for high-confidence fixable patterns.
 
-If a pattern matches, directly write failure_analysis_*.json with verdict=rebuild
-and apply the spec fix. This bypasses the AI agent for known-deterministic cases.
-
-The generated failure_analysis includes spec_patch entries so that the rebuild-mode
-AI can verify the fix was applied correctly.
+If a pattern matches, writes failure_analysis_*.json with verdict=rebuild and
+populated spec_patch for AI to apply in rebuild mode. Does NOT modify the spec
+itself — the AI reads the analysis and learns to apply the fix, so it can handle
+similar issues in the future without new precheck rules.
 
 Usage:
   python3 precheck_failure.py --session-dir <dir> --pkgname <pkg>
@@ -121,7 +120,12 @@ def find_pattern(log_text: str) -> dict | None:
 
 def write_analysis(session_dir: Path, pkgname: str, copr_build_id: str,
                    pattern: dict) -> None:
-    """Write failure_analysis_*.json, fix_instructions.md, and apply spec fix."""
+    """Write failure_analysis_*.json and fix_instructions.md.
+
+    Does NOT modify the spec — only diagnoses and generates structured fix
+    instructions (spec_patch). The AI in rebuild mode reads the analysis and
+    applies the fix, so it learns the pattern for future similar issues.
+    """
     pkg_dir = session_dir / "pkgs" / pkgname
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
@@ -132,10 +136,9 @@ def write_analysis(session_dir: Path, pkgname: str, copr_build_id: str,
         if "%s" in reason:
             reason = reason % m.groups()
         else:
-            # Append the matched path for clarity
             reason = f"{reason}：{m.group(1)}"
 
-    # Determine spec_patch: try resolve() first, fall back to empty
+    # Generate spec_patch: try resolve() to detect the exact fix needed
     spec_patch: list[dict] = []
     spec_path = pkg_dir / f"{pkgname}.spec"
 
@@ -144,20 +147,17 @@ def write_analysis(session_dir: Path, pkgname: str, copr_build_id: str,
         original = spec_path.read_text(encoding="utf-8").splitlines(keepends=True)
         resolved = resolver(original)
         if resolved is not None:
-            fixed_lines, spec_patch = resolved
-            spec_path.write_text("".join(fixed_lines), encoding="utf-8")
-            print(f"[precheck] applied spec fix for pattern: {pattern['name']}", file=sys.stderr)
+            _fixed_lines, spec_patch = resolved
+            print(f"[precheck] diagnosed fix for pattern: {pattern['name']}, "
+                  f"spec_patch={len(spec_patch)} entries", file=sys.stderr)
         else:
-            # Resolve returned None — macro not found in spec. Still write the
-            # analysis so AI can handle it; mark spec_patch empty.
             print(f"[precheck] pattern {pattern['name']} matched but macro not found in spec, "
-                  f"AI will handle in rebuild", file=sys.stderr)
-
-    elif spec_path.exists():
-        # No resolver but spec exists — AI handles the fix in rebuild
+                  f"AI will diagnose from fix_instructions", file=sys.stderr)
+    else:
+        # No resolver — AI will figure out the fix from fix_instructions
         print(f"[precheck] pattern {pattern['name']} requires AI-driven spec fix", file=sys.stderr)
 
-    # Write failure_analysis JSON (with spec_patch so AI can verify)
+    # Write failure_analysis JSON — AI reads this in rebuild mode
     if copr_build_id:
         analysis_path = pkg_dir / f"failure_analysis_{pkgname}_{copr_build_id}.json"
     else:
