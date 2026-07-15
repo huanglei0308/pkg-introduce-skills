@@ -89,18 +89,22 @@ def _download_eur_srpm(match_info: dict, pkgname: str, pkgs_dir: Path, srpms_dir
 def _fetch_reference(match_info: dict, pkgname: str, pkgs_dir: Path) -> None:
     """从 gitcode src-openeuler 拉取参考 spec/yaml/patches。"""
     repo_name = match_info["repo_name"]
+    target_branch = match_info.get("target_branch", "")
     ref_dir = pkgs_dir / "reference"
     if (ref_dir / f"{repo_name}.spec").exists() or (ref_dir / f"{pkgname}.spec").exists():
         return
     ref_result = ref_dir.parent / "reference_result.json"
     try:
         fetch_script = Path(__file__).resolve().parent / "../../build-rpm/scripts/fetch_reference_spec.py"
-        print(f"[gate] 拉取参考源: gitcode.com/src-openeuler/{repo_name}", file=sys.stderr)
-        subprocess.run(
-            ["python3", str(fetch_script), "--pkgname", repo_name,
-             "--output-dir", str(ref_dir), "--output-json", str(ref_result)],
-            check=True, timeout=60,
-        )
+        cmd = ["python3", str(fetch_script), "--pkgname", repo_name,
+               "--output-dir", str(ref_dir), "--output-json", str(ref_result)]
+        if target_branch:
+            cmd += ["--target-branch", target_branch]
+            print(f"[gate] 拉取参考源: gitcode.com/src-openeuler/{repo_name} (branch={target_branch})",
+                  file=sys.stderr)
+        else:
+            print(f"[gate] 拉取参考源: gitcode.com/src-openeuler/{repo_name}", file=sys.stderr)
+        subprocess.run(cmd, check=True, timeout=60)
         print(f"[gate] 参考源已拉取到: {ref_dir}", file=sys.stderr)
     except Exception as exc:
         print(f"[gate] WARN: 拉取参考源失败: {exc}", file=sys.stderr)

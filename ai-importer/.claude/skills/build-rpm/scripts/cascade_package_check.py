@@ -300,18 +300,30 @@ def _clone_and_extract(pkgname: str, output_dir: Path) -> bool:
     return _clone_extract(pkgname, output_dir)
 
 
-def _check_src_openeuler(pkgname: str, lang: str) -> Optional[dict]:
-    """查 gitcode.com/src-openeuler 仓库是否存在。"""
+def _check_src_openeuler(pkgname: str, lang: str, target: str = "") -> Optional[dict]:
+    """查 gitcode.com/src-openeuler 仓库是否存在，并匹配目标版本分支。
+
+    当 target 指定时（如 openEuler-24.03-LTS-SP3），优先使用对应版本分支
+    的 spec 作为参考源，避免默认分支版本不匹配的问题。
+    """
+    from fetch_reference_spec import _find_best_branch
+
     candidates = _build_gitcode_candidates(pkgname, lang)
     for candidate in candidates:
         exists = _git_ls_remote(candidate)
         if exists is True:
-            return {
+            result = {
                 "level": 3,
                 "decision": "introduce_new_with_ref",
                 "gitcode_repo": f"https://{GITCODE_HOST}/{PKG_NAMESPACE}/{candidate}.git",
                 "repo_name": candidate,
             }
+            # 查找匹配目标版本的分支
+            if target:
+                best_branch = _find_best_branch(candidate, target)
+                if best_branch:
+                    result["target_branch"] = best_branch
+            return result
         elif exists is None:
             # 网络错误，继续尝试下一个候选
             continue
@@ -433,7 +445,7 @@ def check_package_existence(
         return result
 
     # ── Level 3: gitcode src-openeuler ──────────────────────────────────────
-    gitcode_match = _check_src_openeuler(pkgname, lang)
+    gitcode_match = _check_src_openeuler(pkgname, lang, target)
     if gitcode_match:
         result.update(gitcode_match)
         return result

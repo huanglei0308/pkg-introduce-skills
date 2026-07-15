@@ -28,6 +28,14 @@ PKG_NAMESPACE = "src-openeuler"
 CLONE_TIMEOUT = 30
 LS_REMOTE_TIMEOUT = 10
 
+# 目标版本 → 分支匹配的最大尝试次数（不同命名风格）
+BRANCH_MATCH_STRATEGIES = [
+    # openEuler-24.03-LTS-SP3 → openEuler-24.03-LTS-SP3（完全匹配）
+    lambda t: t,
+    # openEuler-24.03-LTS-SP3 → openEuler-24.03-LTS-SP3（下划线变体）
+    lambda t: t.replace("-", "_"),
+]
+
 # 重试配置
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2  # 秒，递增：2 → 4 → 6
@@ -128,8 +136,101 @@ def _repo_exists(pkgname: str) -> Optional[bool]:
     return None
 
 
-def _clone_and_extract(pkgname: str, output_dir: Path) -> bool:
-    """Shallow-clone and copy spec / yaml / patches, with retry."""
+def _list_remote_branches(pkgname: str) -> list[str] | None:
+    """List all branch names from a gitcode repo. Returns None on network error."""
+    url = f"https://{GITCODE_HOST}/{PKG_NAMESPACE}/{pkgname}.git"
+    try:
+        result = _run_git(
+            ["git", "ls-remote", "--heads", url],
+            timeout=LS_REMOTE_TIMEOUT,
+            desc=f"ls-remote {pkgname}",
+        )
+        if result.returncode != 0:
+            return None
+        branches = []
+        for line in result.stdout.strip().split("\n"):
+            if not line:
+                continue
+            parts = line.strip().split("\t")
+            if len(parts) >= 2:
+                branch = parts[1].replace("refs/heads/", "")
+                if branch:
+                    branches.append(branch)
+        return branches
+    except subprocess.TimeoutExpired:
+        _log(f"ls-remote {pkgname} timed out")
+        return None
+    except Exception as exc:
+        _log(f"ls-remote {pkgname} exception: {exc}")
+        return None
+
+
+def _normalize_target(target: str) -> str:
+    """Normalize chroot-format target to src-openeuler branch naming.
+
+    openeuler-24.03_LTS_SP3-x86_64 → openEuler-24.03-LTS-SP3
+    openeuler-24.03_LTS-x86_64     → openEuler-24.03-LTS
+    """
+    t = target.strip()
+    # Strip architecture suffix (-x86_64, -aarch64, -noarch)
+    t = re.sub(r"-(x86_64|aarch64|noarch|i686|i386)$", "", t)
+    # Replace underscores with hyphens
+    t = t.replace("_", "-")
+    # Fix common capitalization issues
+    lower = t.lower()
+    if lower.startswith("openeuler-"):
+        t = "openEuler-" + t[len("openeuler-"):]
+    return t
+
+
+def _find_best_branch(pkgname: str, target_version: str) -> str | None:
+    """Find the best matching branch for the target openEuler version.
+
+    Handles both canonical format (openEuler-24.03-LTS-SP3) and chroot format
+    (openeuler-24.03_LTS_SP3-x86_64).
+
+    Strategy:
+      1. Normalize target version, try exact match
+      2. Try prefix match on openEuler-XX.YY (select highest SP/patch version)
+      3. Return None if no match found (caller falls back to default branch)
+    """
+    if not target_version:
+        return None
+
+    normalized = _normalize_target(target_version)
+
+    branches = _list_remote_branches(pkgname)
+    if not branches:
+        return None
+
+    # 1) Exact match with different naming conventions
+    for strategy in BRANCH_MATCH_STRATEGIES:
+        candidate = strategy(normalized)
+        if candidate in branches:
+            return candidate
+
+    # 2) Prefix match: openEuler-24.03-LTS-SP3 → branches starting with "openEuler-24.03"
+    base_match = re.match(r"(openEuler-\d+\.\d+)", normalized)
+    if base_match:
+        base = base_match.group(1)
+        # Also try with underscore: openEuler_24_03
+        base_underscore = base.replace("-", "_")
+        matching = sorted(
+            [b for b in branches if b.startswith(base) or b.startswith(base_underscore)],
+            reverse=True,  # sort reverse gives highest match first
+        )
+        if matching:
+            return matching[0]
+
+    return None
+
+
+def _clone_and_extract(pkgname: str, output_dir: Path, target_branch: str = "") -> bool:
+    """Shallow-clone and copy spec / yaml / patches, with retry.
+
+    If target_branch is given, clone that specific branch; otherwise clone default.
+    """
+    url = f"https://{GITCODE_HOST}/{PKG_NAMESPACE}/{pkgname}.git"
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             tmp = Path(tempfile.mkdtemp(prefix=f"refspec_{pkgname}_"))
@@ -138,13 +239,25 @@ def _clone_and_extract(pkgname: str, output_dir: Path) -> bool:
             return False
 
         try:
-            ok = _try_git_clone(pkgname, tmp)
-            if not ok:
-                if attempt < MAX_RETRIES:
-                    delay = RETRY_BASE_DELAY * attempt
-                    _log(f"clone attempt {attempt}/{MAX_RETRIES} failed, retrying in {delay}s...")
-                    time.sleep(delay)
-                continue
+            clone_args = ["git", "clone", "--depth=1"]
+            if target_branch:
+                clone_args += ["--branch", target_branch]
+            clone_args += [url, str(tmp)]
+            result = _run_git(clone_args, timeout=CLONE_TIMEOUT, desc=f"clone {pkgname}")
+            if result.returncode != 0:
+                # If cloning the specific branch failed, try without --branch as fallback
+                if target_branch:
+                    _log(f"clone branch '{target_branch}' failed, trying default branch...")
+                    result = _run_git(
+                        ["git", "clone", "--depth=1", url, str(tmp)],
+                        timeout=CLONE_TIMEOUT, desc=f"clone {pkgname} (default branch)",
+                    )
+                if result.returncode != 0:
+                    if attempt < MAX_RETRIES:
+                        delay = RETRY_BASE_DELAY * attempt
+                        _log(f"clone attempt {attempt}/{MAX_RETRIES} failed, retrying in {delay}s...")
+                        time.sleep(delay)
+                    continue
 
             # Find spec file — prefer <pkgname>.spec, accept any .spec
             spec_file = tmp / f"{pkgname}.spec"
@@ -194,8 +307,12 @@ def _clone_and_extract(pkgname: str, output_dir: Path) -> bool:
 
 # ── main entry point ───────────────────────────────────────────────────────────
 
-def fetch_reference_spec(pkgname: str, output_dir: Path) -> dict:
+def fetch_reference_spec(pkgname: str, output_dir: Path, target_branch: str = "") -> dict:
     """Check gitcode.com for a reference spec and fetch it.
+
+    If target_branch is given, clone that specific openEuler version branch instead
+    of the default branch. Use _find_best_branch() to determine the best branch from
+    a target version string like 'openEuler-24.03-LTS-SP3'.
 
     Idempotent — if *output_dir* already contains a .spec file the function
     returns immediately without re-fetching.
@@ -224,7 +341,7 @@ def fetch_reference_spec(pkgname: str, output_dir: Path) -> dict:
         return {"found": False, "reason": "repo_not_found",
                 "detail": f"Repo {PKG_NAMESPACE}/{pkgname} not found on {GITCODE_HOST}"}
 
-    success = _clone_and_extract(pkgname, output_dir)
+    success = _clone_and_extract(pkgname, output_dir, target_branch)
     if not success:
         return {"found": False, "reason": "no_spec_file",
                 "detail": f"Repo exists but no .spec found for {pkgname}"}
@@ -239,11 +356,13 @@ def main() -> int:
         description="Fetch reference RPM spec from openEuler source repository")
     parser.add_argument("--pkgname", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--target-branch", default="",
+                        help="Target openEuler version branch (e.g. openEuler-24.03-LTS-SP3)")
     parser.add_argument("--output-json", default="",
                         help="Also write result JSON to this file")
     args = parser.parse_args()
 
-    result = fetch_reference_spec(args.pkgname, Path(args.output_dir))
+    result = fetch_reference_spec(args.pkgname, Path(args.output_dir), args.target_branch)
 
     if args.output_json:
         json_path = Path(args.output_json)

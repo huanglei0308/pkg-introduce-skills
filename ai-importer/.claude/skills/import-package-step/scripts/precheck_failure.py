@@ -4,6 +4,9 @@
 If a pattern matches, directly write failure_analysis_*.json with verdict=rebuild
 and apply the spec fix. This bypasses the AI agent for known-deterministic cases.
 
+The generated failure_analysis includes spec_patch entries so that the rebuild-mode
+AI can verify the fix was applied correctly.
+
 Usage:
   python3 precheck_failure.py --session-dir <dir> --pkgname <pkg>
   # stdout: auto_fixed | needs_ai
@@ -17,80 +20,89 @@ from datetime import date
 from pathlib import Path
 
 
+# ── Macro → explicit-command mapping ────────────────────────────────────────
+
+_MACRO_REPLACEMENTS = {
+    "%cmake_build": "cmake --build . -j$(nproc)",
+    "%make_build": "make -j$(nproc)",
+}
+
+
+def _detect_broken_macro(spec_lines: list[str]) -> str | None:
+    """Return the first macro in *spec_lines* that needs replacing, or None."""
+    for line in spec_lines:
+        stripped = line.strip()
+        if stripped in _MACRO_REPLACEMENTS:
+            return stripped
+    return None
+
+
+def _resolve_macro_fix(spec_lines: list[str]) -> tuple[list[str], list[dict]] | None:
+    """Check which macro needs replacement.
+
+    Returns (fixed_lines, spec_patch) if a macro was found and can be fixed,
+    or None if no known macro is present in the spec.
+    """
+    macro = _detect_broken_macro(spec_lines)
+    if not macro:
+        return None
+    replacement = _MACRO_REPLACEMENTS[macro]
+    fixed = [replacement + "\n" if line.strip() == macro else line
+             for line in spec_lines]
+    spec_patch = [{
+        "description": f"将 {macro} 替换为 {replacement}，避免非交互 shell 中的 job control 错误（fg/bg）",
+        "before": macro,
+        "after": replacement,
+    }]
+    return fixed, spec_patch
+
+
 # ── Pattern definitions ─────────────────────────────────────────────────────
 
-def _fix_cmake_build(spec_lines: list[str], macro: str) -> list[str]:
-    """Replace %cmake_build with cmake --build . -j$(nproc)."""
-    new_lines = []
-    for line in spec_lines:
-        if line.strip() == f"%{macro}":
-            new_lines.append("cmake --build . -j$(nproc)\n")
-        else:
-            new_lines.append(line)
-    return new_lines
-
-
-def _fix_make_build(spec_lines: list[str], macro: str) -> list[str]:
-    """Replace %make_build with make -j$(nproc)."""
-    new_lines = []
-    for line in spec_lines:
-        if line.strip() == f"%{macro}":
-            new_lines.append("make -j$(nproc)\n")
-        else:
-            new_lines.append(line)
-    return new_lines
-
-
-# Each pattern is a dict:
-#   regex: compiled regex to match against build log
-#   verdict: always "rebuild"
-#   reason_template: format string for reason field
+# Each pattern dict:
+#   name:      unique identifier (for logging)
+#   regex:     compiled regex to match against build log
+#   verdict:   always "rebuild"
+#   reason:    human-readable reason (static)
 #   fix_instructions: human-readable fix description
-#   spec_fixer: function(spec_lines, captured_groups) -> new_spec_lines or None
+#   resolve:   function(spec_lines) -> (fixed_lines, spec_patch) or None
+#              None means "AI must handle this in rebuild mode"
+
 PATTERNS = [
     {
-        "name": "fg_no_job_control_cmake",
+        "name": "fg_no_job_control",
         "regex": re.compile(r"fg: no job control", re.MULTILINE),
         "verdict": "rebuild",
-        "reason_template": "%%cmake_build 宏在非交互 shell 中调用 fg 失败，configure 已完成",
+        "reason": "%build 宏在非交互 shell 中调用 fg 失败",
         "fix_instructions": (
-            "将 %%cmake_build 替换为 cmake --build . -j$(nproc)。"
-            "cmake configure 阶段（%%cmake ...）保持不变，只替换 build 步骤。"
+            "将 %cmake_build 替换为 cmake --build . -j$(nproc)，"
+            "或将 %make_build 替换为 make -j$(nproc)。"
+            "cmake configure 阶段（%cmake 或 %configure）保持不变，只替换 build 步骤。"
         ),
-        "spec_fixer": lambda lines: _fix_cmake_build(lines, "cmake_build"),
-    },
-    {
-        "name": "fg_no_job_control_make",
-        "regex": re.compile(r"fg: no job control", re.MULTILINE),
-        "verdict": "rebuild",
-        "reason_template": "%%make_build 宏在非交互 shell 中调用 fg 失败，configure 已完成",
-        "fix_instructions": (
-            "将 %%make_build 替换为 make -j$(nproc)。"
-        ),
-        "spec_fixer": lambda lines: _fix_make_build(lines, "make_build"),
+        "resolve": _resolve_macro_fix,
     },
     {
         "name": "bg_no_job_control",
         "regex": re.compile(r"bg: no job control", re.MULTILINE),
         "verdict": "rebuild",
-        "reason_template": "shell job control 错误（bg），%%build 宏在非交互 shell 中不兼容",
+        "reason": "shell job control 错误（bg），%build 宏在非交互 shell 中不兼容",
         "fix_instructions": (
-            "将构建宏替换为显式命令：%%cmake_build → cmake --build . -j$(nproc)，"
-            "%%make_build → make -j$(nproc)。"
+            "将构建宏替换为显式命令。"
+            "若使用 %cmake_build → cmake --build . -j$(nproc)，"
+            "若使用 %make_build → make -j$(nproc)。"
         ),
-        "spec_fixer": lambda lines: (_fix_cmake_build(lines, "cmake_build")
-                                      if any(l.strip() == "%cmake_build" for l in lines)
-                                      else _fix_make_build(lines, "make_build")),
+        "resolve": _resolve_macro_fix,
     },
     {
         "name": "cd_no_such_file_prep",
         "regex": re.compile(r"cd: (.+?): No such file or directory", re.MULTILINE),
         "verdict": "rebuild",
-        "reason_template": "%%prep 阶段 cd 失败：目录 %s 不存在",
+        "reason": "",  # filled dynamically from match group
         "fix_instructions": (
-            "将 %%autosetup -n 参数改为 %%{name}-%%{version}（build-rpm 的 --transform 已统一目录名）。"
+            "将 %autosetup -n 参数改为 %{name}-%{version}"
+            "（build-rpm 的 --transform 已统一目录名）。"
         ),
-        "spec_fixer": None,  # pkg-builder rebuild 模式会处理
+        "resolve": None,  # pkg-builder rebuild 模式会根据 fix_instructions 处理
     },
 ]
 
@@ -108,16 +120,44 @@ def find_pattern(log_text: str) -> dict | None:
 
 
 def write_analysis(session_dir: Path, pkgname: str, copr_build_id: str,
-                   pattern: dict, log_text: str) -> None:
-    """Write failure_analysis_*.json with the matched verdict."""
+                   pattern: dict) -> None:
+    """Write failure_analysis_*.json, fix_instructions.md, and apply spec fix."""
     pkg_dir = session_dir / "pkgs" / pkgname
     pkg_dir.mkdir(parents=True, exist_ok=True)
 
-    reason = pattern["reason_template"]
+    # Build reason (may use match groups for patterns like cd_no_such_file)
+    reason = pattern["reason"]
     m = pattern.get("_match")
     if m and len(m.groups()) > 0:
-        reason = reason % m.groups()
+        if "%s" in reason:
+            reason = reason % m.groups()
+        else:
+            # Append the matched path for clarity
+            reason = f"{reason}：{m.group(1)}"
 
+    # Determine spec_patch: try resolve() first, fall back to empty
+    spec_patch: list[dict] = []
+    spec_path = pkg_dir / f"{pkgname}.spec"
+
+    resolver = pattern.get("resolve")
+    if resolver and spec_path.exists():
+        original = spec_path.read_text(encoding="utf-8").splitlines(keepends=True)
+        resolved = resolver(original)
+        if resolved is not None:
+            fixed_lines, spec_patch = resolved
+            spec_path.write_text("".join(fixed_lines), encoding="utf-8")
+            print(f"[precheck] applied spec fix for pattern: {pattern['name']}", file=sys.stderr)
+        else:
+            # Resolve returned None — macro not found in spec. Still write the
+            # analysis so AI can handle it; mark spec_patch empty.
+            print(f"[precheck] pattern {pattern['name']} matched but macro not found in spec, "
+                  f"AI will handle in rebuild", file=sys.stderr)
+
+    elif spec_path.exists():
+        # No resolver but spec exists — AI handles the fix in rebuild
+        print(f"[precheck] pattern {pattern['name']} requires AI-driven spec fix", file=sys.stderr)
+
+    # Write failure_analysis JSON (with spec_patch so AI can verify)
     if copr_build_id:
         analysis_path = pkg_dir / f"failure_analysis_{pkgname}_{copr_build_id}.json"
     else:
@@ -128,14 +168,14 @@ def write_analysis(session_dir: Path, pkgname: str, copr_build_id: str,
         "reason": reason,
         "fix_instructions": pattern["fix_instructions"],
         "missing_deps": [],
-        "spec_patch": [],
+        "spec_patch": spec_patch,
     }
     analysis_path.write_text(
         json.dumps(analysis, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
 
-    # Also append to fix_instructions history
+    # Append to fix_instructions history
     fix_path = pkg_dir / "fix_instructions.md"
     today = date.today().isoformat()
     fix_entry = (
@@ -146,16 +186,6 @@ def write_analysis(session_dir: Path, pkgname: str, copr_build_id: str,
     )
     with open(fix_path, "a", encoding="utf-8") as f:
         f.write(fix_entry)
-
-    # Apply spec fix if provided
-    fixer = pattern.get("spec_fixer")
-    if fixer:
-        spec_path = pkg_dir / f"{pkgname}.spec"
-        if spec_path.exists():
-            original = spec_path.read_text(encoding="utf-8").splitlines(keepends=True)
-            fixed = fixer(original)
-            spec_path.write_text("".join(fixed), encoding="utf-8")
-            print(f"[precheck] applied spec fix for pattern: {pattern['name']}", file=sys.stderr)
 
 
 def get_build_log(session_dir: Path, pkgname: str) -> tuple[str, str]:
@@ -194,7 +224,7 @@ def main() -> int:
         return 0
 
     print(f"[precheck] matched pattern: {pattern['name']}", file=sys.stderr)
-    write_analysis(session_dir, pkgname, copr_build_id, pattern, log_text)
+    write_analysis(session_dir, pkgname, copr_build_id, pattern)
     print("auto_fixed")
     return 0
 
