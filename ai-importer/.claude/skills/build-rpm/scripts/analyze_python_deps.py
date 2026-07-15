@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 
-from rpm_batch_lookup import BatchLookupError, fallback_results, provides_query, run_batch_lookup
+from rpm_batch_lookup import BatchLookupError, fallback_results, name_glob_query, provides_query, run_batch_lookup
 from rpm_naming import get_rpm_pkg_name, get_srpm_name, rpm_name_from_pep508
 
 
@@ -490,6 +490,42 @@ def scan_c_extensions_local(source_dir: str) -> Dict:
     }
 
 
+# glibc/编译器自带库，不对应额外的 -devel RPM，从链接库检测中排除
+_C_LIB_BUILTINS = {"m", "c", "pthread", "dl", "rt", "util", "resolv", "gcc_s", "stdc++"}
+
+
+def parse_extension_libraries(source_dir: str) -> List[str]:
+    """从 setup.py 的 Extension(libraries=[...]) 和 .pyx 的 `# distutils: libraries`
+    声明中静态提取需要链接的系统库名（仅解析显式声明，不执行任何代码）。
+
+    scan_c_extensions_local 函数只判断"有没有 C 扩展"，本函数进一步
+    回答"链接了哪些库"，供后续映射到 -devel RPM 包名。解析不出（如库名是变量拼接、
+    或用 pkg-config 动态探测）的情况，交给构建失败诊断循环兜底。
+    """
+    src = Path(source_dir)
+    libs: Set[str] = set()
+
+    # 1. setup.py 中的 Extension(..., libraries=['pq', 'ssl'], ...)
+    setup_py = src / "setup.py"
+    if setup_py.exists():
+        text = setup_py.read_text(errors="ignore")
+        for m in re.finditer(r"libraries\s*=\s*\[([^\]]*)\]", text):
+            for lit in re.findall(r"""['"]([^'"]+)['"]""", m.group(1)):
+                libs.add(lit.strip())
+
+    # 2. Cython .pyx 头部的 `# distutils: libraries = pq ssl`
+    for pyx in src.rglob("*.pyx"):
+        try:
+            head = pyx.read_text(errors="ignore")[:2000]
+        except OSError:
+            continue
+        for m in re.finditer(r"#\s*distutils:\s*libraries\s*=\s*(.+)", head):
+            for name in m.group(1).split():
+                libs.add(name.strip())
+
+    return sorted(n for n in libs if n and n.lower() not in _C_LIB_BUILTINS)
+
+
 # ── 4. 依赖并集合并 ───────────────────────────────────────────────────────────
 
 def _extract_pkg_key(dep: str) -> str:
@@ -730,6 +766,54 @@ def check_rpm_availability(requires: List[str] = None, pypi_metadata: Optional[D
     return {"available": available, "missing": missing, "version_conflict": version_conflict}
 
 
+def check_c_library_rpms(lib_names: List[str], chroot: Optional[str] = None) -> Dict:
+    """把 C 扩展链接的系统库名映射到 -devel RPM 包名（三级查询，与 analyze_c_deps
+    的 link_lib 路径一致：pkgconfig → cmake → lib*-devel / *-devel）。
+
+    只返回在目标 chroot 源中确实存在的包（available）；查不到的（missing）不做处理，
+    交给构建失败诊断循环兜底，避免写入未经验证的 BuildRequires。查询本身失败时
+    （无 dnf / 网络问题）也返回空 available，保持保守。
+    """
+    if not lib_names:
+        return {"available": [], "missing": []}
+
+    tasks = []
+    for lib in lib_names:
+        low = lib.lower()
+        tasks.append({
+            "dep": lib,
+            "name": lib,
+            "rpm_name": f"{low}-devel",
+            "prefer_devel": True,
+            "queries": [
+                provides_query(f"pkgconfig({low})", "pkgconfig()"),
+                provides_query(f"cmake({lib})", "cmake()"),
+                name_glob_query(f"lib{low}*-devel", "name-glob", prefer_devel=True),
+                name_glob_query(f"{low}*-devel", "name-glob", prefer_devel=True),
+            ],
+        })
+
+    chroot_info = f"，chroot={chroot}" if chroot else ""
+    print(f"\n[INFO] 查询 C 扩展链接库的 -devel RPM（{len(tasks)} 个{chroot_info}）...")
+    try:
+        results = run_batch_lookup(tasks, timeout=120, chroot=chroot)
+    except (BatchLookupError, OSError, json.JSONDecodeError) as e:
+        print(f"[WARN] C 库 RPM 查询失败（{e}），跳过（交由构建失败循环兜底）")
+        return {"available": [], "missing": [{"lib": t["dep"]} for t in tasks]}
+
+    available, missing = [], []
+    for item in results:
+        lib = item["dep"]
+        rpm = item.get("rpm")
+        if rpm:
+            print(f"  ✓ lib {lib:<30} → {rpm}")
+            available.append({"lib": lib, "rpm": rpm, "level": item.get("level", "")})
+        else:
+            print(f"  ✗ lib {lib:<30} → 未找到（交由构建失败循环兜底）")
+            missing.append({"lib": lib})
+    return {"available": available, "missing": missing}
+
+
 # ── 6. 报告输出 ───────────────────────────────────────────────────────────────
 
 def build_rpm_requires(c_ext: Dict, rpm_check: Optional[Dict],
@@ -911,9 +995,16 @@ def main():
         pypi_metadata = collect_pypi_metadata(merged + build_sys_requires)
         print(f"  ✓ 已获取 {len(pypi_metadata)} 个依赖的 PyPI 元数据")
 
+    # ── C 扩展链接库检测──
+    # 仅当检测到本地 C 扩展时才解析链接库并查 -devel RPM，纯 Python 包跳过。
+    c_libs = parse_extension_libraries(source_dir) if c_ext_local["has_c_ext"] else []
+    if c_libs:
+        print(f"\n[INFO] C 扩展声明链接库: {c_libs}")
+
     # ── dnf 查询 ──
     rpm_check = None
     build_sys_rpm_check = None
+    c_library_rpm_check = None
     if args.check_rpm:
         if not merged:
             print("[INFO] 无运行时依赖，跳过 RPM 查询")
@@ -924,6 +1015,8 @@ def main():
             print(f"\n[INFO] 查询构建系统依赖 RPM 可用性...")
             build_sys_rpm_check = check_rpm_availability(requires=build_sys_requires, pypi_metadata=pypi_metadata,
                                                          chroot=args.chroot or None)
+        if c_libs:
+            c_library_rpm_check = check_c_library_rpms(c_libs, chroot=args.chroot or None)
 
     print_report(source_dir, pkg_name, version,
                  pypi_requires, local_requires, merged, build_backend,
@@ -948,8 +1041,10 @@ def main():
             "build_sys_dependency_items": build_dependency_items(build_sys_requires, pypi_metadata),
             "c_ext_pypi": c_ext_pypi,
             "c_ext_local": c_ext_local,
+            "c_libraries": c_libs,
             "rpm_check": rpm_check,
             "build_sys_rpm_check": build_sys_rpm_check,
+            "c_library_rpm_check": c_library_rpm_check,
             "build_requires": build_rpm_requires(c_ext_local, rpm_check, build_sys_rpms),
         }
         with open(args.output, "w", encoding="utf-8") as f:

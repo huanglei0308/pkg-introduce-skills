@@ -235,6 +235,8 @@ fi
 
 **使用预检结果填写 BuildRequires：** 读 `./pkgs/<pkgname>/pre_check.json` 的 `resolved[].rpm_requirement` 直接填入。
 
+**C 扩展链接库 BuildRequires：** 若 `pre_check.json` 含 `c_library_build_requires[]`（非空），把其中每个 `-devel` 包名直接加入 `BuildRequires`——这些是预检阶段已在目标 chroot 源中验证存在的 C 扩展链接库（如 `libpq-devel`），无需再自行判断。字段为空或不存在时，按常规处理（缺的库由构建失败诊断循环兜底）。
+
 **注入历史经验：** 若传入 `--lessons`，读取并筛选相关条目注入 spec 生成推理。
 
 **第四步：根据是否有参考 spec 选择生成策略**

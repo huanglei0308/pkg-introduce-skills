@@ -221,10 +221,17 @@ BuildRequires:  python3-setuptools
 BuildRequires:  gcc
 # 若源码有 CMakeLists.txt，必须加：
 # BuildRequires:  cmake
-# BuildRequires:  libuv-devel   （按实际依赖添加）
+# 链接的系统库 -devel 包（如 libpq-devel）：见下方"链接库"说明
 # 若有 .pyx 文件：
 # BuildRequires:  python3-Cython
 ```
+
+> **链接库 BuildRequires**：C 扩展链接的系统库（如 `libpq-devel`、`openssl-devel`）
+> 不要靠猜。预检阶段已从 `setup.py` 的 `Extension(libraries=[...])` 和 `.pyx` 的
+> `# distutils: libraries` 声明中解析链接库，并在目标 chroot 源中验证存在性，结果写入
+> `pre_check.json` 的 `c_library_build_requires[]`。**直接读该字段填入 BuildRequires**。
+> 该字段只含已验证存在的包；若某链接库没被解析出来或源中不存在（如库名是变量拼接、
+> 或用 pkg-config 动态探测），则不在字段中，交由构建失败诊断循环（`fatal error: xxx.h`）兜底。
 
 > **重要**：若源码目录存在 `CMakeLists.txt`，必须加 `BuildRequires: cmake`，
 > 否则 cmake 生成的头文件（如 `encodings.h`）不会生成，`%build` 会报 `No such file or directory`。

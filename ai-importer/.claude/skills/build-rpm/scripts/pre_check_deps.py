@@ -960,6 +960,21 @@ def main():
     decisions = preblocked_decisions + [classify_dependency(dep, lang, source_index) for dep in dependency_items]
     summary = build_summary(args.pkgname, lang, args.source_dir, str(analysis_path), decisions)
 
+    # 缺口3：把 analyze 阶段查到的、在目标 chroot 源中确实存在的 C 扩展链接库
+    # -devel 包，作为一个独立字段带进 summary，供 spec 生成时直接加入 BuildRequires。
+    # 只带 available（已验证存在）的，不写未经验证的包名；查不到的交给构建失败循环。
+    c_lib_check = result.get("c_library_rpm_check") or {}
+    c_lib_brs = []
+    seen_brs: set[str] = set()
+    for item in c_lib_check.get("available", []):
+        rpm = item.get("rpm", "")
+        if rpm and rpm not in seen_brs:
+            seen_brs.add(rpm)
+            c_lib_brs.append(rpm)
+    summary["c_library_build_requires"] = c_lib_brs
+    if c_lib_brs:
+        print(f"[pre_check] C 扩展链接库 BuildRequires: {c_lib_brs}", file=sys.stderr)
+
     output_path = Path(out_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
