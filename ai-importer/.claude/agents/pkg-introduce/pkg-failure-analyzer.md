@@ -76,12 +76,17 @@ python3 -c "import json; d=json.load(open('$BUILD_RESULT')); print(d.get('build_
 | 特征 | verdict |
 |------|---------|
 | `cd: <xxx>: No such file or directory`（%prep 失败） | `rebuild`（%autosetup -n 目录名错误） |
+| `fg: no job control` / `bg:` / shell job control 错误（%build 段，configure 已完成，`%cmake_build` 或 `%make_build` 等宏在非交互 shell 中依赖后台任务控制） | `rebuild`（将 `%cmake_build` 替换为 `cmake --build . -j$(nproc)`，将 `%make_build` 替换为 `make -j$(nproc)`；**必须同时保留 `%cmake` 或 `%configure` configure 步骤，只替换 build 步骤**） |
 | rpmbuild error / bad exit status（spec 语法/宏错误） | `rebuild` |
 | %check 失败 / 测试未通过 | `rebuild` |
 
 ### 类别 D：无法修复
 
 gcc / python3 / 系统运行时版本不足且无法引入替换、架构不支持、循环依赖 → `abort`
+
+> ⚠️ **常见误判提醒**：以下错误**不是**基础设施/环境问题，属于类别 C，应判 `rebuild`：
+> - `fg: no job control` / `bg:` — shell 作业控制错误。只要 configure 阶段已成功，替换 `%cmake_build` → `cmake --build . -j$(nproc)` 即可修复
+> - `line X: fg: no job control` — 同上，是 `%cmake_build` 宏展开后的代码，不是 shell 环境缺陷
 
 ## 步骤 2：执行——按 verdict 操作
 

@@ -153,10 +153,16 @@ analyze_evaluate)
   ;;
 
 analyze_failure)
-  Agent(
-    subagent_type="pkg-failure-analyzer",
-    prompt=f"pkgname: {PKGNAME}\nsession_dir: {SESSION_DIR}"
-  )
+  PRE=$(python3 "$SCRIPTS_DIR/precheck_failure.py" \
+    --session-dir "$SESSION_DIR" --pkgname "$PKGNAME")
+  if [ "$PRE" = "auto_fixed" ]; then
+    echo "[step] precheck auto-fixed, skipping AI analysis"
+  else
+    Agent(
+      subagent_type="pkg-failure-analyzer",
+      prompt=f"pkgname: {PKGNAME}\nsession_dir: {SESSION_DIR}"
+    )
+  fi
   eval "$(python3 "$READ_BUILD_RESULT" --session-dir "$SESSION_DIR" --pkgname "$PKGNAME")"
   python3 "$SUPERVISOR" --session-dir "$SESSION_DIR" \
     --update-action build_main --update-target "$PKGNAME" \
@@ -164,10 +170,16 @@ analyze_failure)
   ;;
 
 analyze_failure_dep)
-  Agent(
-    subagent_type="pkg-failure-analyzer",
-    prompt=f"pkgname: {TARGET}\nsession_dir: {SESSION_DIR}"
-  )
+  PRE=$(python3 "$SCRIPTS_DIR/precheck_failure.py" \
+    --session-dir "$SESSION_DIR" --pkgname "$TARGET")
+  if [ "$PRE" = "auto_fixed" ]; then
+    echo "[step] precheck auto-fixed dep, skipping AI analysis"
+  else
+    Agent(
+      subagent_type="pkg-failure-analyzer",
+      prompt=f"pkgname: {TARGET}\nsession_dir: {SESSION_DIR}"
+    )
+  fi
   eval "$(python3 "$READ_BUILD_RESULT" \
     --session-dir "$SESSION_DIR" --pkgname "$TARGET")"
   python3 "$SUPERVISOR" --session-dir "$SESSION_DIR" \
