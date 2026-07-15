@@ -22,8 +22,7 @@ from pathlib import Path
 # ── Macro → explicit-command mapping ────────────────────────────────────────
 
 _MACRO_REPLACEMENTS = {
-    "%cmake_build": "cmake --build redhat-linux-build -j$(nproc)",
-    "%cmake_install": "DESTDIR=%{buildroot} cmake --install redhat-linux-build",
+    "%cmake_build": "cmake --build . -j$(nproc)",
     "%make_build": "make -j$(nproc)",
 }
 
