@@ -23,7 +23,9 @@ from pathlib import Path
 
 _MACRO_REPLACEMENTS = {
     "%cmake_build": "cmake --build . -j$(nproc)",
+    "%cmake_install": "DESTDIR=%{buildroot} cmake --install .",
     "%make_build": "make -j$(nproc)",
+    "%make_install": "DESTDIR=%{buildroot} make install",
 }
 
 
