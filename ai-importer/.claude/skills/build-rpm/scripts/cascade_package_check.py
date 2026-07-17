@@ -88,19 +88,31 @@ def _eur_fulltext_search(pkgname: str) -> list[dict[str, str]]:
     return projects
 
 
-def _eur_pkgname_matches(build_dir_name: str, pkgname: str) -> bool:
-    """检查 build 目录中的包名是否与目标包匹配。
+KNOWN_LANG_PREFIXES = [
+    "python", "python3", "nodejs", "golang",
+    "rust", "ruby", "perl", "lua", "php",
+]
 
-    上游包名可能与 RPM 包名不同（如 requests vs python-requests），
-    使用包含匹配（考虑到连字符分隔的包名）。
+def _eur_pkgname_matches(build_dir_name: str, pkgname: str) -> bool:
+    """检查 EUR build 目录名是否与目标包匹配。
+
+    策略：先整词相等；再剥离已知语言前缀后整词相等。
     """
     bd = build_dir_name.lower().replace("_", "-")
     pn = pkgname.lower().replace("_", "-")
     if bd == pn:
         return True
-    # 模糊匹配：python-requests 匹配 requests, nodejs-lodash 匹配 lodash
-    parts = bd.split("-")
-    return pn in parts or any(p.startswith(pn) or pn.startswith(p) for p in parts if len(p) >= 3)
+    # 剥离语言前缀后比较（Python 包常见 python-xxx → xxx）
+    for prefix in KNOWN_LANG_PREFIXES:
+        if bd.startswith(prefix + "-"):
+            if bd[len(prefix) + 1:] == pn:
+                return True
+            break  # 只匹配一个前缀
+    # 反向：加前缀后比较
+    for prefix in ["python", "python3", "nodejs", "rust", "golang"]:
+        if (prefix + "-" + pn) == bd:
+            return True
+    return False
 
 
 def _scan_eur_results(projects: list[dict[str, str]], pkgname: str,

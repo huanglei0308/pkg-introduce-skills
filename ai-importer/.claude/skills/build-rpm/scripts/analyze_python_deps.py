@@ -135,6 +135,25 @@ BLOCKED_UPSTREAM_HOSTS = {
     "readthedocs.org",
 }
 
+# GitHub/Gitee/GitLab 保留路径前缀（不是用户/组织名）
+_RESERVED_BY_HOST = {
+    "github.com": {
+        "sponsors", "orgs", "apps", "topics", "collections",
+        "marketplace", "trending", "explore", "features",
+        "enterprise", "settings", "notifications", "login",
+        "join", "about", "pricing", "site", "readme",
+        "account", "dashboard", "codespaces", "gists",
+    },
+    "gitlab.com": {
+        "help", "explore", "users", "groups", "-",
+        "dashboard", "search",
+    },
+    "gitee.com": {
+        "organizations", "explore", "enterprises", "gists",
+    },
+    # bitbucket.org / atomgit.com / gitcode.com：暂无已知保留 namespace，保守留空
+}
+
 
 def normalize_repo_root(url: str) -> str:
     if not isinstance(url, str):
@@ -177,6 +196,10 @@ def classify_upstream_url(url: str) -> str:
     parts = [part for part in parsed.path.split("/") if part]
     if len(parts) < 2:
         return "invalid"
+    # 检查第一段是否是 Git 平台保留 namespace（如 github.com/sponsors/xxx）
+    reserved = _RESERVED_BY_HOST.get(host, set())
+    if parts[0].lower() in reserved:
+        return "invalid"
     if len(parts) == 2:
         return "trusted"
     if parts[2].lower() in SUSPICIOUS_PATH_SEGMENTS:
@@ -193,37 +216,49 @@ def normalize_candidate_upstream(url: str) -> str:
     return ""
 
 
+NON_REPO_PROJECT_URL_KEYS = {
+    "sponsor", "funding", "donation", "donate",
+    "twitter", "chat", "discord", "slack", "gitter",
+    "say thanks", "say thanks!",
+    "changelog", "release notes", "history", "documentation",
+}
+
 def candidate_urls_from_pypi_info(info: Dict) -> List[str]:
     candidates: List[str] = []
     project_urls = info.get("project_urls") or {}
     if isinstance(project_urls, dict):
+        # 第一轮：优先 key 匹配
         for preferred_key in PREFERRED_PROJECT_URL_KEYS:
             for key, value in project_urls.items():
                 if not value:
                     continue
                 if key.strip().lower() == preferred_key:
                     candidates.append(value)
-        for value in project_urls.values():
-            if value:
-                candidates.append(value)
+        # 第二轮：所有 project_urls（排除已知非仓库 key）
+        for key, value in project_urls.items():
+            if not value:
+                continue
+            if key.strip().lower() in NON_REPO_PROJECT_URL_KEYS:
+                continue
+            candidates.append(value)
     if info.get("home_page"):
         candidates.append(info["home_page"])
     return candidates
 
 
 def canonical_upstream_url(pypi_json: Optional[Dict], pypi_name: str) -> str:
-    """优先返回可信源码仓根地址；无法确认时返回空串。"""
+    """优先返回可信源码仓根地址；无法确认时返回空串。
+
+    候选 URL 的 norm（归约根）若被 classify 为 trusted，则接受。
+    这样深度 URL（如 tree/blob/issues 子路径）也能通过归约到 root 后胜出，
+    同时 Sponsor/Funding 等保留 namespace 被阻挡。
+    """
     if pypi_json:
         info = pypi_json.get("info", {})
-        normalized_candidates = []
         for url in candidate_urls_from_pypi_info(info):
-            normalized = normalize_candidate_upstream(url)
-            if normalized:
-                normalized_candidates.append((url, normalized, classify_upstream_url(url)))
-
-        for _, normalized, kind in normalized_candidates:
-            if kind == "trusted":
-                return normalized
+            norm = normalize_candidate_upstream(url)
+            if norm and classify_upstream_url(norm) == "trusted":
+                return norm
     return ""
 
 

@@ -34,17 +34,16 @@ CHECK_RESULT="./pkgs/${PKGNAME}/check_result_${PKGNAME}.json"
 
 ## 判断 verdict
 
-**retry**（临时错误，重试有意义）：
+**retry**（临时错误，AI 可尝试修复）：
 - 网络超时、DNS 失败、连接被拒、EOF
 - Git clone 临时失败
 - dnf metadata 超时
+- URL 无效或无法访问 → AI 尝试搜索正确 URL
+- 版本号不存在（找不到对应 tag/branch）→ AI 尝试其他版本
 
 **abort**（硬失败，重试无意义）：
-- 版本号不存在（找不到对应 tag/branch）
-- 版本号格式错误（如带了 RPM release 后缀 `-1`，应去掉）
-- 仓库不存在或已归档、URL 无效
 - License 不合规（reject）
-- 其他确定性配置错误
+- 包本身不可用（如 Python 2 代码、仓库已删除无法找到替代）
 
 ## 输出
 

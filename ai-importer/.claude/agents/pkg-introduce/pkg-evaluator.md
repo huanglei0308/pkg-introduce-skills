@@ -75,7 +75,7 @@ CHECK_RC=$?
 ```
 
 **CHECK_RC=2（needs_ai）：** 读 `check_result_$PKGNAME.json`，自主处理 needs_ai 步骤：
-- `detect`：选择兼容 Python 3.11、满足 constraint、非 pre-release 的最新稳定版
+- `detect`：优先选择满足 constraint 的最新稳定版；若无稳定版满足约束，可接受预发布版并在 reason 中说明
 - `license_check`：判断 accept/reject，写 decision/license_category/reason
 - 直接修改 `check_result_$PKGNAME.json` 的对应字段，将 `overall_status` 更新为 `done`，继续执行 Phase 2
 

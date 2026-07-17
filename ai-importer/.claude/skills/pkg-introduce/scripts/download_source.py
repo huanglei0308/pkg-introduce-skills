@@ -260,7 +260,11 @@ def clone_repo_at_ref(url: str, dest: Path, ref: str) -> None:
 
 
 UNSTABLE_SUFFIXES = re.compile(
-    r"[-.]?(SNAPSHOT|dev|alpha|beta|rc|pre|nightly|dirty)\d*(\b|$)",
+    r"(?:"
+    r"[-.](?:alpha|beta|rc|preview|dev|snapshot|canary|nightly|dirty|unstable|next|milestone)\d*"
+    r"|"
+    r"(?<=[0-9])(?:a|b|c|rc|alpha|beta|pre|dev|post)\d*"  # 无分隔符后缀：3.0a6, 3.1.0rc1
+    r")(?:\b|$)",
     re.IGNORECASE,
 )
 
@@ -279,15 +283,23 @@ def list_remote_tags(url: str) -> list[str]:
             tags.append(tag)
     # Sort: tags that look like version numbers last-to-first (newest first)
     def sort_key(t: str) -> tuple:
-        nums = re.findall(r"\d+", t)
-        return tuple(int(n) for n in nums) if nums else (0,)
+        return _parse_version_tuple(t)
     return sorted(tags, key=sort_key, reverse=True)
 
 
 def _parse_version_tuple(version_str: str) -> tuple:
-    """Parse a version string like 'v1.4.0' or '1.4.0' into a comparable tuple."""
+    """Parse a version string like 'v1.4.0' or '3.0a6' into a comparable tuple.
+
+    先从 version_str 中剥离预发布后缀标识及紧随数字，再提取剩余的数字序列。
+    > "3.0a6"  → (3, 0)    # a6 的 6 不计入版本号
+    > "1.0.0-rc.1" → (1, 0, 0)  # -rc.1 整体剥离
+    """
     normalized = version_str.lstrip("vV")
-    parts = re.findall(r"\d+", normalized)
+    cleaned = re.sub(
+        r"(?:alpha|beta|rc|preview|dev|a|b|c|post|milestone)[.\d]*",
+        "", normalized, flags=re.IGNORECASE,
+    )
+    parts = re.findall(r"\d+", cleaned)
     return tuple(int(p) for p in parts) if parts else (0,)
 
 
@@ -300,6 +312,8 @@ def _meets_constraint(tag: str, constraint: str) -> bool:
         part = part.strip()
         m = re.match(r"(>=|<=|==|!=|>|<)\s*(.+)", part)
         if not m:
+            if part.strip():
+                print(f"[WARN] 无法解析的约束部分: '{part}'，跳过", file=sys.stderr)
             continue
         op, ver_str = m.group(1), m.group(2).strip()
         req_ver = _parse_version_tuple(ver_str)
@@ -318,38 +332,57 @@ def _meets_constraint(tag: str, constraint: str) -> bool:
     return True
 
 
-def select_stable_version(url: str, constraint: str = "") -> Optional[str]:
-    """从远端 tags 中选出满足 constraint 的最小稳定版本。
+def select_best_version(url: str, constraint: str = "") -> Optional[dict]:
+    """从远端 tags 中选出最佳版本（含稳定性信息）。
+
+    返回格式：{"version": "3.0a6", "is_stable": False, "reason": "..."}
+    稳定版优先，无稳定版时回退到满足约束的最新预发布版。
+    返回 None 表示真·没有满足约束的版本。
 
     - constraint 为精确版本（如 '1.4.0' 或 '== 1.4.0'）时直接返回该版本
     - constraint 为区间（如 '>= 1.4.0'）时选满足条件的最小稳定版
     - constraint 为空时选最新稳定版
-    返回 None 表示找不到合适版本。
     """
-    # 精确版本：直接返回，不查 tags
+    # 精确版本快路径：直接返回，不查 tags（保持兼容）
     if constraint:
         exact = re.match(r"^(?:==\s*)?([0-9][^\s,]*)$", constraint.strip())
         if exact:
-            return exact.group(1).strip()
+            ver = exact.group(1).strip()
+            is_stable = not UNSTABLE_SUFFIXES.search(ver)
+            return {
+                "version": ver,
+                "is_stable": is_stable,
+                "reason": "精确版本约束，直接采用",
+            }
 
     tags = list_remote_tags(url)
     if not tags:
         return None
 
     stable = [t for t in tags if not UNSTABLE_SUFFIXES.search(t)]
-    if not stable:
-        return None
+    unstable = [t for t in tags if UNSTABLE_SUFFIXES.search(t)]
 
-    if not constraint:
-        # 无约束：返回最新稳定版（列表已降序，第一个就是最新）
-        return stable[0]
+    if constraint:
+        stable = [t for t in stable if _meets_constraint(t, constraint)]
+        unstable = [t for t in unstable if _meets_constraint(t, constraint)]
 
-    # 有区间约束：找满足条件的最小稳定版（最小 = 列表中最后一个满足的）
-    satisfying = [t for t in stable if _meets_constraint(t, constraint)]
-    if not satisfying:
-        return None
-    # stable 列表降序，satisfying[-1] 是最小满足版本
-    return satisfying[-1]
+    # stable 优先，取最小的满足约束的稳定版（降序列表，最后一个是最小满足版）
+    if stable:
+        return {
+            "version": stable[-1],
+            "is_stable": True,
+            "reason": "满足约束的最新稳定版",
+        }
+
+    # 回退到 unstable（AI 可接受或拒绝）
+    if unstable:
+        return {
+            "version": unstable[0],   # 降序列表，第一个是最新预发布版
+            "is_stable": False,
+            "reason": f"无满足约束的稳定版，回退到最新预发布版 {unstable[0]}",
+        }
+
+    return None  # 真·没有版本
 
 
 def detect_project_version(dest: Path) -> Optional[str]:
@@ -399,7 +432,7 @@ def download_git_repo(url: str, output_dir: Path, version: Optional[str] = None,
 
     version 优先级：
     1. 精确版本（已指定）→ 直接用
-    2. constraint 区间 → select_stable_version 选最小满足的稳定版
+    2. constraint 区间 → select_best_version 选最佳版本（稳定版优先，不稳定版回退）
     3. 都没有 → clone main，检测到开发版时自动切换稳定 tag
     """
     repo_name = url.rstrip("/").split("/")[-1]
@@ -419,12 +452,13 @@ def download_git_repo(url: str, output_dir: Path, version: Optional[str] = None,
     if not version and not resolved_ref and constraint:
         print(f"[INFO] dependency mode：根据 constraint '{constraint}' 从远端 tags 选稳定版本...",
               file=sys.stderr)
-        selected = select_stable_version(url, constraint)
+        selected = select_best_version(url, constraint)
         if selected:
-            print(f"[INFO] 选定版本: {selected}", file=sys.stderr)
-            version = selected
+            version_str = selected["version"]
+            print(f"[INFO] 选定版本: {version_str} (stable={selected['is_stable']})", file=sys.stderr)
+            version = version_str
         else:
-            print(f"[WARN] 未找到满足 '{constraint}' 的稳定版本，回退到默认分支", file=sys.stderr)
+            print(f"[WARN] 未找到满足 '{constraint}' 的版本，回退到默认分支", file=sys.stderr)
 
     if version and not resolved_ref:
         resolved_ref = resolve_git_ref(url, version)
