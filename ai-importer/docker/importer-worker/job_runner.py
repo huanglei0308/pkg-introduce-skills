@@ -361,6 +361,7 @@ def run_job(r, proj, job_id):
         _log(r, job_id, f"[step] action={action}")
         cmd = [
             "claude",
+            "--model", "claude-sonnet-4-6",
             "--add-dir", "/app",
             "--allowedTools", "Bash,Read,Write,Edit,Agent,Skill",
             "--output-format", "stream-json",
