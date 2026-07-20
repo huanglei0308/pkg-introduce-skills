@@ -1,10 +1,19 @@
-FROM python:3.10-slim
+FROM openeuler/openeuler:24.03
+
+# Claude Code CLI 依赖 Node.js 18+（openEuler 24.03 自带 Node.js 20）
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN dnf -y update && dnf -y install \
+      python3 python3-pip \
+      nodejs npm \
+      git unzip curl gnupg \
+    && npm install -g @anthropic-ai/claude-code \
+    && dnf clean all && rm -rf /var/cache/dnf
 
 WORKDIR /app
 
 # Python 依赖
 COPY docker/importer-worker/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Worker 代码
 COPY docker/importer-worker/worker.py docker/importer-worker/job_runner.py docker/importer-worker/copr_client.py ./
