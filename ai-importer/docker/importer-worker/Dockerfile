@@ -6,6 +6,7 @@ RUN dnf -y update && dnf -y install \
       python3 python3-pip \
       nodejs npm \
       git unzip curl gnupg \
+      rpm-build rpm-devel \
     && npm install -g @anthropic-ai/claude-code \
     && dnf clean all && rm -rf /var/cache/dnf
 
