@@ -423,8 +423,10 @@ def update_after_evaluate_main(sd: Path, wf: dict, wf_path: Path, gate_decision:
         if PKGNAME not in wf["reused_pkgs"]:
             wf["reused_pkgs"].append(PKGNAME)
         wf["goal_achieved"] = True  # 下一轮 determine_action 直接返回 done
-    elif gate_decision in ("introduce_new", "introduce_new_with_ref", "reuse_eur_srpm"):
+    elif gate_decision in ("introduce_new", "introduce_new_with_ref",
+                           "reuse_eur_srpm", "evaluate"):
         pass  # gate_result 文件已存在，需要走 COPR 构建
+        # 注："evaluate" 是 gate 在约束无法解析时的兜底返回值，语义上视为需引入
     else:
         # gate 失败（空 decision 或未知值）：写入 evaluate_failed，等待 AI 分析
         wf["evaluate_failed"] = gate_decision or "evaluate_main gate failed"
@@ -441,8 +443,9 @@ def update_after_evaluate(sd: Path, reg: dict, reg_path: Path, target: str, gate
         if v:
             reg[target]["resolved_version"] = v
     elif gate_decision in ("introduce_new", "introduce_new_with_ref",
-                           "reuse_eur_srpm", "upgrade_user_repo"):
+                           "reuse_eur_srpm", "upgrade_user_repo", "evaluate"):
         reg[target]["status"] = "evaluate_done"
+        # 注："evaluate" 是 gate 在约束无法解析时的兜底返回值，语义上视为需引入
     else:
         # gate 失败：写入 evaluate_failed，等待 AI 分析
         reg[target]["status"] = "evaluate_failed"

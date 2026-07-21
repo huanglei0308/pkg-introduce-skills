@@ -471,6 +471,10 @@ def parse_local_deps(source_dir: str) -> Tuple[List[str], str]:
                 for dep in re.findall(r"""['"]([^'"]+)['"]""", inner):
                     dep = dep.strip()
                     if dep:
+                        # 检测未填充的模板占位符（如 numpy >={}），方便排查
+                        if re.search(r'[><=!~]+\s*\{\s*\}', dep):
+                            print(f"  [WARN] 本地约束含未填充占位符: {dep!r}，"
+                                  f"将由 merge_requires 降级到 PyPI 约束", file=sys.stderr)
                         requires.append(dep)
         if requires:
             backend = "flit" if "flit" in content else ("poetry" if "poetry" in content else "setuptools")
@@ -668,11 +672,21 @@ def _extract_version_constraint(dep: str) -> str:
     return ""
 
 
+# 约束含未替换模板占位符的模式：>= {}、< {}、== {} 等
+_TEMPLATE_PLACEHOLDER_RE = re.compile(r'[><=!~]+\s*\{\s*\}')
+
+
+def _constraint_is_broken(spec: str) -> bool:
+    """检测 spec 中的约束是否包含未填充的模板占位符（如 >= {}）。"""
+    return bool(_TEMPLATE_PLACEHOLDER_RE.search(spec))
+
+
 def merge_requires(pypi_requires: List[str], local_requires: List[str]) -> List[str]:
     """
     合并 PyPI 和本地解析的依赖。
-    策略：本地 pyproject.toml 为主，PyPI 仅补充本地没有的包。
-    若同名包的版本约束不一致，忽略 PyPI 的约束，以本地为准。
+    策略：本地 pyproject.toml / setup.py 为主，PyPI 仅补充本地没有的包。
+    若本地解析出的约束含未填充模板占位符（如 >= {}），
+    则降级使用 PyPI 的真实约束覆盖本地脏数据。
     """
     seen: Dict[str, str] = {}  # normalized_name -> original_spec
 
@@ -682,7 +696,7 @@ def merge_requires(pypi_requires: List[str], local_requires: List[str]) -> List[
         if key:
             seen[key] = dep
 
-    # PyPI 仅补充本地没有的包，且版本约束与本地一致时才采用
+    # PyPI 补充本地没有的包；若本地约束是模板占位符，用 PyPI 真实约束覆盖
     for dep in pypi_requires:
         key = _extract_pkg_key(dep)
         if not key:
@@ -690,7 +704,9 @@ def merge_requires(pypi_requires: List[str], local_requires: List[str]) -> List[
         if key not in seen:
             # 本地没有这个包，从 PyPI 补充
             seen[key] = dep
-        # 本地已有同名包：忽略 PyPI 版本，以本地为准，不覆盖
+        elif _constraint_is_broken(seen[key]):
+            # 本地解析出模板占位符（如 numpy >={}），用 PyPI 真实约束覆盖
+            seen[key] = dep
 
     return list(seen.values())
 
