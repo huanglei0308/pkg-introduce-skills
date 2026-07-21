@@ -38,6 +38,8 @@ _CHROOT_REPO_MAP = {
     "openeuler-24.03_LTS-":       "http://repo.openeuler.org/openEuler-24.03-LTS",
     "openeuler-24.03_LTS_SP1-":   "http://repo.openeuler.org/openEuler-24.03-LTS-SP1",
     "openeuler-24.03_LTS_SP2-":   "http://repo.openeuler.org/openEuler-24.03-LTS-SP2",
+    "openeuler-24.03_LTS_SP3-":   "http://repo.openeuler.org/openEuler-24.03-LTS-SP3",
+    "openeuler-24.03_LTS_SP4-":   "http://repo.openeuler.org/openEuler-24.03-LTS-SP4",
 }
 
 _ACTIVE_REPO_FILE: Optional[Path] = None
