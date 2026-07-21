@@ -113,13 +113,14 @@ def _sync_copr_result(session_dir: Path, pkgname: str, job_id: str = "") -> None
                 if _scripts_dir not in _sys.path:
                     _sys.path.insert(0, _scripts_dir)
                 from rpm_naming import upstream_from_srpm_name
-                gate_path = session_dir / f"reports/gate_result_{pkgname}.json"
+                gate_path = session_dir / f"pkgs/{pkgname}/gate_result_{pkgname}.json"
                 lang = ""
                 if gate_path.exists():
                     gate_data = _json.loads(gate_path.read_text())
                     lang = gate_data.get("lang", "") or gate_data.get("result", {}).get("lang", "")
                 # 从 RPM 名剥离前缀还原上游名（python3-setuptools → setuptools）
-                normalized = upstream_from_srpm_name(actual_pkg, lang) if lang else actual_pkg
+                # lang 为空时默认 "python"——Python 是最常见的包语言
+                normalized = upstream_from_srpm_name(actual_pkg, lang or "python")
             except Exception:
                 normalized = actual_pkg
             if normalized != pkgname:
