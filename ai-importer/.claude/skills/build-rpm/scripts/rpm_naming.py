@@ -160,6 +160,33 @@ def extract_compat_major_version(version: str) -> str:
     return parts[0]
 
 
+def upstream_from_srpm_name(srpm_name: str, lang: str = "python") -> str:
+    """
+    从 SRPM/RPM 包名还原上游 PyPI/npm 等注册表中的原始名称。
+    是 get_srpm_name() 的逆操作。
+
+    Python 示例：
+        upstream_from_srpm_name("python3-setuptools")  → "setuptools"
+        upstream_from_srpm_name("python-setuptools")   → "setuptools"
+        upstream_from_srpm_name("python3-Django")       → "Django"
+
+    Node.js 示例：
+        upstream_from_srpm_name("nodejs-lodash", "nodejs") → "lodash"
+
+    未匹配任何已知前缀时原样返回，兼容已无前缀的名称和未知语言。
+    """
+    lang = lang.lower()
+    if lang == "python":
+        # python3- 必须在 python- 之前，避免 python3-xxx 被 python- 抢先匹配成 3-xxx
+        for prefix in ["python3-", "python-"]:
+            if srpm_name.startswith(prefix):
+                return srpm_name[len(prefix):]
+    elif lang == "nodejs":
+        if srpm_name.startswith("nodejs-"):
+            return srpm_name[len("nodejs-"):]
+    return srpm_name
+
+
 def rpm_name_from_pep508(pkg_spec: str) -> str:
     """
     从 PEP 508 依赖规范直接生成 Python RPM Requires 表达式。

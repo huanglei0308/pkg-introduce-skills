@@ -102,17 +102,36 @@ def _sync_copr_result(session_dir: Path, pkgname: str, job_id: str = "") -> None
         state = data.get("state", "unknown")
 
         # 校验包名：防止 pkg-builder 提交了错误的包
+        # COPR 返回 source_package.name 是 RPM 包名（python-xxx / python3-xxx），
+        # pkgname 是上游名（setuptools）。用 upstream_from_srpm_name 剥离
+        # 语言前缀还原为上游名后再比对，兼容 python- 和 python3- 两种前缀。
         actual_pkg = data.get("source_package", {}).get("name", "")
         if actual_pkg and actual_pkg != pkgname:
-            br["status"] = "failed"
-            br["failure_reason"] = (
-                f"Package name mismatch: build {build_id} "
-                f"is '{actual_pkg}', expected '{pkgname}'"
-            )
-            br_path.write_text(_json.dumps(br, indent=2, ensure_ascii=False))
-            print(f"[sync_copr][{job_id}] MISMATCH: build {build_id} is {actual_pkg}, expected {pkgname}",
-                  flush=True)
-            return
+            try:
+                import sys as _sys
+                _scripts_dir = str(Path(SKILLS_DIR) / "build-rpm/scripts")
+                if _scripts_dir not in _sys.path:
+                    _sys.path.insert(0, _scripts_dir)
+                from rpm_naming import upstream_from_srpm_name
+                gate_path = session_dir / f"reports/gate_result_{pkgname}.json"
+                lang = ""
+                if gate_path.exists():
+                    gate_data = _json.loads(gate_path.read_text())
+                    lang = gate_data.get("lang", "") or gate_data.get("result", {}).get("lang", "")
+                # 从 RPM 名剥离前缀还原上游名（python3-setuptools → setuptools）
+                normalized = upstream_from_srpm_name(actual_pkg, lang) if lang else actual_pkg
+            except Exception:
+                normalized = actual_pkg
+            if normalized != pkgname:
+                br["status"] = "failed"
+                br["failure_reason"] = (
+                    f"Package name mismatch: build {build_id} "
+                    f"is '{actual_pkg}', expected '{pkgname}'"
+                )
+                br_path.write_text(_json.dumps(br, indent=2, ensure_ascii=False))
+                print(f"[sync_copr][{job_id}] MISMATCH: build {build_id} is {actual_pkg}, expected {pkgname}",
+                      flush=True)
+                return
 
         terminal = {"succeeded", "failed", "canceled", "skipped"}
         if state not in terminal:
@@ -180,6 +199,13 @@ def _run_supervisor(session_dir: Path, job_id: str = "") -> dict:
 def run_job(r, proj, job_id):
     job        = r.hgetall(f"{JOB_PREFIX}{job_id}")
     pkgname    = job["pkgname"]
+    # 归一化：用户可能误传入 RPM 包名（python-numpy），剥离语言前缀还原为上游名
+    for _pfx in ["python3-", "python-", "nodejs-"]:
+        if pkgname.startswith(_pfx):
+            _normalized = pkgname[len(_pfx):]
+            _log(r, job_id, f"[归一化] pkgname '{pkgname}' → '{_normalized}'")
+            pkgname = _normalized
+            break
     url        = job["url"]
     version    = job.get("version", "")
     owner, coprname = proj.split("/", 1)
