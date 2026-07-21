@@ -178,6 +178,23 @@ def get_pypi_upstream(pypi_name: str) -> str:
     return ""
 
 
+# ── 构建系统工具白名单 ──────────────────────────────────────────────────────────
+# 这些是构建工具（build backend / build system），不是运行时依赖。
+# 为应用包递归构建发行版基础设施是本末倒置，且可能引入循环依赖。
+# spec 中 BuildRequires 不带版本，mock 会自动装源里的版本。
+BUILD_SYSTEM_WHITELIST = {
+    "setuptools", "setuptools-scm", "wheel", "pip",
+    "flit", "flit-core", "hatchling", "poetry", "poetry-core",
+    "pdm", "pdm-backend", "meson-python", "scikit-build",
+    "ninja", "cmake", "pbr",
+}
+
+
+def _is_build_system_tool(name: str) -> bool:
+    """判断包名是否为已知的构建系统工具。"""
+    return name.lower() in BUILD_SYSTEM_WHITELIST
+
+
 # ── 通用辅助 ──────────────────────────────────────────────────────────────────
 
 def resolve_python_executable() -> str:
@@ -664,8 +681,27 @@ def classify_dependency(dep: dict[str, Any], lang: str, source_index: dict[tuple
         )
     if source_check["status"] == "older" and not existing_check.get("official", {}).get("exists"):
         existing_check = merge_official_source_older_result(dep, source_check, existing_check)
+
+    # 构建系统工具白名单：官方源存在任意版本时强制 reuse_official，忽略版本约束。
+    # 构建工具不是运行时依赖，spec 中 BuildRequires 不带版本即可。
+    category = dep.get("category", "")
+    dep_name = dep.get("name") or dep.get("dep") or ""
+    if category == "build_system" and _is_build_system_tool(dep_name):
+        if existing_check.get("official", {}).get("exists"):
+            existing_check["decision"] = "reuse_official"
+            existing_check["reason"] = (
+                f"{dep_name} 是构建系统工具（白名单），"
+                f"官方源已有版本，直接复用"
+            )
+        else:
+            # 白名单内的构建工具但官方源不存在 → 降级为 needs_ai，不直接进构建队列
+            existing_check["decision"] = "needs_ai"
+
     decision = existing_check["decision"]
-    if decision in {"reuse_official", "reuse_user_repo"}:
+    if decision == "needs_ai":
+        action = "needs_ai"
+        reason = existing_check.get("reason", "构建系统工具需 AI 判断")
+    elif decision in {"reuse_official", "reuse_user_repo"}:
         action = "resolved"
         reason = existing_check["reason"]
     elif decision == "block_official_older":
