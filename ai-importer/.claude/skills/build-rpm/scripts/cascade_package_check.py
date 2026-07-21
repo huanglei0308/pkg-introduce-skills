@@ -53,7 +53,7 @@ RESULTS_SCAN_TIMEOUT = 15
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from rpm_naming import get_rpm_pkg_name  # noqa: E402
+from rpm_naming import get_rpm_pkg_name, get_srpm_name  # noqa: E402
 import check_existing_package as _checker  # noqa: E402
 
 
