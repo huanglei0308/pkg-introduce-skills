@@ -360,7 +360,7 @@ def _check_src_openeuler(pkgname: str, lang: str, target: str = "") -> Optional[
 
 def _check_user_copr_project(pkgname: str, copr_url: str, owner: str,
                               project: str, login: str, token: str,
-                              target: str = "") -> Optional[dict]:
+                              target: str = "", lang: str = "") -> Optional[dict]:
     """检查用户自己的 COPR project 是否已有此包（避免重复构建）。
 
     仅当已有构建的 chroot 与 target 匹配时才返回复用结果，
@@ -373,10 +373,16 @@ def _check_user_copr_project(pkgname: str, copr_url: str, owner: str,
     creds = base64.b64encode(f"{login}:{token}".encode()).decode()
     headers = {"Authorization": f"Basic {creds}"}
 
+    # COPR 里存的是 RPM 包名（如 python-xxx），pkgname 是上游名
+    # 需用 rpm_naming 转换后再查询
+    query_name = pkgname
+    if lang:
+        query_name = get_srpm_name(lang, pkgname)
+
     params = urllib.parse.urlencode({
         "ownername": owner,
         "projectname": project,
-        "packagename": pkgname,
+        "packagename": query_name,
         "limit": "10",
     })
     url = f"{copr_url.rstrip('/')}/api_3/build/list?{params}"
@@ -461,7 +467,7 @@ def check_package_existence(
 
     # ── Level 0: 用户 COPR project ──────────────────────────────────────────
     user_result = _check_user_copr_project(
-        pkgname, copr_url, copr_owner, copr_project, copr_login, copr_token, target
+        pkgname, copr_url, copr_owner, copr_project, copr_login, copr_token, target, lang
     )
     if user_result:
         result.update(user_result)
