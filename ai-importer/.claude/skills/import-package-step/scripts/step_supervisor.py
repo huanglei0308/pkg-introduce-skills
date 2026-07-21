@@ -310,6 +310,18 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
                 return ("analyze_failure_dep", dep, 0)
         verdict = read_json(analysis_file).get("verdict", "abort")
         if verdict in ("rebuild", "retry"):
+            # 检查 analyze 过程中是否有新增的未就绪前置依赖（required_by 指向当前 dep）。
+            # 若存在，设为 pending_deps，等待前置依赖就绪后由 Priority 2 晋升逻辑自动升回 evaluate_done。
+            # 这与 update_after_build 中 dep_needed 路径的行为一致。
+            blockers = [k for k, v in reg.items()
+                        if v.get("required_by") == dep
+                        and v["status"] not in DEP_READY_STATUSES]
+            if blockers:
+                reg[dep]["status"] = DEP_WAITING_STATUS
+                write_json(reg_path_local, reg)
+                # 重新评估：当前 dep 已变为 pending_deps，不再被 Priority 2 捕获，
+                # Priority 3 将有机会处理 blocker 的 build_failed
+                return determine_action(sd, wf, reg)
             reg[dep]["status"] = "evaluate_done"
             write_json(reg_path_local, reg)
             lang = get_lang(sd, dep)
