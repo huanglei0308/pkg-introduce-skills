@@ -149,7 +149,7 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
             if g.get("overall_status") == "done" and \
                decision in ("introduce_new", "introduce_new_with_ref",
                             "reuse_official", "reuse_copr_project",
-                            "reuse_eur_srpm"):
+                            "reuse_eur_srpm", "evaluate"):
                 gate_valid = True
             elif decision == "check_failed":
                 # 网络/下载临时失败，删除后重试（不算损坏，delay 长一些）
