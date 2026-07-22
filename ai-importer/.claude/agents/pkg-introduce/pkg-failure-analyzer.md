@@ -128,6 +128,13 @@ dnf provides 'libxxx.so*' 2>/dev/null | head -5     # 链接库
 得到 RPM 包名后，再用 `check_existing_package.py` 确认官方源/COPR 均可用。
 
 **决策规则**：
+
+> ⚠️ **构建工具白名单优先**：以下包是构建基础设施，不是运行时依赖。**版本约束由上游声明，不代表真正需要该版本**。在分析构建失败时，若缺失的依赖命中此白名单且官方源存在任意版本，则**直接视为 `reuse_official`，忽略版本号差异**，继续寻找真正的失败原因。不得因为这些包的版本约束而注册为依赖引入。
+>
+> 白名单：`setuptools`、`wheel`、`pip`、`hatchling`、`flit-core`、`flit`、`poetry-core`、`poetry`、`pdm-backend`、`pdm`、`build`、`meson-python`、`scikit-build-core`、`cython`、`numpy`（仅限构建依赖场景）、`versioneer`、`setuptools-scm`、`maturin`、`jupyter-packaging`、`pbr`
+>
+> 示例：构建日志显示 `setuptools >=79` 缺失但官方源有 `python3-setuptools 68` → **不是失败原因**，跳过此依赖继续分析日志中的其他错误。
+
 - `reuse_official` 或 `reuse_copr_project` → `verdict=rebuild`，加入 spec `BuildRequires`
 - `introduce_new` → `verdict=retry`，调 `register-dep.py` 注册
 
