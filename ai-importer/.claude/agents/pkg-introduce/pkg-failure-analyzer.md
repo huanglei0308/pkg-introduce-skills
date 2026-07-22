@@ -79,6 +79,7 @@ python3 -c "import json; d=json.load(open('$BUILD_RESULT')); print(d.get('build_
 | `fg: no job control` / `bg:` / shell job control 错误（%build 段，configure 已完成，`%cmake_build` 或 `%make_build` 等宏在非交互 shell 中依赖后台任务控制） | `rebuild`（将 `%cmake_build` 替换为 `cmake --build . -j$(nproc)`，将 `%make_build` 替换为 `make -j$(nproc)`；**必须同时保留 `%cmake` 或 `%configure` configure 步骤，只替换 build 步骤**） |
 | rpmbuild error / bad exit status（spec 语法/宏错误） | `rebuild` |
 | %check 失败 / 测试未通过 | `rebuild` |
+| `Package name mismatch` / `MISMATCH: build N is X, expected Y`（sync_copr_result 检测到 COPR 产出 SRPM 名与预期不符，说明 spec 的 `Name:`/`%global pypi_name`/`Source0:` 写成了另一个包的内容，不能通过 patch spec 修复——需要 pkg-builder 完全重写） | `retry`（spec 需 pkg-builder 重新生成。**必须读 fix_instructions.md：若已有相同 build_id 的 MISMATCH → retry 记录，说明重试过一次仍失败，改为 abort 防止死循环**） |
 
 ### 类别 D：无法修复
 
