@@ -24,7 +24,7 @@ SESSIONS_BASE = Path(os.environ.get("SESSIONS_BASE", "/tmp/ai-sessions"))
 SUPERVISOR    = Path(SKILLS_DIR) / "import-package-step/scripts/step_supervisor.py"
 
 MAX_JOB_SECONDS = int(os.environ.get("MAX_JOB_SECONDS", str(4 * 3600)))
-MAX_LOOPS       = int(os.environ.get("MAX_LOOPS", "100"))
+MAX_LOOPS       = int(os.environ.get("MAX_LOOPS", "200"))
 
 
 def _log(r, job_id, msg):
