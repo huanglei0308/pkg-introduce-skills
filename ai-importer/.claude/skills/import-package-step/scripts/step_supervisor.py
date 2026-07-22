@@ -211,10 +211,16 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
     # 优先级 1b：有 dep 待 evaluate
     pending_eval = [k for k, v in reg.items() if v["status"] == "pending_evaluate"]
     if pending_eval:
+        dep = pending_eval[0]
+        # 上游 URL 未填写时先让 AI 解析（脚本查询可能因网络/非标准平台失败）
+        if not reg[dep].get("url", ""):
+            if reg[dep].get("url_error", ""):
+                return ("fail", f"无法解析 {dep} 上游地址: {reg[dep]['url_error']}", None)
+            return ("resolve_upstream", dep, 0)
         over_depth = [k for k in pending_eval if compute_depth(k, reg, PKGNAME) > MAX_DEP_DEPTH]
         if over_depth:
             return ("fail", f"dep depth exceeded {MAX_DEP_DEPTH}: {over_depth}", None)
-        return ("evaluate", pending_eval[0], 60)
+        return ("evaluate", dep, 60)
 
     # 优先级 2：有 dep 待构建
     # pending_deps 状态：该 dep 曾返回 dep_needed，等待其前置依赖就绪后再重试

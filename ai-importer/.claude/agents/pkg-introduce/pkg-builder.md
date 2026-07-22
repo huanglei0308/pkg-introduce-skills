@@ -53,6 +53,11 @@ eval "$(python3 $SCRIPTS_DIR/read-gate-fields.py --session-dir . --pkg $PKGNAME)
 
 # URL：优先从 dep_registry 读，否则用 session 里的
 DEP_URL="$(python3 $SCRIPTS_DIR/read-dep-registry.py --session-dir . --pkg $PKGNAME --field url)"
+# 依赖包空 URL 不再用主包 URL 兜底（会写出错误 spec，如 scipy → PyElastica 内容）
+if [ "$MODE" != "top-level" ] && [ -z "$DEP_URL" ]; then
+  echo "ERROR: upstream URL is empty for dependency $PKGNAME — supervisor should have triggered resolve_upstream first"
+  exit 1
+fi
 UPSTREAM_URL="${DEP_URL:-$SESSION_UPSTREAM_URL}"
 
 LESSONS_FILE="$BUILD_RPM_DIR/lessons/${LANG}.json"

@@ -86,6 +86,13 @@ evaluate)
     --gate-decision "$GATE_DECISION"
   ;;
 
+resolve_upstream)
+  Agent(
+    subagent_type="resolve-upstream",
+    prompt=f"target: {TARGET}\nsession_dir: {SESSION_DIR}"
+  )
+  ;;
+
 build_dep)
   # COPR 模式：依赖包直接构建到 COPR project，不需要本地安装
   Agent(
