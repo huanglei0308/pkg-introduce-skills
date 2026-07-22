@@ -71,7 +71,24 @@ build-rpm skill 在 COPR 模式下（无 `SESSION_CONTAINER`）：
 3. **【强制】源码目录结构校验**：写 `%prep` / `%build` 前，**必须先** `tar tf <source>` 确认解压后的真实顶层目录名（如 `llvm-22.0.0/`）。将顶层目录名写入 spec 注释（如 `# topdir: llvm-22.0.0`），后续所有 `cd`、`cmake -S`、`%autosetup -n` 等指令必须引用该注释中的目录名。**严禁在未确认解压目录名的情况下写死目录参数。**
 4. `rpmlint` 静态检查
 5. `rpmbuild -bs` 打 SRPM → `./srpms/${PKGNAME}-${VERSION}*.src.rpm`
-6. 提交 COPR 构建，`copr_client.py` 直接写 `build_rpm_result.json`
+6. **【强制】spec 内容自检**：提交 COPR 构建前，校验 spec 关键字段是否与 `${PKGNAME}` 一致：
+
+   ```bash
+   # 读取 spec 的关键字段
+   grep -m1 '^Name:' ./pkgs/${PKGNAME}/${PKGNAME}.spec
+   grep -m1 '^%global pypi_name' ./pkgs/${PKGNAME}/${PKGNAME}.spec 2>/dev/null || echo "(无 pypi_name 宏)"
+   grep -m1 '^Source0:' ./pkgs/${PKGNAME}/${PKGNAME}.spec
+   grep -m1 '^Summary:' ./pkgs/${PKGNAME}/${PKGNAME}.spec
+   ```
+
+   校验规则：
+   - **pypi_name 一致性**（最高优先级）：若 spec 定义了 `%global pypi_name <X>`，则 `<X>` **必须等于** `${PKGNAME}`。不通过 → 删 spec 重写。
+   - **Name 字段一致性**：spec 的 `Name:` 去除 `python-`/`python3-` 前缀后，必须与 `${PKGNAME}` 匹配（大小写不敏感）。如 `${PKGNAME}=scipy`，`Name: scipy` ✓，`Name: python-pyelastica` ✗。
+   - **Source0 一致性**：Source0 URL 路径中必须包含 `${PKGNAME}`（大小写不敏感）。如 `${PKGNAME}=scipy` 但 Source0 指向 `GazzolaLab/PyElastica` → ✗。
+
+   校验不通过时：删除 `./pkgs/${PKGNAME}/${PKGNAME}.spec`，重新生成。连续 2 次校验失败则输出错误退出，不提交 COPR。
+
+7. 提交 COPR 构建，`copr_client.py` 直接写 `build_rpm_result.json`
 
 读取 `./pkgs/${PKGNAME}/build_rpm_result.json` 的 `status`：
 
