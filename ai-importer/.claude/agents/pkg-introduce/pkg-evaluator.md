@@ -85,6 +85,8 @@ CHECK_RC=$?
 ```
 退出。
 
+> **Gradle 直接 abort**：Java 包的 `detect` 步骤若 `build_system: "gradle"`（reason 含 "Gradle build system is not supported"），说明 chroot 的 maven-local 离线设施无法构建该项目。**不要尝试任何构建或适配**，直接按上面 check_failed 格式写入 reason 后退出。这是确定性结论，不是可修复问题。
+
 ### Phase 2：引入决策
 
 ```bash
