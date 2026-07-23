@@ -21,6 +21,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from constraint_conflict import has_conflict, merge_constraints  # noqa: E402
 
+# 引入构建工具链约束（manifest 生成的脚本目录）
+BUILD_RPM_SCRIPTS = Path(__file__).resolve().parents[2] / "build-rpm" / "scripts"
+sys.path.insert(0, str(BUILD_RPM_SCRIPTS))
+from chroot_toolchain import is_toolchain, get_tool_version  # noqa: E402
+
 # 可信的 git 仓库主机
 _TRUSTED_GIT_HOSTS = (
     "github.com",
@@ -106,6 +111,15 @@ def main():
     if not args.constraint:
         print(f"[register-dep] WARNING: --constraint 未指定，evaluator 将选最新稳定版而非最小满足版本。"
               f"建议明确指定版本约束（如 '>= 1.4.0'）。", file=sys.stderr)
+
+    # 构建工具链硬过滤：禁止引入/升级构建工具
+    if is_toolchain(args.pkg):
+        tool_version = get_tool_version(args.session_dir, args.pkg)
+        version_hint = f" (chroot has {tool_version})" if tool_version else ""
+        print(f"[register-dep] ERROR: {args.pkg} is a toolchain package{version_hint}. "
+              f"Do not introduce build tools into dep_registry. "
+              f"Adapt spec/source to the chroot toolchain version instead.", file=sys.stderr)
+        sys.exit(2)
 
     reg_path = Path(args.session_dir) / "dep_registry.json"
     reg = json.loads(reg_path.read_text(encoding="utf-8")) if reg_path.exists() else {}

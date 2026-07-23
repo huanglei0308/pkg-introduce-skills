@@ -18,6 +18,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from constraint_conflict import has_conflict, merge_constraints  # noqa: E402
 
+# 引入构建工具链约束
+BUILD_RPM_SCRIPTS = Path(__file__).resolve().parents[2] / "build-rpm" / "scripts"
+sys.path.insert(0, str(BUILD_RPM_SCRIPTS))
+from chroot_toolchain import is_toolchain  # noqa: E402
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -78,6 +83,10 @@ def main():
 
     for dep in deps:
         name = dep["name"]
+        # 构建工具链不得注册为依赖
+        if is_toolchain(name):
+            print(f"[update-dep-registry] skip toolchain: {name}")
+            continue
         new_constraint = dep.get("constraint", "")
         if name not in reg:
             reg[name] = {

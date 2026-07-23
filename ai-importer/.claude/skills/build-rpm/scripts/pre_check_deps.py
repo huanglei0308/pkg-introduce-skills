@@ -33,6 +33,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 from rpm_naming import get_rpm_pkg_name, get_compat_srpm_name, get_compat_rpm_pkg_name, extract_compat_major_version  # noqa: E402
 from constraint_parser import parse_constraint as _parse_constraint  # noqa: E402
+from chroot_toolchain import is_build_system_tool  # noqa: E402
 
 CHECK_EXISTING_SCRIPT = SCRIPT_DIR / "check_existing_package.py"
 ANALYZE_PYTHON_SCRIPT = SCRIPT_DIR / "analyze_python_deps.py"
@@ -179,20 +180,16 @@ def get_pypi_upstream(pypi_name: str) -> str:
 
 
 # ── 构建系统工具白名单 ──────────────────────────────────────────────────────────
-# 这些是构建工具（build backend / build system），不是运行时依赖。
-# 为应用包递归构建发行版基础设施是本末倒置，且可能引入循环依赖。
-# spec 中 BuildRequires 不带版本，mock 会自动装源里的版本。
-BUILD_SYSTEM_WHITELIST = {
-    "setuptools", "setuptools-scm", "wheel", "pip",
-    "flit", "flit-core", "hatchling", "poetry", "poetry-core",
-    "pdm", "pdm-backend", "meson-python", "scikit-build",
-    "ninja", "cmake", "pbr",
-}
+# 名单定义已收敛到 chroot_toolchain.py 的 BUILD_SYSTEM_TOOLS，此处仅保留导入别名以兼容
+# 可能的外部引用。这些工具不是运行时依赖：为应用包递归构建发行版基础设施是本末倒置，
+# 且可能引入循环依赖。spec 中 BuildRequires 不带版本，mock 会自动装源里的版本。
+# 原集合见 chroot_toolchain.BUILD_SYSTEM_TOOLS
+BUILD_SYSTEM_WHITELIST = None  # deprecated; use is_build_system_tool()
 
-
+# 保留兼容函数签名，但实现复用统一名单
 def _is_build_system_tool(name: str) -> bool:
     """判断包名是否为已知的构建系统工具。"""
-    return name.lower() in BUILD_SYSTEM_WHITELIST
+    return is_build_system_tool(name)
 
 
 # ── 通用辅助 ──────────────────────────────────────────────────────────────────

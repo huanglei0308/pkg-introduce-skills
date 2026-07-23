@@ -62,6 +62,34 @@ UPSTREAM_URL="${DEP_URL:-$SESSION_UPSTREAM_URL}"
 
 LESSONS_FILE="$BUILD_RPM_DIR/lessons/${LANG}.json"
 LESSONS_ARG=""; [ -f "$LESSONS_FILE" ] && LESSONS_ARG="--lessons $LESSONS_FILE"
+
+# 读取目标 chroot 的构建工具链清单（manifest 不存在时跳过）
+TOOLCHAIN_FILE=""
+for f in ./toolchain_*.json; do
+  [ -f "$f" ] && TOOLCHAIN_FILE="$f" && break
+done
+```
+
+## 构建工具链约束（强制）
+
+`toolchain_<chroot>.json` 是当前 chroot 官方源中构建工具（golang、rust、cmake、python3-setuptools 等）的版本清单，作为**全局约束**：
+
+- **只能用清单里的版本**，禁止在 spec 中写 `BuildRequires: <tool> >= <高于清单的版本>`；
+- 若上游源码要求更高版本（如 go.mod 写 `go 1.23` 但清单只有 1.21.4），正确做法是**修改源码/ spec 适应当前 chroot 版本**，而不是引入新版工具链；
+- 对 Python build backend（setuptools、flit-core、hatchling 等），spec 中 `BuildRequires` 不带版本约束，mock 会装源里版本；
+- 绝不允许因为工具链版本不足而触发 dep_registry 引入该工具链。
+
+生成 spec 前，先检查 `$TOOLCHAIN_FILE`：
+
+```bash
+if [ -n "$TOOLCHAIN_FILE" ]; then
+  python3 -c "
+import json, sys
+m = json.load(open('$TOOLCHAIN_FILE'))
+for t, info in m.get('toolchain', {}).items():
+    if info.get('available'):
+        print(f'[toolchain] {t} = {info[\"version\"]}')"
+fi
 ```
 
 ## 阶段一：调用 build-rpm skill 生成 spec + SRPM

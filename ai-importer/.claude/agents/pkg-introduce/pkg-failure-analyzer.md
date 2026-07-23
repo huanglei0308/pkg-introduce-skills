@@ -30,6 +30,24 @@ BUILD_RESULT="./pkgs/${PKGNAME}/build_rpm_result.json"
 SPEC_FILE="./pkgs/${PKGNAME}/${PKGNAME}.spec"
 FIX_FILE="./pkgs/${PKGNAME}/fix_instructions.md"
 COPR_BUILD_ID="$(python3 -c "import json; print(json.load(open('$BUILD_RESULT')).get('copr_build_id',''))" 2>/dev/null)"
+
+# 读取目标 chroot 的构建工具链清单（manifest 不存在时跳过）
+TOOLCHAIN_FILE=""
+for f in ./toolchain_*.json; do
+  [ -f "$f" ] && TOOLCHAIN_FILE="$f" && break
+done
+if [ -n "$TOOLCHAIN_FILE" ]; then
+  python3 -c "
+import json
+m = json.load(open('$TOOLCHAIN_FILE'))
+print('[toolchain manifest]', m.get('chroot', '?'))
+for t, info in m.get('toolchain', {}).items():
+    if info.get('available'):
+        print(f'  {t} = {info[\"version\"]}')
+    else:
+        print(f'  {t} = (not available)')
+"
+fi
 ```
 
 **诊断前必须读取以下内容，缺一不可：**
@@ -69,7 +87,7 @@ python3 -c "import json; d=json.load(open('$BUILD_RESULT')); print(d.get('build_
 | **C/C++ 头文件缺失** | `fatal error: xxx.h: No such file or directory` | `rebuild` 或 `retry`（见步骤 2） |
 | **pkg-config 缺失** | `Package 'xxx' not found` / `No package 'xxx' found` | `rebuild` 或 `retry`（见步骤 2） |
 | **链接库缺失** | `cannot find -lxxx` / `undefined reference to` / `ld: library not found for -lxxx` | `rebuild` 或 `retry`（见步骤 2） |
-| **构建工具版本不足** | `Xxx version is A.B.C but project requires >=X.Y.Z` / `CMake X or higher is required` / `Autoconf version X or higher is required` / `Module "xxx" does not exist`（meson 模块缺失，该模块在更高版本才引入） | `retry`，**禁止降低被构建包的版本** |
+| **构建工具版本不足** | `Xxx version is A.B.C but project requires >=X.Y.Z` / `CMake X or higher is required` / `Autoconf version X or higher is required` / `Module "xxx" does not exist`（meson 模块缺失，该模块在更高版本才引入）/ Go: `go.mod requires go >= X.Y` | `retry`：**修改 spec/源码适应当前 chroot 的工具链版本**；禁止引入/升级构建工具；确实无法适配 → `abort` |
 
 ### 类别 C：spec 问题（与语言无关）
 
@@ -129,13 +147,14 @@ dnf provides 'libxxx.so*' 2>/dev/null | head -5     # 链接库
 
 **决策规则**：
 
-> ⚠️ **构建工具白名单优先**：以下包是构建基础设施，不是运行时依赖。**版本约束由上游声明，不代表真正需要该版本**。在分析构建失败时，若缺失的依赖命中此白名单且官方源存在任意版本，则**直接视为 `reuse_official`，忽略版本号差异**，继续寻找真正的失败原因。不得因为这些包的版本约束而注册为依赖引入。
+> ⚠️ **构建工具链约束优先**：`toolchain_<chroot>.json` 是当前 chroot 官方源中构建工具（golang、rust、cmake、setuptools、flit-core、hatchling 等）的版本清单。若缺失/版本不足的依赖命中工具链名单，则**绝对禁止**把它写入 `missing_deps` 或调 `register-dep.py` 引入。正确做法是：
+> 1. 若官方源已有任意版本 → 视为 `reuse_official`，在 spec 中无版本约束地加入 `BuildRequires`；
+> 2. 若官方源没有 → 尝试修改 spec/源码适应当前 chroot 版本（如降低 go.mod 的 `go` 指令、sed 绕开 PEP 639 等新格式、backport 不兼容写法）；
+> 3. 确认无法适配 → `verdict=abort`。
 >
-> 白名单：`setuptools`、`wheel`、`pip`、`hatchling`、`flit-core`、`flit`、`poetry-core`、`poetry`、`pdm-backend`、`pdm`、`build`、`meson-python`、`scikit-build-core`、`cython`、`numpy`（仅限构建依赖场景）、`versioneer`、`setuptools-scm`、`maturin`、`jupyter-packaging`、`pbr`
->
-> 示例：构建日志显示 `setuptools >=79` 缺失但官方源有 `python3-setuptools 68` → **不是失败原因**，跳过此依赖继续分析日志中的其他错误。
+> 示例：构建日志显示 `golang >= 1.23` 缺失但清单只有 `golang 1.21.4` → **不能注册 golang**；应改 fzf 的 go.mod 为 `go 1.21` 并评估是否用到 1.23 特性，必要时 backport。
 
-- `reuse_official` 或 `reuse_copr_project` → `verdict=rebuild`，加入 spec `BuildRequires`
+- `reuse_official` 或 `reuse_copr_project` → `verdict=rebuild`，加入 spec `BuildRequires`（工具链不加版本约束）
 - `introduce_new` → `verdict=retry`，调 `register-dep.py` 注册
 
 ### verdict = retry（引入新依赖，不改 spec）
@@ -185,7 +204,9 @@ python3 $SCRIPTS_DIR/register-dep.py \
 >
 > 任何情况下都不得把 `--constraint` 留空或写成过宽的约束（如 `>= 0`）。
 
-> **严禁降低主包版本**：主包（`${PKGNAME}`）的版本是用户指定的目标，任何情况下都不得在 fix_instructions 或 spec 修改中降低其 `Version:` 字段。遇到构建工具版本不足、meson 模块缺失等环境约束，必须引入更新的构建工具到 dep_registry，让 supervisor 先构建工具再重建主包。
+> **严禁引入/升级构建工具**：`register-dep.py` 和 `register-missing-deps.py` 已在脚本层拒绝工具链包注册。若缺失的依赖是工具链（golang、rust、setuptools、flit-core、hatchling、cmake 等），**不得调用 register 脚本**；应回到 spec/源码适配路径或 `abort`。
+
+> **严禁降低主包版本**：主包（`${PKGNAME}`）的版本是用户指定的目标，任何情况下都不得在 fix_instructions 或 spec 修改中降低其 `Version:` 字段。遇到构建工具版本不足、meson 模块缺失等环境约束，必须修改 spec/源码适应当前 chroot 的工具链版本，或确认无法适配后 `abort`。
 
 ### verdict = rebuild（修改 spec，重新构建）
 

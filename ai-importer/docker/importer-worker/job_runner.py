@@ -262,7 +262,7 @@ def run_job(r, proj, job_id):
 
     _init_workflow(session_dir, pkgname)
 
-    # ── 1.5 异步预热 repo 缓存 ────────────────────────────────────────────
+    # ── 1.5 异步预热 repo 缓存 + 生成构建工具链 manifest ────────────────────
     if copr_chroot:
         _warm_script = Path("/app/.claude/skills/build-rpm/scripts/warm_repo_cache.py")
         if _warm_script.exists():
@@ -271,6 +271,18 @@ def run_job(r, proj, job_id):
                     [sys.executable, str(_warm_script), copr_chroot],
                     capture_output=False,
                     timeout=660,
+                ),
+                daemon=True,
+            ).start()
+        # 同时生成当前 chroot 的构建工具链版本清单，作为全局约束
+        _toolchain_script = Path("/app/.claude/skills/build-rpm/scripts/chroot_toolchain.py")
+        if _toolchain_script.exists():
+            threading.Thread(
+                target=lambda: subprocess.run(
+                    [sys.executable, str(_toolchain_script), copr_chroot,
+                     "--session-dir", str(session_dir)],
+                    capture_output=False,
+                    timeout=300,
                 ),
                 daemon=True,
             ).start()

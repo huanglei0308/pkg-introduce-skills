@@ -9,6 +9,11 @@ import json
 import re
 from pathlib import Path
 
+# 引入构建工具链约束
+BUILD_RPM_SCRIPTS = Path(__file__).resolve().parents[2] / "build-rpm" / "scripts"
+sys.path.insert(0, str(BUILD_RPM_SCRIPTS))
+from chroot_toolchain import is_toolchain  # noqa: E402
+
 
 def _extract_constraint(log_text: str, rpm_pkg: str) -> str:
     """从 log 里提取包名对应的版本约束，如 '>= 1.4.0'。"""
@@ -58,8 +63,12 @@ def main():
 
     added = []
     for rpm_pkg in missing:
-        # 去掉 python3- 前缀还原 pypi/pkg 名
-        pkg_name = rpm_pkg.removeprefix("python3-")
+        # 去掉 python3-/python- 前缀还原 pypi/pkg 名
+        pkg_name = rpm_pkg.removeprefix("python3-").removeprefix("python-")
+        # 构建工具链不得注册为依赖
+        if is_toolchain(pkg_name):
+            print(f"[register-missing-deps] skip toolchain: {pkg_name}")
+            continue
         constraint = _extract_constraint(log_text, rpm_pkg)
         if pkg_name not in reg:
             reg[pkg_name] = {

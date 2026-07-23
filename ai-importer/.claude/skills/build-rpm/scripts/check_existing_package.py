@@ -21,6 +21,9 @@ import base64
 from pathlib import Path
 from typing import Any, Optional
 
+# 引入构建工具链名单与判断函数
+from chroot_toolchain import is_toolchain
+
 SKILLS_DIR = Path(__file__).resolve().parents[2]
 
 OFFICIAL_REPO_LABEL = "<openeuler-official>"
@@ -259,6 +262,16 @@ def teardown_repo():
 
 # ── 官方源查询（dnf repoquery 本地执行）──────────────────────────────────────
 
+def _python_query_stem(pkgname: str) -> str:
+    """剥离可能已有的 python3-/python- 前缀，避免二次拼接（如 python3-python3-xxx）。"""
+    stem = pkgname
+    for prefix in ("python3-", "python-"):
+        if stem.startswith(prefix):
+            stem = stem[len(prefix):]
+            break
+    return stem
+
+
 def _dnf_repoquery(pkgname: str, lang: str) -> Optional[dict]:
     """
     在本地 dnf 中查找包。如果设置了临时 repo（_ACTIVE_REPO_FILE），
@@ -285,9 +298,10 @@ def _dnf_repoquery(pkgname: str, lang: str) -> Optional[dict]:
             pass
 
     if lang_lower == "python":
-        query_args.append(f"python3dist({pkgname.lower()})")
-        query_args.append(f"python3-{pkgname}")
-        query_args.append(f"python-{pkgname}")
+        stem = _python_query_stem(pkgname)
+        query_args.append(f"python3dist({stem.lower()})")
+        query_args.append(f"python3-{stem}")
+        query_args.append(f"python-{stem}")
     elif lang_lower == "nodejs":
         query_args.append(f"npm({pkgname})")
         query_args.append(f"nodejs-{pkgname}")
@@ -326,7 +340,8 @@ def _dnf_repoquery_copr(pkgname: str, lang: str) -> Optional[dict]:
     lang_lower = (lang or "").lower()
     query_args = []
     if lang_lower == "python":
-        query_args = [f"python3-{pkgname}", f"python3dist({pkgname.lower()})"]
+        stem = _python_query_stem(pkgname)
+        query_args = [f"python3-{stem}", f"python3dist({stem.lower()})"]
     elif lang_lower == "nodejs":
         query_args = [f"nodejs-{pkgname}", f"npm({pkgname})"]
     else:
@@ -478,6 +493,12 @@ def summarize_copr_project(pkgname: str, lang: str, requested_version: str,
 
 def choose_decision(official: dict, copr: dict, requested_version: str,
                     requirement: str) -> str:
+    # 构建工具链：只要官方源存在任意版本，就复用（禁止引入/升级构建工具）
+    if official.get("exists"):
+        rpm_name = (official.get("highest") or {}).get("name", "")
+        if rpm_name and is_toolchain(rpm_name):
+            return "reuse_official"
+
     # 官方源满足 → 直接复用
     if official["meets_need"]:
         return "reuse_official"
