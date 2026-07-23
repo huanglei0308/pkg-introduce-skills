@@ -25,6 +25,7 @@ from constraint_conflict import has_conflict, merge_constraints  # noqa: E402
 BUILD_RPM_SCRIPTS = Path(__file__).resolve().parents[2] / "build-rpm" / "scripts"
 sys.path.insert(0, str(BUILD_RPM_SCRIPTS))
 from chroot_toolchain import is_toolchain, get_tool_version  # noqa: E402
+from rpm_naming import rpm_name_from_gav  # noqa: E402
 
 # 可信的 git 仓库主机
 _TRUSTED_GIT_HOSTS = (
@@ -111,6 +112,9 @@ def main():
     if not args.constraint:
         print(f"[register-dep] WARNING: --constraint 未指定，evaluator 将选最新稳定版而非最小满足版本。"
               f"建议明确指定版本约束（如 '>= 1.4.0'）。", file=sys.stderr)
+
+    # GAV 名归一化：'com.google.guava:guava' → 'guava'，防止同一依赖双名注册
+    args.pkg = rpm_name_from_gav(args.pkg)
 
     # 构建工具链硬过滤：禁止引入/升级构建工具
     if is_toolchain(args.pkg):

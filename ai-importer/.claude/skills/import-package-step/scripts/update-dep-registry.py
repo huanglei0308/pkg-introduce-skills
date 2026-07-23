@@ -22,6 +22,7 @@ from constraint_conflict import has_conflict, merge_constraints  # noqa: E402
 BUILD_RPM_SCRIPTS = Path(__file__).resolve().parents[2] / "build-rpm" / "scripts"
 sys.path.insert(0, str(BUILD_RPM_SCRIPTS))
 from chroot_toolchain import is_toolchain  # noqa: E402
+from rpm_naming import rpm_name_from_gav  # noqa: E402
 
 
 def main():
@@ -54,7 +55,8 @@ def main():
             for dep in pc.get("dependency_decisions", []):
                 name = dep.get("name", "")
                 if name:
-                    pre_check_index[name] = {
+                    # key 归一化（GAV → artifactId），与注册 key 保持一致
+                    pre_check_index[rpm_name_from_gav(name)] = {
                         "url": dep.get("upstream_url", ""),
                         "constraint": dep.get("constraint", ""),
                     }
@@ -68,11 +70,12 @@ def main():
     pending_names = result.get("dependency_resolution", {}).get("pending_deps", [])
 
     # 合并：full list 优先，pending_names 补充（从 pre_check_index 补全 url/constraint）
-    seen = {d["name"] for d in deps_full if isinstance(d, dict)}
+    # seen 与查找均用归一化后的名字（GAV → artifactId），与 pre_check_index 的 key 对齐
+    seen = {rpm_name_from_gav(d["name"]) for d in deps_full if isinstance(d, dict)}
     deps = list(deps_full)
     for name in pending_names:
-        if isinstance(name, str) and name not in seen:
-            pc_info = pre_check_index.get(name, {})
+        if isinstance(name, str) and rpm_name_from_gav(name) not in seen:
+            pc_info = pre_check_index.get(rpm_name_from_gav(name), {})
             deps.append({
                 "name": name,
                 "url": pc_info.get("url", ""),
@@ -82,7 +85,8 @@ def main():
     conflicts = []
 
     for dep in deps:
-        name = dep["name"]
+        # GAV 名归一化（com.google.guava:guava → guava），防止双名重复注册
+        name = rpm_name_from_gav(dep["name"])
         # 构建工具链不得注册为依赖
         if is_toolchain(name):
             print(f"[update-dep-registry] skip toolchain: {name}")

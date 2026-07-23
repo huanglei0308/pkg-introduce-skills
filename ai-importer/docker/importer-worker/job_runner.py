@@ -107,12 +107,13 @@ def _sync_copr_result(session_dir: Path, pkgname: str, job_id: str = "") -> None
         # 语言前缀还原为上游名后再比对，兼容 python- 和 python3- 两种前缀。
         actual_pkg = data.get("source_package", {}).get("name", "")
         if actual_pkg and actual_pkg != pkgname:
+            expected = pkgname
             try:
                 import sys as _sys
                 _scripts_dir = str(Path(SKILLS_DIR) / "build-rpm/scripts")
                 if _scripts_dir not in _sys.path:
                     _sys.path.insert(0, _scripts_dir)
-                from rpm_naming import upstream_from_srpm_name
+                from rpm_naming import upstream_from_srpm_name, rpm_name_from_gav
                 gate_path = session_dir / f"pkgs/{pkgname}/gate_result_{pkgname}.json"
                 lang = ""
                 if gate_path.exists():
@@ -121,9 +122,13 @@ def _sync_copr_result(session_dir: Path, pkgname: str, job_id: str = "") -> None
                 # 从 RPM 名剥离前缀还原上游名（python3-setuptools → setuptools）
                 # lang 为空时默认 "python"——Python 是最常见的包语言
                 normalized = upstream_from_srpm_name(actual_pkg, lang or "python")
+                # Java：pkgname 是 Maven GAV（com.google.j2objc:j2objc-annotations），
+                # SRPM 名是 artifactId（j2objc-annotations），expected 侧需归一
+                if lang == "java":
+                    expected = rpm_name_from_gav(pkgname)
             except Exception:
                 normalized = actual_pkg
-            if normalized != pkgname:
+            if normalized != expected:
                 br["status"] = "failed"
                 br["failure_reason"] = (
                     f"Package name mismatch: build {build_id} "

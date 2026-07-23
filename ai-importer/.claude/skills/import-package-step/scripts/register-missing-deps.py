@@ -13,6 +13,7 @@ from pathlib import Path
 BUILD_RPM_SCRIPTS = Path(__file__).resolve().parents[2] / "build-rpm" / "scripts"
 sys.path.insert(0, str(BUILD_RPM_SCRIPTS))
 from chroot_toolchain import is_toolchain  # noqa: E402
+from rpm_naming import rpm_name_from_gav  # noqa: E402
 
 
 def _extract_constraint(log_text: str, rpm_pkg: str) -> str:
@@ -65,6 +66,8 @@ def main():
     for rpm_pkg in missing:
         # 去掉 python3-/python- 前缀还原 pypi/pkg 名
         pkg_name = rpm_pkg.removeprefix("python3-").removeprefix("python-")
+        # GAV / mvn(...) 名归一化（mvn(org.jspecify:jspecify) → jspecify）
+        pkg_name = rpm_name_from_gav(pkg_name)
         # 构建工具链不得注册为依赖
         if is_toolchain(pkg_name):
             print(f"[register-missing-deps] skip toolchain: {pkg_name}")

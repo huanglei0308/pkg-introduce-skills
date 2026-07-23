@@ -12,6 +12,11 @@ import shlex
 import sys
 from pathlib import Path
 
+# 引入 GAV 名归一化（读侧与注册侧对齐）
+BUILD_RPM_SCRIPTS = Path(__file__).resolve().parents[2] / "build-rpm" / "scripts"
+sys.path.insert(0, str(BUILD_RPM_SCRIPTS))
+from rpm_naming import rpm_name_from_gav  # noqa: E402
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -27,7 +32,8 @@ def main():
         sys.exit(0)
 
     reg = json.loads(reg_file.read_text(encoding="utf-8"))
-    entry = reg.get(args.pkg, {})
+    # GAV 名归一化：调用方传 'com.google.guava:guava' 也能命中 'guava' 条目
+    entry = reg.get(rpm_name_from_gav(args.pkg), {})
     if isinstance(entry, str):
         entry = {"url": entry}
 

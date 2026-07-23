@@ -160,6 +160,25 @@ def extract_compat_major_version(version: str) -> str:
     return parts[0]
 
 
+def rpm_name_from_gav(name: str) -> str:
+    """Maven GAV / mvn() provides 名 → RPM 名（artifactId）。
+
+    'com.google.j2objc:j2objc-annotations'   → 'j2objc-annotations'
+    'mvn(org.jspecify:jspecify)'             → 'jspecify'
+    'j2objc-annotations'（非 GAV）            → 原样返回
+
+    用于 dep_registry 注册 key 归一化与包名比对，防止同一依赖以
+    GAV 名和简单名重复注册（Guava session 曾因此出现 6 条目 / 3 真依赖）。
+    """
+    n = name.strip()
+    # 剥 mvn(...) provides 包裹
+    if n.startswith("mvn(") and n.endswith(")"):
+        n = n[4:-1]
+    if ":" in n:
+        n = n.split(":")[-1]
+    return n
+
+
 def upstream_from_srpm_name(srpm_name: str, lang: str = "python") -> str:
     """
     从 SRPM/RPM 包名还原上游 PyPI/npm 等注册表中的原始名称。
