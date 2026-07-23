@@ -16,9 +16,9 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Optional
 
-from rpm_batch_lookup import name_query, run_batch_lookup
+from rpm_batch_lookup import chroot_to_repofrompath
 
 
 # ── 构建工具名单（唯一事实来源）───────────────────────────────────────────────
@@ -130,22 +130,59 @@ def is_build_system_tool(name: str) -> bool:
 
 # ── Manifest 生成 ────────────────────────────────────────────────────────────
 
+def _query_toolchain_versions(chroot: str) -> Dict[str, Dict[str, Any]]:
+    """用 dnf 直接查询 TOOLCHAIN_PACKAGES 在目标 chroot 官方源中的版本。
+
+    不经过 run_batch_lookup，避免其 cacheonly 策略在缓存"存在但无效"时返回空结果。
+    """
+    import warnings
+
+    warnings.filterwarnings("ignore")
+
+    try:
+        import dnf
+    except ImportError as exc:
+        raise RuntimeError("dnf Python module not available") from exc
+
+    repofrompath = chroot_to_repofrompath(chroot)
+    if not repofrompath:
+        raise RuntimeError(f"unknown chroot: {chroot}")
+
+    base = dnf.Base()
+    base.conf.cachedir = "/var/cache/dnf"
+    # 禁用系统默认 repo，只使用目标 chroot 的 openEuler 官方源
+    base.read_all_repos()
+    for repo in base.repos.iter_enabled():
+        repo.disable()
+    for repo_id, url in repofrompath:
+        base.repos.add_new_repo(repo_id, base.conf, baseurl=[url])
+    # 强制允许下载/刷新 metadata，不因旧缓存存在而跳过
+    base.conf.cacheonly = False
+    base.fill_sack(load_system_repo=False, load_available_repos=True)
+
+    sack = base.sack
+    result: Dict[str, Dict[str, Any]] = {}
+    for pkg_name in TOOLCHAIN_PACKAGES:
+        pkgs = list(sack.query().filter(name=pkg_name))
+        if pkgs:
+            pkg = pkgs[0]
+            result[pkg_name] = {
+                "version": pkg.version,
+                "release": pkg.release,
+                "available": True,
+            }
+        else:
+            result[pkg_name] = {"version": None, "release": None, "available": False}
+
+    return result
+
+
 def generate_manifest(chroot: str, output_path: Optional[str | Path] = None) -> Dict[str, Any]:
     """查询目标 chroot 官方源中 TOOLCHAIN_PACKAGES 的版本，生成 manifest。
 
     若 output_path 给定，将 manifest 写入该文件；同时返回 manifest 字典。
     """
-    tasks = [name_query(pkg, "name") for pkg in TOOLCHAIN_PACKAGES]
-    results = run_batch_lookup(tasks, chroot=chroot)
-
-    toolchain: Dict[str, Dict[str, Any]] = {}
-    for pkg, res in zip(TOOLCHAIN_PACKAGES, results):
-        rpm = res.get("rpm")
-        toolchain[pkg] = {
-            "version": res.get("version") if rpm else None,
-            "release": res.get("release") if rpm else None,
-            "available": bool(rpm),
-        }
+    toolchain = _query_toolchain_versions(chroot)
 
     manifest = {
         "chroot": chroot,
