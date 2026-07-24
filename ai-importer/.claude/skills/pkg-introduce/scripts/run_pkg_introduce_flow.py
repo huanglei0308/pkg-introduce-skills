@@ -95,6 +95,34 @@ def normalize_version_text(version: str) -> str:
     return (version or "").strip().removeprefix("v")
 
 
+def split_version_input(version: str) -> tuple[str, str]:
+    """拆分 version 输入为 (裸版本号, 完整 tag)。
+
+    用户可填完整 tag（如 workers-sdk@0.18.8、jfiglet-0.0.8、@scope/pkg@1.0.0）：
+    完整 tag 用于 ref 解析，裸版本号（数字尾）用于 detect 比对和 spec Version。
+    普通版本号输入时两者相同。
+
+    >>> split_version_input("0.18.8")
+    ('0.18.8', '0.18.8')
+    >>> split_version_input("v0.18.8")
+    ('0.18.8', 'v0.18.8')
+    >>> split_version_input("workers-sdk@0.18.8")
+    ('0.18.8', 'workers-sdk@0.18.8')
+    >>> split_version_input("jfiglet-0.0.8")
+    ('0.0.8', 'jfiglet-0.0.8')
+    >>> split_version_input("@cloudflare/pkg@1.0.0")
+    ('1.0.0', '@cloudflare/pkg@1.0.0')
+    """
+    version = (version or "").strip()
+    # 匹配结尾的数字版本段：以 \d+\.\d 开头（至少包含 major.minor），
+    # 后跟可选的点分数字段。预发布后缀（如 -rc.1、a6）无法单靠此正则匹配，
+    # 会 fall through 到默认路径，此时整个输入即为裸版本号（无前缀可剥离）。
+    m = re.search(r"(\d+\.\d[.\d]*)$", version)
+    if m and m.start() > 0:
+        return m.group(1), version      # (0.18.8, workers-sdk@0.18.8)
+    return version.removeprefix("v"), version
+
+
 def result_path(pkgname: str, reports_dir: Path) -> Path:
     return reports_dir / f"pkg_introduce_result_{pkgname}.json"
 
@@ -214,6 +242,18 @@ def run_download(pkgname: str, upstream_url: str, expected_version: str, sources
         # dependency mode：无精确版本，用 constraint 选稳定版
         command.extend(["--constraint", constraint])
     proc = run_command(command)
+    # P0-2: version 解析失败且 URL 里有 ref 时，用 ref 重试一次再放弃
+    if proc.returncode != 0 and expected_version and extracted_ref:
+        print(
+            f"[WARN] 按版本 {expected_version} 解析失败，回退到 URL 中的 ref: {extracted_ref}",
+            file=sys.stderr,
+        )
+        command = [
+            sys.executable, str(DOWNLOAD_SCRIPT), "--upstream-url", repo_url,
+            "--output-dir", str(sources_dir), "-o", str(path),
+            "--ref", extracted_ref,
+        ]
+        proc = run_command(command)
     if proc.returncode != 0:
         mark_step(pkgname, reports_dir, "download", "failed")
         raise FlowError(proc.stderr.strip() or proc.stdout.strip() or "download failed", "non_retryable_source_missing")
@@ -457,7 +497,10 @@ def main() -> int:
         if args.command == "detect":
             reports_dir = Path(args.reports_dir)
             try:
-                payload = detect_lang_and_version(Path(args.source_dir), args.expected_version)
+                # P0-1: 用户可能填了完整 tag（如 workers-sdk@0.18.8）
+                # detect 比对和后续 spec Version 应使用裸版本号
+                bare_version, _ = split_version_input(args.expected_version)
+                payload = detect_lang_and_version(Path(args.source_dir), bare_version)
                 if payload.get("status") == "done":
                     mark_step(args.pkg, reports_dir, "detect")
                 return print_payload(payload)
@@ -470,6 +513,11 @@ def main() -> int:
         if args.command == "finalize-result":
             archived = None if args.archived is None else args.archived == "true"
             args.archived = archived
+            # P0-1: spec Version 应为裸版本号，非法 RPM 字符（如 @）
+            if args.version is not None:
+                args.version, _ = split_version_input(args.version)
+            if args.requested_version is not None:
+                args.requested_version, _ = split_version_input(args.requested_version)
             payload = finalize_result(args)
             return print_payload(payload)
         if args.command == "mark-step":
