@@ -2,7 +2,7 @@
 """Build failure pre-check: scan build log for high-confidence fixable patterns.
 
 If a pattern matches, writes failure_analysis_*.json with verdict=rebuild and
-populated spec_patch for AI to apply in rebuild mode. Does NOT modify the spec
+populated spec_patch for pkg-fixer to apply. Does NOT modify the spec
 itself — the AI reads the analysis and learns to apply the fix, so it can handle
 similar issues in the future without new precheck rules.
 

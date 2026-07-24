@@ -24,14 +24,13 @@ model: sonnet
 
 ## 工作模式
 
-- **build**：构建（含依赖包和主包，COPR 模式下统一处理）
-- **rebuild**：重新构建（spec 已存在，跳过 gate，直接 build-rpm）
+- **build**：首次构建（含依赖包和主包，COPR 模式下统一处理）。spec 已存在的失败修复**不归本 agent**，由 `pkg-fixer` 负责
 
 ## 任务来源
 
 从 prompt 中读取：
 - `pkgname`：包名
-- `mode`：`build` | `rebuild`
+- `mode`：`build`
 - `session_dir`：session 目录路径
 
 ## 执行步骤
@@ -99,8 +98,8 @@ fi
 ```
 
 build-rpm skill 在 COPR 模式下（无 `SESSION_CONTAINER`）：
-1. **判断模式**：若 `fix_instructions.md` 和 spec 均已存在 → **rebuild 模式，在现有 spec 上打补丁，不重新生成**
-2. 首次构建：`git clone` 源码到 `./sources/${PKGNAME}/`，读规范生成 spec
+1. **只负责首次构建**：若 `./pkgs/${PKGNAME}/${PKGNAME}.spec` 已存在，说明是失败修复场景，**不归本 agent**——退出并提示应路由到 `pkg-fixer`
+2. `git clone` 源码到 `./sources/${PKGNAME}/`，读规范生成 spec
 3. **【强制】源码目录结构校验**：写 `%prep` / `%build` 前，**必须先** `tar tf <source>` 确认解压后的真实顶层目录名（如 `llvm-22.0.0/`）。将顶层目录名写入 spec 注释（如 `# topdir: llvm-22.0.0`），后续所有 `cd`、`cmake -S`、`%autosetup -n` 等指令必须引用该注释中的目录名。**严禁在未确认解压目录名的情况下写死目录参数。**
 4. `rpmlint` 静态检查
 5. `rpmbuild -bs` 打 SRPM → `./srpms/${PKGNAME}-${VERSION}*.src.rpm`

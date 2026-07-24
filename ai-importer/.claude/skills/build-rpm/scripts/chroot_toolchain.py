@@ -43,7 +43,7 @@ BUILD_SYSTEM_TOOLS = {
     "ninja",
     "cmake",
     "pbr",
-    # 原 pkg-failure-analyzer.md 白名单中额外出现的工具
+    # 原失败分析 agent 白名单中额外出现的工具
     "build",
     "scikit-build-core",
     "cython",

@@ -163,47 +163,11 @@ PRECHECK_RC=$?
 
 > **§2.5（检查参考源）已移除。** 参考源的查询和拉取由 gate 阶段的 4 级级联查找统一完成。若 gate 决定 `introduce_new_with_ref`，参考 spec/yaml/patches 已在 `./pkgs/<pkgname>/reference/` 中；若 gate 决定 `introduce_new`，说明 gitcode 也没有参考源，无需再查。
 
-### 3. 生成 spec
+### 3. 生成 spec（仅首次构建）
 
-**⚠️ 第一步：判断是首次构建还是 rebuild**
+**⚠️ 前置检查**：若 `./pkgs/<pkgname>/<pkgname>.spec` 已存在，说明是失败修复场景——**停止并退出**，该任务应由 `pkg-fixer` 处理，不要重新生成 spec。
 
-```bash
-FIX_FILE="./pkgs/<pkgname>/fix_instructions.md"
-SPEC_FILE="./pkgs/<pkgname>/<pkgname>.spec"
-```
-
-#### rebuild 模式（fix_instructions.md 和 spec 均已存在）
-
-**不重新生成 spec**，只应用最新一次失败分析的修法：
-
-```bash
-# 找最新的 failure_analysis 文件
-LATEST_ANALYSIS=$(ls -t ./pkgs/<pkgname>/failure_analysis_<pkgname>*.json 2>/dev/null | head -1)
-```
-
-**优先使用 `spec_patch`（精确替换）**：
-
-1. 读取 `$LATEST_ANALYSIS` 的 `spec_patch` 数组
-2. 对每条 patch，在现有 spec 中精确匹配 `before` 文本，用 Edit 工具替换为 `after`
-3. 找不到 `before` 文本时，读取该条 `description` 和 `fix_instructions` 字段，用 AI 判断等效位置并应用
-4. 所有 patch 应用完毕后，逐条确认改动已体现在 spec 中
-
-**`spec_patch` 为空或不存在时 fallback**：读取 `fix_instructions.md` 最后一个 `## build_id=` 块（仅最新，不读全部），根据描述修改 spec。
-
-5. 若上述两种方式均无法应用（spec 结构差异太大）→ 删除 spec，走下方"首次构建"流程重新生成
-6. 直接跳到 §3.5 rpmlint 校验，不执行"首次构建"步骤
-
-#### 首次构建（无 fix_instructions.md 或无 spec）
-
-读取修法（如有）：
-```bash
-if [ -f "$FIX_FILE" ]; then
-  echo "=== 发现历史修法，必须严格遵照 ==="
-  cat "$FIX_FILE"
-fi
-```
-
-**第二步：检查 openEuler 已有 spec 作为参考**
+**第一步：检查 openEuler 已有 spec 作为参考**
 
 ```bash
 REF_SPEC="./pkgs/<pkgname>/reference/<pkgname>.spec"
@@ -224,7 +188,7 @@ if [ -f "$REF_SPEC" ]; then
 fi
 ```
 
-**第三步：读取通用规范**，根据 `<lang>` 读规范文件：
+**第二步：读取通用规范**，根据 `<lang>` 读规范文件：
 
 - `python`：Read `/app/.claude/skills/build-rpm/spec-rules-python.md`
 - `nodejs`：Read `/app/.claude/skills/build-rpm/spec-rules-nodejs.md`
@@ -239,7 +203,7 @@ fi
 
 **注入历史经验：** 若传入 `--lessons`，读取并筛选相关条目注入 spec 生成推理。
 
-**第四步：根据是否有参考 spec 选择生成策略**
+**第三步：根据是否有参考 spec 选择生成策略**
 
 ##### A. 有参考 spec（`$REF_SPEC` 存在时）
 
@@ -338,6 +302,13 @@ python3 $SCRIPTS_DIR/copr_client.py \
   ./srpms/<pkgname>-<version>-1.src.rpm \
   --output ./pkgs/<pkgname>/build_rpm_result.json \
   --chroot "$COPR_CHROOT"
+
+# 【强制】spec 快照存档：记录本次实际提交的 spec（地面真值，供 pkg-fixer 下轮修复对照）
+BUILD_ID="$(python3 -c "import json; print(json.load(open('./pkgs/<pkgname>/build_rpm_result.json')).get('copr_build_id',''))" 2>/dev/null)"
+if [ -n "$BUILD_ID" ]; then
+  mkdir -p ./pkgs/<pkgname>/submitted_specs
+  cp ./pkgs/<pkgname>/<pkgname>.spec ./pkgs/<pkgname>/submitted_specs/spec_${BUILD_ID}.spec
+fi
 ```
 
 > **提交完成后立即退出，不要等待、不要轮询、不要 sleep。**
