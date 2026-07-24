@@ -103,6 +103,26 @@ def build_delay(lang: str) -> int:
 
 MAX_DEP_DEPTH = 5
 
+# 单包修复轮数上限：按 failure_analysis_<pkg>_<build_id>.json 文件数计（每轮失败构建一份）。
+# 超过上限强制 abort，防止 rebuild 死循环（此前没有任何上限）。
+MAX_FIX_ROUNDS = 8
+
+# 连续"修复无产出"轮数上限：fixer 退出但既未重新提交构建、也未注册新依赖、也未 abort。
+MAX_NO_OUTPUT_ROUNDS = 2
+
+
+def _fix_rounds(sd: Path, pkgname: str) -> int:
+    """统计该包已经历的修复轮数（按失败分析的 build 数）。"""
+    return len(list(sd.glob(f"pkgs/{pkgname}/failure_analysis_{pkgname}_*.json")))
+
+
+def _resubmitted(result: dict | None, old_build_id) -> bool:
+    """判断 fixer 是否已重新提交构建（build_rpm_result 变为 copr_running 且 build_id 更新）。"""
+    if not result:
+        return False
+    new_id = result.get("copr_build_id")
+    return result.get("status") == "copr_running" and bool(new_id) and str(new_id) != str(old_build_id)
+
 
 def compute_depth(dep_name: str, reg: dict, pkgname: str, _seen: frozenset = frozenset()) -> int:
     """从 required_by 链计算依赖深度。主包 = 0，直接依赖 = 1，以此类推。
@@ -313,9 +333,24 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
             if fallback.exists():
                 analysis_file = fallback
             else:
-                return ("analyze_failure_dep", dep, 0)
+                return ("fix_failure_dep", dep, 0)
         verdict = read_json(analysis_file).get("verdict", "abort")
+        if verdict == "regenerate":
+            # fixer 已删除 spec，回到 build_dep 由 pkg-builder 重新生成
+            reg[dep]["status"] = "evaluate_done"
+            reg[dep].pop("no_output_rounds", None)
+            write_json(reg_path_local, reg)
+            return ("build_dep", dep, build_delay(get_lang(sd, dep)))
         if verdict in ("rebuild", "retry"):
+            # fixer 已重新提交构建？（build_rpm_result 已变为 copr_running 且 build_id 更新）
+            dep_result_path = sd / f"pkgs/{dep}/build_rpm_result.json"
+            dep_result = read_json(dep_result_path) if dep_result_path.exists() else None
+            if _resubmitted(dep_result, dep_build_id):
+                reg[dep]["status"] = "copr_running"
+                reg[dep]["copr_build_id"] = dep_result["copr_build_id"]
+                reg[dep].pop("no_output_rounds", None)
+                write_json(reg_path_local, reg)
+                return determine_action(sd, wf, reg)
             # 检查 analyze 过程中是否有新增的未就绪前置依赖（required_by 指向当前 dep）。
             # 若存在，设为 pending_deps，等待前置依赖就绪后由 Priority 2 晋升逻辑自动升回 evaluate_done。
             # 这与 update_after_build 中 dep_needed 路径的行为一致。
@@ -328,10 +363,16 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
                 # 重新评估：当前 dep 已变为 pending_deps，不再被 Priority 2 捕获，
                 # Priority 3 将有机会处理 blocker 的 build_failed
                 return determine_action(sd, wf, reg)
-            reg[dep]["status"] = "evaluate_done"
+            # 修复轮数上限
+            if _fix_rounds(sd, dep) >= MAX_FIX_ROUNDS:
+                return ("fail", f"dep {dep} 修复轮数达到上限 {MAX_FIX_ROUNDS}，强制 abort", None)
+            # fixer 既未重新提交也未注册依赖 → 无产出计数，超限强制 abort
+            n = reg[dep].get("no_output_rounds", 0) + 1
+            if n >= MAX_NO_OUTPUT_ROUNDS:
+                return ("fail", f"dep {dep} 连续 {n} 轮修复无产出，强制 abort", None)
+            reg[dep]["no_output_rounds"] = n
             write_json(reg_path_local, reg)
-            lang = get_lang(sd, dep)
-            return ("build_dep", dep, build_delay(lang))
+            return ("fix_failure_dep", dep, 0)
         reason = read_json(analysis_file).get("reason", f"dep {dep} build failed")
         return ("fail", reason, None)
 
@@ -366,12 +407,28 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
             build_id = main_result.get("copr_build_id") if main_result else None
             analysis_file = sd / f"pkgs/{PKGNAME}/failure_analysis_{PKGNAME}_{build_id}.json" if build_id else sd / f"pkgs/{PKGNAME}/failure_analysis_{PKGNAME}.json"
             if not analysis_file.exists():
-                return ("analyze_failure", PKGNAME, 0)
+                return ("fix_failure", PKGNAME, 0)
             verdict = read_json(analysis_file).get("verdict", "abort")
-            if verdict == "rebuild":
+            if verdict == "regenerate":
+                # fixer 已删除 spec，回到 build_main 由 pkg-builder 重新生成
+                main_result_path.write_text(json.dumps({"status": "interrupted"}))
                 lang = get_lang(sd, PKGNAME)
-                return ("rebuild", PKGNAME, build_delay(lang))
+                return ("build_main", PKGNAME, build_delay(lang))
+            if verdict == "rebuild":
+                # 正常路径下 fixer 已重新提交（build_rpm_result 变为 copr_running），
+                # 不会进入本分支（走上方 copr_running 轮询）。进入本分支 = fixer 未重提交。
+                if _fix_rounds(sd, PKGNAME) >= MAX_FIX_ROUNDS:
+                    return ("fail", f"{PKGNAME} 修复轮数达到上限 {MAX_FIX_ROUNDS}，强制 abort", None)
+                n = main_result.get("no_output_rounds", 0) + 1
+                if n >= MAX_NO_OUTPUT_ROUNDS:
+                    return ("fail", f"{PKGNAME} 连续 {n} 轮修复无产出，强制 abort", None)
+                main_result["no_output_rounds"] = n
+                write_json(main_result_path, main_result)
+                return ("fix_failure", PKGNAME, 0)
             if verdict == "retry":
+                # fixer 已自行重提交时不会走到这里；走到这里按原逻辑重置重建
+                if _fix_rounds(sd, PKGNAME) >= MAX_FIX_ROUNDS:
+                    return ("fail", f"{PKGNAME} 修复轮数达到上限 {MAX_FIX_ROUNDS}，强制 abort", None)
                 main_result_path.write_text(json.dumps({"status": "interrupted"}))
                 lang = get_lang(sd, PKGNAME)
                 return ("build_main", PKGNAME, build_delay(lang))
@@ -593,7 +650,7 @@ def main() -> int:
     parser.add_argument("--session-dir", required=True)
 
     # 更新模式参数
-    parser.add_argument("--update-action", choices=["evaluate_main", "evaluate", "build_dep", "build_main", "rebuild", "done", "fail"])
+    parser.add_argument("--update-action", choices=["evaluate_main", "evaluate", "build_dep", "build_main", "done", "fail"])
     parser.add_argument("--update-target", default="")
     parser.add_argument("--gate-decision", default="")   # evaluate 完成后
     parser.add_argument("--build-result", default="")    # build 完成后

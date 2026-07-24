@@ -54,6 +54,20 @@ def _init_workflow(session_dir: Path, pkgname: str) -> None:
         }, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def _extract_build_failure(session_dir: Path, pkgname: str, job_id: str = "") -> None:
+    """构建失败时提取结构化错误报告（build_failure_<build_id>.json），供 pkg-fixer 诊断。
+    best-effort，失败不影响主流程。"""
+    try:
+        extractor = Path(SKILLS_DIR) / "import-package-step/scripts/extract-build-failure.py"
+        subprocess.run(
+            [sys.executable, str(extractor),
+             "--session-dir", str(session_dir), "--pkg", pkgname],
+            check=False, capture_output=True, text=True, timeout=60,
+        )
+    except Exception as e:
+        print(f"[sync_copr][{job_id}] extract-build-failure error: {e}", flush=True)
+
+
 def _sync_copr_result(session_dir: Path, pkgname: str, job_id: str = "") -> None:
     """wait 结束后拉取 COPR build log，写入 build_rpm_result.json。"""
     if not pkgname:
@@ -137,6 +151,7 @@ def _sync_copr_result(session_dir: Path, pkgname: str, job_id: str = "") -> None
                 br_path.write_text(_json.dumps(br, indent=2, ensure_ascii=False))
                 print(f"[sync_copr][{job_id}] MISMATCH: build {build_id} is {actual_pkg}, expected {pkgname}",
                       flush=True)
+                _extract_build_failure(session_dir, pkgname, job_id)
                 return
 
         terminal = {"succeeded", "failed", "canceled", "skipped"}
@@ -177,6 +192,8 @@ def _sync_copr_result(session_dir: Path, pkgname: str, job_id: str = "") -> None
 
         br_path.write_text(_json.dumps(br, indent=2, ensure_ascii=False))
         print(f"[sync_copr][{job_id}] {pkgname}: state={state} → build_rpm_result.status={br['status']}", flush=True)
+        if br["status"] == "failed":
+            _extract_build_failure(session_dir, pkgname, job_id)
 
     except Exception as e:
         print(f"[sync_copr][{job_id}] error: {e}", flush=True)
@@ -393,8 +410,8 @@ def run_job(r, proj, job_id):
                 if dep_info.get("status") == "build_failed":
                     _sync_copr_result(session_dir, dep_name, job_id)
         # 主包失败时也拉日志
-        if action in ("analyze_failure", "analyze_failure_dep"):
-            target_pkg = sv.get("pkgname", "") if action == "analyze_failure" else sv.get("target", "")
+        if action in ("fix_failure", "fix_failure_dep"):
+            target_pkg = sv.get("pkgname", "") if action == "fix_failure" else sv.get("target", "")
             _sync_copr_result(session_dir, target_pkg, job_id)
 
         if not action:
