@@ -134,6 +134,27 @@ build_main)
     --build-result "$BUILD_STATUS"
   ;;
 
+verify_install)
+  # 构建成功后：repoclosure 验证 RPM 可安装性
+  echo "[step] 运行 repoclosure 安装验证..."
+  eval "$(python3 $SCRIPTS_DIR/read-session.py --session-dir $SESSION_DIR)"
+  _BID=$(python3 -c "import json; print(json.load(open('$SESSION_DIR/pkgs/$TARGET/build_rpm_result.json')).get('copr_build_id',''))" 2>/dev/null)
+  _SRPM=""
+  if [ -n "$_BID" ]; then
+    _SRPM=$(python3 -c "
+import json,urllib.request,base64
+c=base64.b64encode(f'$COPR_LOGIN:$COPR_TOKEN'.encode()).decode()
+r=urllib.request.Request(f'$COPR_FRONTEND_URL/api_3/build/$_BID',headers={'Authorization':f'Basic {c}'})
+d=json.loads(urllib.request.urlopen(r,timeout=10).read())
+print(d.get('source_package',{}).get('name',''))
+" 2>/dev/null)
+  fi
+  python3 $SKILLS_DIR/pkg-introduce/scripts/run_ci_check.py \
+    --pkgs "${_SRPM:-$TARGET}" \
+    --session-dir "$SESSION_DIR"
+  echo "[step] CI 验证完成"
+  ;;
+
 feedback)
   Agent(
     subagent_type="pkg-feedback",

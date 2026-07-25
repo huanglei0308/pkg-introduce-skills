@@ -89,6 +89,9 @@ cat "$SPEC_FILE"
 
 # 5. 已有的失败分析（precheck_failure 自动诊断产出，如存在可作为诊断参考）
 cat "./pkgs/${PKGNAME}/failure_analysis_${PKGNAME}_${COPR_BUILD_ID}.json" 2>/dev/null || true
+
+# 6. CI 安装验证失败报告（构建成功但 RPM 因运行时依赖缺失而不可安装）
+cat "./pkgs/${PKGNAME}/ci_check_result.json" 2>/dev/null || true
 ```
 
 注意：`build_failure_*.json` 的 `same_as_previous=true` 表示本轮错误与上一轮相同，
@@ -138,6 +141,30 @@ gcc / python3 / 系统运行时版本不足且无法引入替换、架构不支�
 > ⚠️ **常见误判提醒**：以下错误**不是**基础设施/环境问题，属于类别 C，应判 `rebuild`：
 > - `fg: no job control` / `bg:` — shell 作业控制错误。只要 configure 阶段已成功，替换 `%cmake_build` → `cmake --build . -j$(nproc)` 即可修复
 > - `line X: fg: no job control` — 同上，是 `%cmake_build` 宏展开后的代码，不是 shell 环境缺陷
+
+### 类别 E：CI 安装验证失败（`ci_check_result.json` 存在且 `status: "fail"`）
+
+构建成功但 RPM 运行时依赖不闭合（repoclosure 检查未通过）。`ci_check_result.json` 的 `errors` 字段列出了缺失的依赖。
+
+**处置规则**：
+
+1. **默认处置**：将 `errors` 中的缺失依赖逐一注册到 dep_registry，走递归引入
+   ```bash
+   python3 $SCRIPTS_DIR/register-dep.py \
+     --session-dir . --pkg <缺失包名> --constraint "<版本约束>" --required-by ${PKGNAME}
+   ```
+   版本约束从 `ci_check_result.json` 的 errors 中提取（如 `astroid >= 3.3`）。
+
+2. **⛔ 严格禁止**：不得通过以下方式"通过"验证：
+   - 删除或注释 spec 中的 `Requires:` 行
+   - 添加 `AutoReq: no` 禁用自动依赖生成
+   - sed 删除 RPM 的 Requires 元数据
+   
+   以上行为属于"消灭证据"，会导致 RPM 表面上可安装但实际运行时 import 失败。
+
+3. **例外**：如果能证明 Requires 是误生成（如 `pythondistdeps` 已知 bug、`~=` 替换产生的虚假约束），允许在 spec 中精确过滤该条 Requires。
+
+**verdict**：`retry`（注册缺失依赖后退出，supervisor 会重新调度）
 
 ## 步骤 2：修复——按 verdict 执行
 

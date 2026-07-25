@@ -436,6 +436,16 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
             return ("fail", reason, None)
 
         if main_status == "success":
+            # CI 安装验证：构建成功后必须通过 repoclosure 验证
+            ci_result_path = sd / f"pkgs/{PKGNAME}/ci_check_result.json"
+            if not ci_result_path.exists():
+                return ("verify_install", PKGNAME, 0)
+            ci_result = read_json(ci_result_path)
+            if ci_result.get("status") != "pass":
+                main_result["status"] = "ci_failed"
+                main_result["ci_errors"] = ci_result.get("errors", [])
+                write_json(main_result_path, main_result)
+                return ("fix_failure", PKGNAME, 0)
             # 跳过 critique，直接 feedback → summary → done
             feedback_file = sd / f"pkgs/{PKGNAME}/feedback_{PKGNAME}.json"
             if not feedback_file.exists():

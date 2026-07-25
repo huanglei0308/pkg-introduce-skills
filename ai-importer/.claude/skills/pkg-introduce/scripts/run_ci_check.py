@@ -37,6 +37,8 @@ _CHROOT_REPO_MAP = {
     "openeuler-24.03_LTS-":      "http://repo.openeuler.org/openEuler-24.03-LTS",
     "openeuler-24.03_LTS_SP1-":  "http://repo.openeuler.org/openEuler-24.03-LTS-SP1",
     "openeuler-24.03_LTS_SP2-":  "http://repo.openeuler.org/openEuler-24.03-LTS-SP2",
+    "openeuler-24.03_LTS_SP3-":  "http://repo.openeuler.org/openEuler-24.03-LTS-SP3",
+    "openeuler-24.03_LTS_SP4-":  "http://repo.openeuler.org/openEuler-24.03-LTS-SP4",
 }
 
 
@@ -187,6 +189,10 @@ def run_repoclosure(pkgs: list[str], chroot: str, copr_result_url: str) -> tuple
         cmd += ["--check", pkg]
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    # repodata 可能有秒级更新延迟（createrepo 刚跑完），失败时重试一次
+    if result.returncode != 0:
+        time.sleep(2)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     if result.returncode != 0:
         return False, (result.stdout + result.stderr).strip()
     return True, ""
