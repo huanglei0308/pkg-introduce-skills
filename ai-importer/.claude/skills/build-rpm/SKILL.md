@@ -157,7 +157,13 @@ PRECHECK_RC=$?
 ```
 
 - `PRECHECK_RC=1`（blocked）：终止，不生成 spec。
-- `PRECHECK_RC=2`（dep_needed）：将缺包写入 `dep_registry.json`，退出等待 lead 处理。
+- `PRECHECK_RC=2`（dep_needed）：执行以下命令将缺包写入 `dep_registry.json`，退出等待 lead 处理。
+
+```bash
+python3 /app/.claude/skills/import-package-step/scripts/update-dep-registry.py \
+  --session-dir ${SESSION_DIR} --pkg <pkgname>
+```
+
 - `PRECHECK_RC=3`（needs_ai）：web search 补全 upstream URL 后重新执行本步骤。
 - `PRECHECK_RC=0`（precheck_done）：继续 §3。
 
