@@ -97,3 +97,10 @@ print('FAILED: url_error set')
 - **只写 url 或 url_error，不改 status**（status 由 supervisor 管理）
 - **不要 sleep 或轮询**
 - url 必须是可信平台链接，不要填 PyPI/crates.io 等中间注册表地址
+
+## 契约
+
+- 输入状态：supervisor 路由 resolve_upstream（dep 处于 pending_evaluate 且 url 为空、脚本直查也失败）时唤起。
+- 产物及消费者：dep_registry 该 dep 的 `url` 字段 → supervisor 下一轮进入 evaluate；`url_error` 字段 → supervisor 直接 fail 全单（无重试无降级）。
+- 预算与熔断：单次机会——写了 url_error 即判死全单，所以只有确实找不到可信上游时才写 url_error。
+- 异常出口：找不到可信平台 URL 时写 `url_error` 说明原因退出（= 全单 fail）；状态已变化（url 非空或 status 非 pending_evaluate）时什么都不写直接退出。

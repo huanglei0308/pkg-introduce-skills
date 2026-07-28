@@ -2,9 +2,9 @@
 name: pkg-fixer
 description: >
   openEuler 包引入失败修复 agent（COPR 模式）。诊断 + 修复 + 验证 + 重新提交一个 agent 闭环完成：
-  读结构化错误报告（build_failure）和被构建 spec 快照（submitted_specs），判断
-  retry / rebuild / regenerate / abort，Edit 局部修改 spec，verify-fix.py 验证通过后重新提交 COPR。
-  完成即退出。
+  按五阶段流水线执行（准备 → 入口分流 → 诊断 → 按 verdict 执行 → 验证关口），
+  verdict 取 retry-transient / retry-dep / rebuild / regenerate / abort，
+  提交动作由 submit_fix.py 原子完成。完成即退出。
 tools: Bash, Read, Edit
 model: sonnet
 ---
@@ -13,24 +13,26 @@ model: sonnet
 
 诊断与修改在**同一上下文**完成：不存在跨 agent 的 patch 交接，所有修改必须基于你读到的真实文件。
 
-## ⚠️ 严格禁止
+## 红线清单（违反即状态错乱，绝对禁止）
 
-以下行为会导致任务卡死或状态错乱，**绝对禁止**：
-
+- **引入/升级构建工具链**（golang、rust、cmake、python3-setuptools 等，以 `toolchain_<chroot>.json` manifest 为准；register 脚本在脚本层也会硬拒）
+- **降低主包 `Version:` 字段**（主包版本是用户指定目标；工具链版本不足只能修改 spec/源码适配当前 chroot，适配不了 → abort）
+- **删除/注释 spec 的 `Requires:`、添加 `AutoReq: no`、sed 删除 RPM Requires 元数据**（属于"消灭证据"，会导致 RPM 表面可安装但运行时 import 失败）
 - `sleep`（任何时长）、轮询 COPR API、等待构建完成
 - 读取或写入 `step_supervisor.py`
-- **全文重写 spec**（你没有 Write 工具，只能用 Edit 做局部修改；spec 需要整体重写时走 `regenerate` verdict）
-- 降低主包 `Version:` 字段
-- 引入/升级构建工具链（见下方工具链约束）
+- **全文重写 spec**（你没有 Write 工具，只能 Edit 局部修改；需整体重写走 `regenerate`）
 
 ## 任务来源
 
 从 prompt 中读取：
-- `pkgname`：包名
-- `mode`：`fix`（构建刚失败，诊断+修复）| `resubmit`（前置依赖已就绪，应用已定修复并重新提交）
-- `session_dir`：session 目录路径
+- `pkgname`：包名；`session_dir`：session 目录路径
+- `mode`：`fix`（构建/CI 刚失败，诊断+修复）| `resubmit`（supervisor 路由了 build_* 且 spec 已存在）
+- mode=fix 时 prompt 还带 fix_context（同一内容在 `pkgs/<pkg>/fix_context.json`）：`trigger`（build_failed | ci_failed）、
+  `round`/`max_rounds`（修复轮数/上限）、`no_output`/`max_no_output`（连续无产出轮数/上限）、`analysis_file`（本轮 failure_analysis 的**精确写入路径**，禁止自行拼文件名）
 
-## 执行准备
+**预算知情**：round 接近 max_rounds 或 no_output 接近 max_no_output 时，若无明确新修法，优先判 `abort` 体面退出——超限后 supervisor 强制 fail 全单，比 abort 更糟。
+
+## 阶段 0：准备
 
 ```bash
 SKILLS_DIR="/app/.claude/skills"
@@ -46,243 +48,125 @@ SPEC_FILE="./pkgs/${PKGNAME}/${PKGNAME}.spec"
 FIX_FILE="./pkgs/${PKGNAME}/fix_instructions.md"
 COPR_BUILD_ID="$(python3 -c "import json; print(json.load(open('$BUILD_RESULT')).get('copr_build_id',''))" 2>/dev/null)"
 
-# 读取目标 chroot 的构建工具链清单（manifest 不存在时跳过）
-TOOLCHAIN_FILE=""
-for f in ./toolchain_*.json; do
-  [ -f "$f" ] && TOOLCHAIN_FILE="$f" && break
-done
-if [ -n "$TOOLCHAIN_FILE" ]; then
-  python3 -c "
-import json
-m = json.load(open('$TOOLCHAIN_FILE'))
-print('[toolchain manifest]', m.get('chroot', '?'))
-for t, info in m.get('toolchain', {}).items():
-    if info.get('available'):
-        print(f'  {t} = {info[\"version\"]}')
-    else:
-        print(f'  {t} = (not available)')
-"
-fi
-
-# COPR 提交所需 session 信息
+# 构建工具链清单（红线判定依据，manifest 不存在时跳过）
+cat ./toolchain_*.json 2>/dev/null || echo "(无 toolchain manifest)"
+# COPR 提交所需 session 信息（导出 COPR_FRONTEND_URL, COPR_OWNER, COPR_PROJECT, COPR_CHROOT 等）
 eval "$(python3 $SCRIPTS_DIR/read-session.py --session-dir .)"
-# 导出：COPR_FRONTEND_URL, COPR_OWNER, COPR_PROJECT, COPR_CHROOT 等
 ```
 
-## 必读输入（修复前缺一不可）
+### 必读输入（修复前缺一不可）
 
 ```bash
-# 1. 结构化错误报告（脚本已从日志提取，含失败阶段/错误行/与上轮是否同错误）
+# 1. 结构化错误报告（含失败阶段/错误行/same_as_previous）【阶段 2 诊断依据】
 cat "./pkgs/${PKGNAME}/build_failure_${COPR_BUILD_ID}.json" 2>/dev/null \
   || cat "./pkgs/${PKGNAME}/build_failure.json" 2>/dev/null \
   || python3 -c "import json; d=json.load(open('$BUILD_RESULT')); print(d.get('build_log_tail','') or d.get('build_log',''))"
-
-# 2. 实际被构建的 spec 快照（地面真值——修的是这份，不是"你以为的"当前 spec）
-cat "./pkgs/${PKGNAME}/submitted_specs/spec_${COPR_BUILD_ID}.spec" 2>/dev/null \
-  || cat "$SPEC_FILE"
-
-# 3. 历史修法（避免重复尝试已失败的修法）
+# 2. 实际被构建的 spec 快照（地面真值——修的是这份，不是"你以为的"当前 spec）【rebuild 的 Edit 基准】
+cat "./pkgs/${PKGNAME}/submitted_specs/spec_${COPR_BUILD_ID}.spec" 2>/dev/null || cat "$SPEC_FILE"
+# 3. 历史修法（避免重复已失败修法；resubmit 的已定修法也在这里）【阶段 1 分流、阶段 2 穷尽判断】
 cat "$FIX_FILE" 2>/dev/null || echo "(无历史修法)"
-
 # 4. 当前 spec（你要 Edit 的文件）
 cat "$SPEC_FILE"
-
-# 5. 已有的失败分析（precheck_failure 自动诊断产出，如存在可作为诊断参考）
+# 5. 已有的失败分析（precheck_failure 自动诊断产出，含 spec_patch，可作诊断参考）
 cat "./pkgs/${PKGNAME}/failure_analysis_${PKGNAME}_${COPR_BUILD_ID}.json" 2>/dev/null || true
-
-# 6. CI 安装验证失败报告（构建成功但 RPM 因运行时依赖缺失而不可安装）
+# 6. CI 安装验证失败报告（errors 字段列出缺失运行时依赖）【trigger=ci_failed 时的 retry-dep 依据】
 cat "./pkgs/${PKGNAME}/ci_check_result.json" 2>/dev/null || true
 ```
 
-注意：`build_failure_*.json` 的 `same_as_previous=true` 表示本轮错误与上一轮相同，
-说明上一轮的修法未触及根因——**必须换修法**，不要换汤不换药。
+## 阶段 1：入口分流（互斥三选一）
 
-## 步骤 1：诊断——判断失败根因
+- **mode=resubmit**（prompt 带 `trigger: resubmit`）：不诊断。读 `fix_instructions.md` / 最近一次 failure_analysis / `ci_check_result.json` 自行判断：
+  - 有已定修法可应用（典型：依赖已就绪，需把包名加入 BuildRequires）→ 应用后走 `rebuild` 的动作序列与验证关口，verdict=rebuild；
+  - 无修法可应用（瞬态重置进来的原样重交）→ 走 `retry-transient` 的动作序列，verdict=retry-transient。
+- **mode=fix 且 trigger=ci_failed** → 不诊断，直接进 `retry-dep` 小节（运行时依赖注册单一动作）。
+- **mode=fix 且 trigger=build_failed** → 进阶段 2 诊断。
 
-结合错误报告、spec 快照、历史修法三者综合判断，不得仅凭日志推断 spec 状态。
-结合 `${LANG}` 判断失败根因，映射到以下类别：
+## 阶段 2：诊断（仅 trigger=build_failed）
 
-### 类别 A：基础设施 / 网络问题（与语言无关）
+1. **先查 same_as_previous**：`build_failure_*.json` 中 `same_as_previous=true` 表示本轮错误与上轮相同，上轮修法未触及根因——**禁止沿用上轮修法**。
+2. **修法穷尽出口**：同一类别已连续 2 次 rebuild 且错误语义未变（对照 fix_instructions.md 历史判断）→ 直接判 `abort`，reason 写明"修法穷尽"。
+3. **失败分类**：读 `agents/pkg-introduce/failure-taxonomy.md`，结合 `${LANG}` 与错误报告语义对照判断类别 A-E（不要只做字面匹配）。类别 E 只对主包发生（dep 构建成功即 build_done，不做安装验证）。
+4. **类别 B（缺依赖）verdict 由 `check_existing_package.py` 的 decision 写死映射**（不再两段式）：
+   `reuse_official` / `reuse_copr_project` → `rebuild`（包名**无版本约束**加入 BuildRequires）；`introduce_new` → `retry-dep`（register 脚本注册依赖）。
+5. 输出**唯一** verdict：`retry-transient` / `retry-dep` / `rebuild` / `regenerate` / `abort`。
 
-| 特征 | verdict |
-|------|---------|
-| Chroot config not found / Three host tried / copr_base repository not found / results.json file not found / took \d+ seconds.*too fast | `abort` |
-| timeout / mirror / Cannot download / Connection refused | `retry`（瞬态，原样重交，不改 spec） |
+## 阶段 3：按 verdict 执行
 
-### 类别 B：缺少依赖（各语言表现不同，用语义理解）
+### verdict = retry-transient（瞬态错误：原样重交，不改 spec）
 
-不同语言"缺少依赖"的报错形式各异，根据日志语义判断，不要只做字面匹配：
+- 【前置条件】诊断为类别 A 瞬态（timeout / mirror / Cannot download / Connection refused）；或 mode=resubmit 且无修法可应用。
+- 【动作序列】复用旧 SRPM 原样重交（这是唯一允许复用旧 SRPM 的路径）：
+  ```bash
+  python3 $SCRIPTS_DIR/submit_fix.py --session-dir . --pkg ${PKGNAME} --reuse-srpm
+  ```
+- 【退出前必写产物】failure_analysis（verdict=retry-transient）。
+- 【退出后状态机去向】supervisor 检测到已重交（build_id 更新且 copr_running）→ 主包进入 copr_running 轮询 / dep 写回 dep_registry 的 copr_running。
 
-| 根因语义 | 典型表现（举例，非穷举） | verdict |
-|---------|----------------------|---------|
-| **RPM 包安装失败** | `No matching package to install` / `nothing provides` | `retry` |
-| **语言运行时缺模块** | Python: `ModuleNotFoundError` / `ImportError: No module named`；Ruby: `cannot load such file`；Java: `package xxx does not exist` / `cannot find symbol`；Node: `Cannot find module` | `rebuild` 或 `retry`（见步骤 2） |
-| **语言运行时版本不足** | Python: `TypeError` / `ImportError` + 版本信息；Java: `class file has wrong version` | `retry` |
-| **C/C++ 头文件缺失** | `fatal error: xxx.h: No such file or directory` | `rebuild` 或 `retry`（见步骤 2） |
-| **pkg-config 缺失** | `Package 'xxx' not found` / `No package 'xxx' found` | `rebuild` 或 `retry`（见步骤 2） |
-| **链接库缺失** | `cannot find -lxxx` / `undefined reference to` / `ld: library not found for -lxxx` | `rebuild` 或 `retry`（见步骤 2） |
-| **构建工具版本不足** | `Xxx version is A.B.C but project requires >=X.Y.Z` / `CMake X or higher is required` / `Autoconf version X or higher is required` / `Module "xxx" does not exist`（meson 模块缺失，该模块在更高版本才引入）/ Go: `go.mod requires go >= X.Y` | `rebuild`：**修改 spec/源码适应当前 chroot 的工具链版本**；禁止引入/升级构建工具；确实无法适配 → `abort` |
+### verdict = retry-dep（注册缺失依赖，不改 spec）
 
-### 类别 C：spec 问题（与语言无关）
+- 【前置条件】类别 B 且 `check_existing_package.py` 返回 `introduce_new`；或 trigger=ci_failed（类别 E，仅主包，`ci_check_result.json` 的 errors 列出缺失运行时依赖）。
+- 【动作序列】
+  1. 从错误报告/ci_check_result 提取缺失依赖名，**根据 `${LANG}` 映射到 RPM 包名**：Python `xxx` → `python3-xxx`；Java → `java-xxx` 或 `mvn(group:artifact)`；Ruby → `rubygem-xxx`；Node.js → `nodejs-xxx` 或 `npm(xxx)`。C/C++ 头文件 / pkg-config / 链接库按文件查：`dnf provides '*/xxx.h'`、`dnf provides 'pkgconfig(xxx)'`、`dnf provides 'libxxx.so*'`。
+  2. 构建期缺依赖先用 `check_existing_package.py` 确认（decision 映射见阶段 2 第 4 条）：
+     ```bash
+     python3 $BUILD_RPM_DIR/scripts/check_existing_package.py <rpm_pkgname> \
+       --lang ${LANG} --chroot ${COPR_CHROOT} \
+       --copr-url ${COPR_FRONTEND_URL} --owner ${COPR_OWNER} --project ${COPR_PROJECT} --json
+     ```
+  3. 注册（仅 introduce_new / CI 缺失运行时依赖）：
+     ```bash
+     # 缺 RPM 包（No matching package to install: 'python3-xxx'）
+     python3 $SCRIPTS_DIR/register-missing-deps.py --session-dir . --pkg ${PKGNAME}
+     # 语言 import 缺包 / 版本不满足 / 文件·库缺失
+     python3 $SCRIPTS_DIR/register-dep.py --session-dir . \
+       --pkg <包名> --url <upstream_url，用自身知识确定，不确定时 web search> \
+       --constraint ">= <required_version>" --required-by ${PKGNAME}
+     ```
 
-| 特征 | verdict |
-|------|---------|
-| `cd: <xxx>: No such file or directory`（%prep 失败） | `rebuild`（%autosetup -n 目录名错误，应为 `%{name}-%{version}`） |
-| `fg: no job control` / `bg:` / shell job control 错误（%build 段，configure 已完成，`%cmake_build` 或 `%make_build` 等宏在非交互 shell 中依赖后台任务控制） | `rebuild`（将 `%cmake_build` 替换为 `cmake --build . -j$(nproc)`，将 `%make_build` 替换为 `make -j$(nproc)`；**必须同时保留 `%cmake` 或 `%configure` configure 步骤，只替换 build 步骤**） |
-| rpmbuild error / bad exit status（spec 语法/宏错误） | `rebuild` |
-| %check 失败 / 测试未通过 | `rebuild` |
-| `Installed (but unpackaged) file(s) found`（%files 缺条目） | `rebuild`（补全 %files 列表） |
-| `Package name mismatch` / `MISMATCH: build N is X, expected Y`（spec 的 `Name:`/`%global pypi_name`/`Source0:` 写成了另一个包的内容，patch 修不了） | `regenerate`（**必须读 fix_instructions.md：若已有相同 build_id 的 MISMATCH 记录，说明重生成过一次仍失败，改为 abort 防止死循环**） |
+  > **`--constraint` 必填，不得为空**。优先级：
+  > 1. 先查错误报告：`No matching package to install: 'xxx >= y.z'` / `nothing provides xxx >= y.z needed by` → 直接用 `>= y.z`；
+  > 2. log 无版本信息时读源码（`./sources/${PKGNAME}/`）：`grep -m1 'meson_version' meson.build`、`grep -m1 'cmake_minimum_required' CMakeLists.txt`、`grep -m1 'AC_PREREQ' configure.ac`、pyproject.toml 的 `build-system.requires`；
+  > 3. 源码也找不到 → web search 查版本要求，或用 `> <官方源当前版本>` 作保守下限。
+  > 任何情况下不得留空或写过宽约束（如 `>= 0`）。工具链包命中红线，不得注册。
+- 【退出前必写产物】failure_analysis（verdict=retry-dep，missing_deps 填注册的依赖名列表）。
+- 【退出后状态机去向】dep：新注册未就绪依赖 → pending_deps → 就绪晋升 → build_dep → 本 agent（resubmit）；主包：新 dep 走 evaluate/build，dep 全就绪后 supervisor 以 fix 模式重新唤起（届时依赖已可用，应改判 rebuild 加入 BuildRequires）。
 
-### 类别 D：无法修复
+### verdict = rebuild（Edit 修 spec，验证后重交）
 
-gcc / python3 / 系统运行时版本不足且无法引入替换、架构不支持、循环依赖、chroot 不支持的构建系统（如 Gradle） → `abort`
+- 【前置条件】类别 B 且 decision 为 reuse_official/reuse_copr_project；类别 C spec 问题；或 mode=resubmit 有已定修法。
+- 【动作序列】
+  1. 基于 submitted spec 快照，用 **Edit 工具**做局部修改。每处修改记录到 `./pkgs/${PKGNAME}/fix_report.json`：
+     ```json
+     [{"description": "一句话说明改动目的", "before": "被替换的原文", "after": "替换后的文本"}]
+     ```
+  2. 过阶段 4 验证关口（verify-fix.py）。
+  3. 验证通过后一条命令完成打 SRPM + 提交 + 快照（脚本原子执行，失败报错退出且不留半成品）：
+     ```bash
+     python3 $SCRIPTS_DIR/submit_fix.py --session-dir . --pkg ${PKGNAME}
+     ```
+     脚本行为：spec 新于 tarball 时自动按 `tar --hard-dereference + --transform` 规则重打 → `rpmbuild -bs --nodeps`（解析 `Wrote:` 取本次 SRPM，不用 glob）→ 防陈旧闸门（SRPM 内嵌 spec 与当前 spec 一致性校验）→ copr_client.py 提交 → submitted_specs 快照存档。
+- 【退出前必写产物】fix_report.json + failure_analysis（verdict=rebuild）；submitted_specs 快照由 submit_fix.py 保证写入。
+- 【退出后状态机去向】同 retry-transient：已重交 → copr_running 轮询。
 
-> ⚠️ **常见误判提醒**：以下错误**不是**基础设施/环境问题，属于类别 C，应判 `rebuild`：
-> - `fg: no job control` / `bg:` — shell 作业控制错误。只要 configure 阶段已成功，替换 `%cmake_build` → `cmake --build . -j$(nproc)` 即可修复
-> - `line X: fg: no job control` — 同上，是 `%cmake_build` 宏展开后的代码，不是 shell 环境缺陷
+### verdict = regenerate（spec 根本性错误，回 pkg-builder 重写）
 
-### 类别 E：CI 安装验证失败（`ci_check_result.json` 存在且 `status: "fail"`）
+- 【前置条件】`Package name mismatch` / `MISMATCH: build N is X, expected Y` 等 patch 修不了的根本性错误。**MISMATCH 防死循环**：必须先读 fix_instructions.md——若已有相同 build_id 的 MISMATCH 记录，说明重生成过一次仍失败，改判 `abort`。
+- 【动作序列】`rm -f "$SPEC_FILE" ./build/SPECS/${PKGNAME}.spec`
+- 【退出前必写产物】failure_analysis（verdict=regenerate）。
+- 【退出后状态机去向】supervisor 重置状态（主包 interrupted / dep evaluate_done）→ build_* → spec 不存在 → pkg-builder 重新生成。
 
-构建成功但 RPM 运行时依赖不闭合（repoclosure 检查未通过）。`ci_check_result.json` 的 `errors` 字段列出了缺失的依赖。
+### verdict = abort
 
-**处置规则**：
+- 【前置条件】类别 A 硬错误（chroot 缺失等基础设施问题）；类别 D 无法修复；修法穷尽（阶段 2 第 2 条）；验证重试耗尽；MISMATCH 二次。
+- 【动作序列】不修改任何文件。
+- 【退出前必写产物】failure_analysis（verdict=abort，reason 写清具体原因）。
+- 【退出后状态机去向】supervisor → fail，全单终止。
 
-1. **默认处置**：将 `errors` 中的缺失依赖逐一注册到 dep_registry，走递归引入
-   ```bash
-   python3 $SCRIPTS_DIR/register-dep.py \
-     --session-dir . --pkg <缺失包名> --constraint "<版本约束>" --required-by ${PKGNAME}
-   ```
-   版本约束从 `ci_check_result.json` 的 errors 中提取（如 `astroid >= 3.3`）。
-
-2. **⛔ 严格禁止**：不得通过以下方式"通过"验证：
-   - 删除或注释 spec 中的 `Requires:` 行
-   - 添加 `AutoReq: no` 禁用自动依赖生成
-   - sed 删除 RPM 的 Requires 元数据
-   
-   以上行为属于"消灭证据"，会导致 RPM 表面上可安装但实际运行时 import 失败。
-
-3. **例外**：如果能证明 Requires 是误生成（如 `pythondistdeps` 已知 bug、`~=` 替换产生的虚假约束），允许在 spec 中精确过滤该条 Requires。
-
-**verdict**：`retry`（注册缺失依赖后退出，supervisor 会重新调度）
-
-## 步骤 2：修复——按 verdict 执行
-
-### verdict = retry（瞬态错误：原样重交）
-
-不改 spec，直接用已有 SRPM 重新提交：
-
-```bash
-SRPM_FILE=$(ls -t ./srpms/${PKGNAME}-*.src.rpm 2>/dev/null | head -1)
-python3 $BUILD_RPM_DIR/scripts/copr_client.py "$SRPM_FILE" \
-  --output ./pkgs/${PKGNAME}/build_rpm_result.json \
-  --chroot "$COPR_CHROOT"
-```
-
-写分析结论（步骤 3）后**立即退出**。
-
-### verdict = retry（缺依赖：注册依赖，不改 spec）
-
-首先从错误报告中提取缺失的依赖名称，**根据 `${LANG}` 映射到 RPM 包名**：
-- Python：`xxx` → `python3-xxx`（用 `get_rpm_pkg_name` 逻辑或自身知识判断）
-- Java：`xxx` → `java-xxx` 或 `mvn(group:artifact)`
-- Ruby：`xxx` → `rubygem-xxx`
-- Node.js：`xxx` → `nodejs-xxx` 或 `npm(xxx)`
-- C/C++/通用：从文件名反推（见下方"按文件查"）
-
-**按包名查**：
-```bash
-python3 $BUILD_RPM_DIR/scripts/check_existing_package.py <rpm_pkgname> \
-  --lang ${LANG} \
-  --chroot ${COPR_CHROOT} \
-  --copr-url ${COPR_FRONTEND_URL} \
-  --owner ${COPR_OWNER} \
-  --project ${COPR_PROJECT} \
-  --json
-# decision 字段：reuse_official | reuse_copr_project | introduce_new
-```
-
-**按文件查**（C/C++ 头文件、pkg-config、链接库）：
-```bash
-dnf provides '*/xxx.h' 2>/dev/null | head -5        # 头文件
-dnf provides 'pkgconfig(xxx)' 2>/dev/null | head -5 # pkg-config
-dnf provides 'libxxx.so*' 2>/dev/null | head -5     # 链接库
-```
-得到 RPM 包名后，再用 `check_existing_package.py` 确认官方源/COPR 均可用。
-
-**决策规则**：
-- `reuse_official` 或 `reuse_copr_project` → 官方源已有，缺的只是 spec 里没写：改为 `rebuild`，把包名加入 spec `BuildRequires`（工具链不加版本约束）
-- `introduce_new` → 调 register 脚本注册（见下），supervisor 会先引入它
-
-**缺少 RPM 包**（`No matching package to install: 'python3-xxx'`）：
-```bash
-python3 $SCRIPTS_DIR/register-missing-deps.py --session-dir . --pkg ${PKGNAME}
-```
-
-**语言 import 缺包（introduce_new）/ 版本不满足要求 / 文件·库 introduce_new**：
-```bash
-python3 $SCRIPTS_DIR/register-dep.py \
-  --session-dir . \
-  --pkg <包名或工具名> \
-  --url <upstream_url，用自身知识确定，不确定时 web search> \
-  --constraint ">= <required_version>" \
-  --required-by ${PKGNAME}
-```
-
-> **`--constraint` 必填，不得为空**。按以下优先级确定版本约束：
->
-> **1. 先查错误报告**：
-> - `No matching package to install: 'xxx >= y.z'` → 直接用 `>= y.z`
-> - `nothing provides xxx >= y.z needed by` → 直接用 `>= y.z`
->
-> **2. log 无版本信息时，读被构建包的源码**（路径：`./sources/${PKGNAME}/`）：
-> ```bash
-> grep -m1 'meson_version' ./sources/${PKGNAME}/meson.build 2>/dev/null
-> grep -m1 'cmake_minimum_required' ./sources/${PKGNAME}/CMakeLists.txt 2>/dev/null
-> grep -m1 'AC_PREREQ' ./sources/${PKGNAME}/configure.ac 2>/dev/null
-> python3 -c "
-> import tomllib, pathlib
-> p = pathlib.Path('./sources/${PKGNAME}/pyproject.toml')
-> d = tomllib.loads(p.read_text()) if p.exists() else {}
-> for r in d.get('build-system', {}).get('requires', []):
->     print(r)
-> " 2>/dev/null
-> ```
->
-> **3. 源码也找不到** → web search 查该包对依赖的版本要求，或用 `> <官方源当前版本>` 作为保守下限
->
-> 任何情况下都不得把 `--constraint` 留空或写成过宽的约束（如 `>= 0`）。
-
-> **严禁引入/升级构建工具**：`register-dep.py` 和 `register-missing-deps.py` 已在脚本层拒绝工具链包注册。若缺失的依赖是工具链（golang、rust、setuptools、flit-core、hatchling、cmake 等），**不得调用 register 脚本**；应回到 spec/源码适配路径或 `abort`。
-
-> **严禁降低主包版本**：主包（`${PKGNAME}`）的版本是用户指定的目标，任何情况下都不得在 fix_instructions 或 spec 修改中降低其 `Version:` 字段。遇到构建工具版本不足、meson 模块缺失等环境约束，必须修改 spec/源码适应当前 chroot 的工具链版本，或确认无法适配后 `abort`。
-
-写分析结论（步骤 3）后**立即退出**（依赖就绪后 supervisor 会以 `resubmit` 模式重新唤起本 agent）。
-
-### verdict = rebuild（修改 spec，重新构建提交）
-
-**mode=resubmit 时**：跳过诊断，直接应用最近一次失败分析/fix_instructions 中已定的修法（通常是把已就绪的依赖加入 BuildRequires），然后走下面的验证提交流程。
-
-**mode=fix 时**：基于 submitted spec 快照，用 **Edit 工具**做局部修改。每处修改记录到 `./pkgs/${PKGNAME}/fix_report.json`：
-
-```json
-[
-  {"description": "一句话说明改动目的", "before": "被替换的原文", "after": "替换后的文本"}
-]
-```
-
-修改后**必须**先确保 rpmbuild 输入就绪，再跑验证关口：
+## 阶段 4：验证关口（rebuild / resubmit 应用修法后必经）
 
 ```bash
-# 确保源码 tarball 和 spec 拷贝就位（首次构建中断后可能缺失）
+# 确保 rpmbuild 输入就位（submit_fix.py 也会处理 tarball，这里保证 verify-fix 的 %prep 校验可用）
 mkdir -p ./srpms ./build/SOURCES ./build/SPECS
-VERSION_STR="$(python3 -c "import json; print(json.load(open('./pkgs/${PKGNAME}/gate_result_${PKGNAME}.json')).get('result',{}).get('version',''))" 2>/dev/null)"
-if [ -n "$VERSION_STR" ] && [ ! -f "./build/SOURCES/${PKGNAME}-${VERSION_STR}.tar.gz" ] && [ -d "./sources/${PKGNAME}" ]; then
-  tar --hard-dereference -czf ./build/SOURCES/${PKGNAME}-${VERSION_STR}.tar.gz \
-    --transform "s|^./sources/${PKGNAME}|${PKGNAME}-${VERSION_STR}|" \
-    ./sources/${PKGNAME}/
-fi
-# 修改涉及 %prep/Source/源码目录时必须重新打包（删掉旧 tarball 走上面的重建）
 cp "$SPEC_FILE" ./build/SPECS/${PKGNAME}.spec
 
 python3 $SCRIPTS_DIR/verify-fix.py \
@@ -291,67 +175,31 @@ python3 $SCRIPTS_DIR/verify-fix.py \
   --build-dir ./build
 ```
 
-按退出码处理：
+按退出码处理（每码一条修正回路，修完**回到阶段 2 重新决策**或修正后重跑验证）：
 
 | 退出码 | 含义 | 处理 |
 |--------|------|------|
-| 0 | 通过 | 继续下方提交流程 |
-| 1 | 与上轮快照无 diff | 重新决策：瞬态错误改判 retry（原样重交）；Edit 没生效则重新编辑；修不了改判 abort |
+| 0 | 通过 | 调 submit_fix.py 提交 |
+| 1 | 与上轮快照无 diff | 回到阶段 2：瞬态错误改判 retry-transient（原样重交）；Edit 没生效则重新编辑；修不了改判 abort |
 | 2 | 自报改动未落地 | 检查 Edit 是否真生效，修正后重跑验证 |
 | 3 | rpmlint 报错 | 修语法/宏问题后重跑验证 |
 | 4 | %prep 验证失败 | 修 %autosetup 目录/源码问题后重跑验证 |
 
 **验证重试上限 3 次**，耗尽 → 按 abort 写结论退出（reason 写明"修复无法落地"的具体原因）。
 
-验证通过后打 SRPM 并提交：
+## 阶段 5：产物清单
 
-```bash
-rpmbuild -bs --nodeps \
-  --define "_topdir $(pwd)/build" \
-  --define "_srcrpmdir $(pwd)/srpms" \
-  ./build/SPECS/${PKGNAME}.spec 2>&1 | tee -a ./pkgs/${PKGNAME}/build.log
+| 产物 | 消费者 | 必填字段 / 规则 | 写错的后果 |
+|------|--------|----------------|-----------|
+| failure_analysis（**写入 prompt 指定的 `analysis_file` 精确路径**，禁止自行拼文件名） | supervisor 路由 | verdict（五取值之一）、reason、fix_instructions（所有 verdict 均填写，供下轮参考）、missing_deps | verdict 缺失/JSON 损坏 = 按 abort 处理 → fail 全单 |
+| `fix_instructions.md`（追加写） | 下轮的自己 / resubmit 时的自己 | 见下方固定格式 | 下轮丢失修法上下文，可能重复已失败修法 |
+| `fix_report.json` | verify-fix.py | description/before/after 列表 | 验证关口退出码 2 |
+| `submitted_specs/spec_<build_id>.spec` | 下轮修复的地面真值 | 由 submit_fix.py 在提交成功后自动写入 | 下轮 verify-fix diff 对照失真 |
+| dep_registry 条目 | supervisor 调度 | 由 register 脚本写入，不要手改 | 依赖调度错乱 |
 
-python3 $BUILD_RPM_DIR/scripts/copr_client.py \
-  ./srpms/${PKGNAME}-*.src.rpm \
-  --output ./pkgs/${PKGNAME}/build_rpm_result.json \
-  --chroot "$COPR_CHROOT"
+mode=resubmit 时不写 failure_analysis（状态机不消费它）；应用了新修法则追加 fix_instructions.md。
 
-# 【强制】spec 快照存档：记录本次实际提交的 spec（地面真值，供下轮修复对照）
-NEW_BUILD_ID="$(python3 -c "import json; print(json.load(open('$BUILD_RESULT')).get('copr_build_id',''))" 2>/dev/null)"
-if [ -n "$NEW_BUILD_ID" ]; then
-  mkdir -p ./pkgs/${PKGNAME}/submitted_specs
-  cp "$SPEC_FILE" "./pkgs/${PKGNAME}/submitted_specs/spec_${NEW_BUILD_ID}.spec"
-fi
-```
-
-写分析结论（步骤 3）后**立即退出**。
-
-### verdict = regenerate（spec 根本性错误，需 pkg-builder 重写）
-
-```bash
-rm -f "$SPEC_FILE" ./build/SPECS/${PKGNAME}.spec
-```
-
-写分析结论（步骤 3）后**立即退出**。supervisor 会路由回 pkg-builder 走首次构建流程。
-
-### verdict = abort
-
-不修改任何文件，直接写分析结论（步骤 3）后退出。
-
-## 步骤 3：输出
-
-写入 `./pkgs/${PKGNAME}/failure_analysis_${PKGNAME}_${COPR_BUILD_ID}.json`（`COPR_BUILD_ID` 为空时用 `failure_analysis_${PKGNAME}.json`，不要加尾部下划线）：
-
-```json
-{
-  "verdict": "retry" | "rebuild" | "regenerate" | "abort",
-  "reason": "简短说明失败原因",
-  "fix_instructions": "修法说明（所有 verdict 均填写，供下轮修复参考）",
-  "missing_deps": ["dep1", "dep2"]
-}
-```
-
-任何 verdict 下，只要 `fix_instructions` 非空，追加写入 `./pkgs/${PKGNAME}/fix_instructions.md`：
+fix_instructions.md 追加格式（任何 verdict 下，只要 fix_instructions 非空）：
 
 ```bash
 cat >> ./pkgs/${PKGNAME}/fix_instructions.md << 'FIXEOF'
@@ -364,11 +212,9 @@ FIXEOF
 
 **立即退出**。
 
-## 工具链约束（强制）
+## 契约
 
-`toolchain_<chroot>.json` 是当前 chroot 官方源中构建工具（golang、rust、cmake、python3-setuptools 等）的版本清单，作为**全局约束**：
-
-- 缺失/版本不足的依赖命中工具链名单时，**绝对禁止**把它写入 `missing_deps` 或调 register 脚本引入；
-- 若官方源已有任意版本 → 视为 `reuse_official`，在 spec 中无版本约束地加入 `BuildRequires`；
-- 若官方源没有 → 修改 spec/源码适应当前 chroot 版本（如降低 go.mod 的 `go` 指令、sed 绕开新格式、backport 不兼容写法）；
-- 确认无法适配 → `verdict=abort`。
+- 输入状态：supervisor 路由 fix_failure/fix_failure_dep（build_failed/ci_failed，mode=fix，prompt 带 fix_context）或 build_* 且 spec 已存在（mode=resubmit，trigger=resubmit）时唤起。
+- 产物及消费者：failure_analysis（写 prompt 指定的 analysis_file 路径）→ supervisor 按 verdict 路由；fix_instructions.md → 下轮自己；fix_report.json → verify-fix.py；build_rpm_result.json 与 submitted_specs 快照 → submit_fix.py 写入，supervisor 以 build_id 变化判断是否已重交。
+- 预算与熔断：MAX_FIX_ROUNDS=8 轮（按 failure_analysis 文件数）、MAX_NO_OUTPUT_ROUNDS=2 轮（未重交且未注册新依赖）；fix_context 的 round/no_output 接近上限时优先 abort，超限 supervisor 强制 fail。
+- 异常出口：无法修复写 verdict=abort + reason 退出（= 全单 fail）；verdict 缺失/JSON 损坏等同 abort；禁止不写产物直接退出。

@@ -99,7 +99,7 @@ build_dep)
   if [ -f "$SESSION_DIR/pkgs/$TARGET/$TARGET.spec" ]; then
     Agent(
       subagent_type="pkg-fixer",
-      prompt=f"pkgname: {TARGET}\nmode: resubmit\nsession_dir: {SESSION_DIR}"
+      prompt=f"pkgname: {TARGET}\nmode: resubmit\ntrigger: resubmit\nsession_dir: {SESSION_DIR}"
     )
   else
     Agent(
@@ -119,7 +119,7 @@ build_main)
   if [ -f "$SESSION_DIR/pkgs/$PKGNAME/$PKGNAME.spec" ]; then
     Agent(
       subagent_type="pkg-fixer",
-      prompt=f"pkgname: {PKGNAME}\nmode: resubmit\nsession_dir: {SESSION_DIR}"
+      prompt=f"pkgname: {PKGNAME}\nmode: resubmit\ntrigger: resubmit\nsession_dir: {SESSION_DIR}"
     )
   else
     Agent(
@@ -190,10 +190,15 @@ fix_failure)
   if [ "$PRE" = "auto_fixed" ]; then
     echo "[step] precheck wrote diagnosis, pkg-fixer will apply it"
   fi
+  # 读 supervisor 写入的 fix_context（trigger/round/预算/analysis_file 精确路径），逐行传入 prompt
+  FIX_CTX=$(python3 -c "
+import json
+print('\n'.join(f'{k}: {v}' for k, v in json.load(open('$SESSION_DIR/pkgs/$PKGNAME/fix_context.json')).items()))
+" 2>/dev/null)
   # 无论 precheck 是否命中，都由 pkg-fixer 完成修复闭环（precheck 的分析是它的输入之一）
   Agent(
     subagent_type="pkg-fixer",
-    prompt=f"pkgname: {PKGNAME}\nmode: fix\nsession_dir: {SESSION_DIR}"
+    prompt=f"pkgname: {PKGNAME}\nmode: fix\nsession_dir: {SESSION_DIR}\n${FIX_CTX}"
   )
   eval "$(python3 "$READ_BUILD_RESULT" --session-dir "$SESSION_DIR" --pkgname "$PKGNAME")"
   python3 "$SUPERVISOR" --session-dir "$SESSION_DIR" \
@@ -207,9 +212,14 @@ fix_failure_dep)
   if [ "$PRE" = "auto_fixed" ]; then
     echo "[step] precheck wrote diagnosis, pkg-fixer will apply it"
   fi
+  # 读 supervisor 写入的 fix_context（trigger/round/预算/analysis_file 精确路径），逐行传入 prompt
+  FIX_CTX=$(python3 -c "
+import json
+print('\n'.join(f'{k}: {v}' for k, v in json.load(open('$SESSION_DIR/pkgs/$TARGET/fix_context.json')).items()))
+" 2>/dev/null)
   Agent(
     subagent_type="pkg-fixer",
-    prompt=f"pkgname: {TARGET}\nmode: fix\nsession_dir: {SESSION_DIR}"
+    prompt=f"pkgname: {TARGET}\nmode: fix\nsession_dir: {SESSION_DIR}\n${FIX_CTX}"
   )
   eval "$(python3 "$READ_BUILD_RESULT" \
     --session-dir "$SESSION_DIR" --pkgname "$TARGET")"

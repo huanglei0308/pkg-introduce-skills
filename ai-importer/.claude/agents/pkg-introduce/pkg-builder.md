@@ -118,7 +118,15 @@ build-rpm skill 在 COPR 模式下（无 `SESSION_CONTAINER`）：
    - **Name 字段一致性**：spec 的 `Name:` 去除 `python-`/`python3-` 前缀后，必须与 `${PKGNAME}` 匹配（大小写不敏感）。如 `${PKGNAME}=scipy`，`Name: scipy` ✓，`Name: python-pyelastica` ✗。
    - **Source0 一致性**：Source0 URL 路径中必须包含 `${PKGNAME}`（大小写不敏感）。如 `${PKGNAME}=scipy` 但 Source0 指向 `GazzolaLab/PyElastica` → ✗。
 
-   校验不通过时：删除 `./pkgs/${PKGNAME}/${PKGNAME}.spec`，重新生成。连续 2 次校验失败则输出错误退出，不提交 COPR。
+   校验不通过时：删除 `./pkgs/${PKGNAME}/${PKGNAME}.spec`，重新生成。连续 2 次校验失败则写入失败状态后退出，不提交 COPR（什么都不写直接退出会让 supervisor 无感知自旋）：
+
+   ```bash
+   python3 -c "
+   import json
+   json.dump({'status': 'failed', 'failure_reason': 'spec self-check failed twice: <具体原因>'},
+             open('./pkgs/${PKGNAME}/build_rpm_result.json', 'w'), indent=2, ensure_ascii=False)
+   "
+   ```
 
 7. 提交 COPR 构建，`copr_client.py` 直接写 `build_rpm_result.json`
 
@@ -169,3 +177,10 @@ echo "${PKGNAME}" >> ./build_state/introduced.txt
 ```
 
 **立即退出**，lead 读 `build_rpm_result.json` 确认 `status=success`，标记为 build_done。
+
+## 契约
+
+- 输入状态：supervisor 路由 build_dep/build_main 且 `pkgs/<pkg>/<pkg>.spec` 不存在时唤起（首次构建；spec 已存在的修复场景归 pkg-fixer）。
+- 产物及消费者：`pkgs/<pkg>/<pkg>.spec` + `srpms/*.src.rpm` → pkg-fixer 修复/重交的基准；`build_rpm_result.json` → supervisor 决定后续路由（copr_running 轮询 / dep_needed 注册依赖 / failed 走修复）；`build_state/introduced.txt` → 归档。
+- 预算与熔断：spec 内容自检最多 2 次，第 2 次失败必须写 `build_rpm_result.json`（status=failed）后退出；什么都不写直接退出会让 supervisor 无感知自旋到 max_loops。
+- 异常出口：URL 缺失、skill 失败、自检两次失败等无法完成时，写 `build_rpm_result.json`（status=failed/interrupted + failure_reason）再退出；写 status=failed 会进入 pkg-fixer 修复流程，修复不了由 fixer 判 abort 终止全单。

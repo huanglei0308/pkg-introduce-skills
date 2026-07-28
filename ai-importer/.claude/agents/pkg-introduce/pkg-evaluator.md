@@ -59,6 +59,19 @@ VERSION_ARG=""; [ -n "$VERSION" ] && VERSION_ARG="--version $VERSION"
 CONSTRAINT_ARG=""; [ -n "$CONSTRAINT" ] && CONSTRAINT_ARG="--constraint $CONSTRAINT"
 ```
 
+### Phase 0：读取上一轮重试提示（如存在）
+
+```bash
+cat "./pkgs/${PKGNAME}/evaluate_retry_hint.txt" 2>/dev/null || echo "(无重试提示)"
+```
+
+若该文件存在，说明上一轮 evaluate 失败后 analyzer 留下了修复建议（如正确的版本 tag、修正后的 URL）。
+在 Phase 1 needs_ai 处理或版本选择时**应用该建议**（如按建议的 tag 调整 VERSION_ARG），应用后删除该文件：
+
+```bash
+rm -f "./pkgs/${PKGNAME}/evaluate_retry_hint.txt"
+```
+
 ### Phase 1：合规检查
 
 ```bash
@@ -123,3 +136,10 @@ gate_result_$PKGNAME.json 已由 run_gate.py 写入，lead 直接读取：
 ```
 
 完成后**立即退出**，不等待任何回复。
+
+## 契约
+
+- 输入状态：supervisor 路由 evaluate_main（主包 gate_result 缺失/无效）或 evaluate（dep 处于 pending_evaluate）时唤起。
+- 产物及消费者：`gate_result_<pkg>.json`（decision/lang/version）→ supervisor 决定 reuse 直完、进入构建还是 evaluate_failed 待分析；`check_result_<pkg>.json` → pkg-evaluate-analyzer 失败诊断的输入。
+- 预算与熔断：evaluate 失败由 analyze_evaluate 判 retry/abort，retry 时带 `evaluate_retry_hint.txt` 重试（Phase 0 必读）；无 hint 的反复失败最终由 analyzer 判 abort 终止。
+- 异常出口：check 失败写 `gate_result`（decision=check_failed + reason）后退出；Gradle 等确定性不可构建场景直接按 check_failed 写原因，不做任何构建尝试。

@@ -116,8 +116,61 @@ MAX_NO_OUTPUT_ROUNDS = 2
 
 
 def _fix_rounds(sd: Path, pkgname: str) -> int:
-    """统计该包已经历的修复轮数（按失败分析的 build 数）。"""
-    return len(list(sd.glob(f"pkgs/{pkgname}/failure_analysis_{pkgname}_*.json")))
+    """统计该包已经历的修复轮数（按失败分析的 build 数）。
+    同时计入无 build_id 的 failure_analysis_<pkg>.json（否则该轮次会绕过熔断）。"""
+    n = len(list(sd.glob(f"pkgs/{pkgname}/failure_analysis_{pkgname}_*.json")))
+    if (sd / f"pkgs/{pkgname}/failure_analysis_{pkgname}.json").exists():
+        n += 1
+    return n
+
+
+def fix_context(sd: Path, pkgname: str, old_build_id) -> dict:
+    """生成 pkg-fixer 的上下文参数：trigger / 修复轮数 / 无产出计数 / analysis_file 精确路径。
+
+    trigger 推断：build_rpm_result.status == "ci_failed" → ci_failed，否则 build_failed。
+    （resubmit 场景不经 fix_failure 入口，trigger 由 SKILL.md 在 prompt 中直接写死。）
+    """
+    result_path = sd / f"pkgs/{pkgname}/build_rpm_result.json"
+    status = ""
+    no_output = 0
+    if result_path.exists():
+        try:
+            result = read_json(result_path)
+            status = result.get("status", "")
+            no_output = result.get("no_output_rounds", 0)
+        except Exception:
+            pass
+    # dep 的无产出计数在 dep_registry 里
+    reg_path = sd / "dep_registry.json"
+    if reg_path.exists():
+        try:
+            entry = read_json(reg_path).get(pkgname, {})
+            if isinstance(entry, dict) and "no_output_rounds" in entry:
+                no_output = entry["no_output_rounds"]
+        except Exception:
+            pass
+    trigger = "ci_failed" if status == "ci_failed" else "build_failed"
+    if old_build_id:
+        analysis_file = f"pkgs/{pkgname}/failure_analysis_{pkgname}_{old_build_id}.json"
+    else:
+        analysis_file = f"pkgs/{pkgname}/failure_analysis_{pkgname}.json"
+    return {
+        "trigger": trigger,
+        "round": _fix_rounds(sd, pkgname) + 1,
+        "max_rounds": MAX_FIX_ROUNDS,
+        "no_output": no_output,
+        "max_no_output": MAX_NO_OUTPUT_ROUNDS,
+        "analysis_file": analysis_file,
+    }
+
+
+def _emit_fix_action(sd: Path, action: str, pkgname: str, old_build_id) -> tuple[str, str, int]:
+    """写 pkgs/<pkg>/fix_context.json 后返回 fix_failure/fix_failure_dep action。"""
+    ctx = fix_context(sd, pkgname, old_build_id)
+    pkg_dir = sd / "pkgs" / pkgname
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    write_json(pkg_dir / "fix_context.json", ctx)
+    return (action, pkgname, 0)
 
 
 def _resubmitted(result: dict | None, old_build_id) -> bool:
@@ -159,6 +212,10 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
             if wf_files:
                 write_json(wf_files[0], wf)
             (sd / f"pkgs/{PKGNAME}/gate_result_{PKGNAME}.json").unlink(missing_ok=True)
+            # suggestion 留给重试的 pkg-evaluator（它读完后自行删除）
+            suggestion = data.get("suggestion", "")
+            if suggestion:
+                (sd / f"pkgs/{PKGNAME}/evaluate_retry_hint.txt").write_text(suggestion, encoding="utf-8")
             analysis_file.unlink(missing_ok=True)
             return ("evaluate_main", PKGNAME, 60)
         return ("fail", data.get("reason", wf.get("evaluate_failed", "evaluate failed")), None)
@@ -226,6 +283,10 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
             reg[dep]["status"] = "pending_evaluate"
             reg[dep].pop("error", None)
             write_json(sd / "dep_registry.json", reg)
+            # suggestion 留给重试的 pkg-evaluator（它读完后自行删除）
+            suggestion = data.get("suggestion", "")
+            if suggestion:
+                (sd / f"pkgs/{dep}/evaluate_retry_hint.txt").write_text(suggestion, encoding="utf-8")
             analysis_file.unlink(missing_ok=True)
             (sd / f"pkgs/{dep}/gate_result_{dep}.json").unlink(missing_ok=True)
             return ("evaluate", dep, 60)
@@ -355,7 +416,7 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
             if fallback.exists():
                 analysis_file = fallback
             else:
-                return ("fix_failure_dep", dep, 0)
+                return _emit_fix_action(sd, "fix_failure_dep", dep, dep_build_id)
         verdict = read_json(analysis_file).get("verdict", "abort")
         if verdict == "regenerate":
             # fixer 已删除 spec，回到 build_dep 由 pkg-builder 重新生成
@@ -363,7 +424,7 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
             reg[dep].pop("no_output_rounds", None)
             write_json(reg_path_local, reg)
             return ("build_dep", dep, build_delay(get_lang(sd, dep)))
-        if verdict in ("rebuild", "retry"):
+        if verdict in ("rebuild", "retry", "retry-transient", "retry-dep"):
             # fixer 已重新提交构建？（build_rpm_result 已变为 copr_running 且 build_id 更新）
             dep_result_path = sd / f"pkgs/{dep}/build_rpm_result.json"
             dep_result = read_json(dep_result_path) if dep_result_path.exists() else None
@@ -394,7 +455,7 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
                 return ("fail", f"dep {dep} 连续 {n} 轮修复无产出，强制 abort", None)
             reg[dep]["no_output_rounds"] = n
             write_json(reg_path_local, reg)
-            return ("fix_failure_dep", dep, 0)
+            return _emit_fix_action(sd, "fix_failure_dep", dep, dep_build_id)
         reason = read_json(analysis_file).get("reason", f"dep {dep} build failed")
         return ("fail", reason, None)
 
@@ -429,16 +490,18 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
             build_id = main_result.get("copr_build_id") if main_result else None
             analysis_file = sd / f"pkgs/{PKGNAME}/failure_analysis_{PKGNAME}_{build_id}.json" if build_id else sd / f"pkgs/{PKGNAME}/failure_analysis_{PKGNAME}.json"
             if not analysis_file.exists():
-                return ("fix_failure", PKGNAME, 0)
+                return _emit_fix_action(sd, "fix_failure", PKGNAME, build_id)
             verdict = read_json(analysis_file).get("verdict", "abort")
             if verdict == "regenerate":
                 # fixer 已删除 spec，回到 build_main 由 pkg-builder 重新生成
                 main_result_path.write_text(json.dumps({"status": "interrupted"}))
                 lang = get_lang(sd, PKGNAME)
                 return ("build_main", PKGNAME, build_delay(lang))
-            if verdict == "rebuild":
+            if verdict in ("rebuild", "retry-dep"):
+                # retry-dep（注册了 required_by=主包的新依赖）视同 rebuild 走未重交逻辑：
                 # 正常路径下 fixer 已重新提交（build_rpm_result 变为 copr_running），
-                # 不会进入本分支（走上方 copr_running 轮询）。进入本分支 = fixer 未重提交。
+                # 不会进入本分支（走上方 copr_running 轮询）。进入本分支 = fixer 未重提交，
+                # dep 全就绪后再唤起 fixer（fix 模式）把可用依赖加入 BuildRequires。
                 if _fix_rounds(sd, PKGNAME) >= MAX_FIX_ROUNDS:
                     return ("fail", f"{PKGNAME} 修复轮数达到上限 {MAX_FIX_ROUNDS}，强制 abort", None)
                 n = main_result.get("no_output_rounds", 0) + 1
@@ -446,8 +509,8 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
                     return ("fail", f"{PKGNAME} 连续 {n} 轮修复无产出，强制 abort", None)
                 main_result["no_output_rounds"] = n
                 write_json(main_result_path, main_result)
-                return ("fix_failure", PKGNAME, 0)
-            if verdict == "retry":
+                return _emit_fix_action(sd, "fix_failure", PKGNAME, build_id)
+            if verdict in ("retry", "retry-transient"):
                 # fixer 已自行重提交时不会走到这里；走到这里按原逻辑重置重建
                 if _fix_rounds(sd, PKGNAME) >= MAX_FIX_ROUNDS:
                     return ("fail", f"{PKGNAME} 修复轮数达到上限 {MAX_FIX_ROUNDS}，强制 abort", None)
@@ -467,7 +530,8 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
                 main_result["status"] = "ci_failed"
                 main_result["ci_errors"] = ci_result.get("errors", [])
                 write_json(main_result_path, main_result)
-                return ("fix_failure", PKGNAME, 0)
+                return _emit_fix_action(sd, "fix_failure", PKGNAME,
+                                        main_result.get("copr_build_id"))
             # 跳过 critique，直接 feedback → summary → done
             feedback_file = sd / f"pkgs/{PKGNAME}/feedback_{PKGNAME}.json"
             if not feedback_file.exists():
