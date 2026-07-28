@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,9 @@ DEP_WAITING_STATUS = "pending_deps"
 
 # 编译慢的语言，用较长延迟
 SLOW_LANGS = {"rust", "go", "c", "cpp"}
+
+# 上游地址解析脚本（优先脚本直查，失败再走 AI）
+_RESOLVE_SCRIPT = Path(__file__).resolve().parent / "resolve_upstream.py"
 
 
 
@@ -232,11 +236,29 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
     pending_eval = [k for k, v in reg.items() if v["status"] == "pending_evaluate"]
     if pending_eval:
         dep = pending_eval[0]
-        # 上游 URL 未填写时先让 AI 解析（脚本查询可能因网络/非标准平台失败）
+        # 上游 URL 未填写时，优先用脚本直查（npm/PyPI/crates.io API），
+        # 脚本查不到再走 resolve_upstream AI agent 兜底。
         if not reg[dep].get("url", ""):
             if reg[dep].get("url_error", ""):
                 return ("fail", f"无法解析 {dep} 上游地址: {reg[dep]['url_error']}", None)
-            return ("resolve_upstream", dep, 0)
+            # 尝试脚本解析
+            try:
+                rc = subprocess.run(
+                    [sys.executable, str(_RESOLVE_SCRIPT),
+                     "--pkg", dep, "--session-dir", str(sd)],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if rc.returncode == 0:
+                    # 脚本成功写入 URL → 重新读 dep_registry 后继续
+                    reg = read_json(sd / "dep_registry.json")
+                    if reg[dep].get("url", ""):
+                        pass  # url 已填充，进入下面的 evaluate 分支
+                    else:
+                        return ("resolve_upstream", dep, 0)
+                else:
+                    return ("resolve_upstream", dep, 0)
+            except (subprocess.TimeoutExpired, OSError):
+                return ("resolve_upstream", dep, 0)
         over_depth = [k for k in pending_eval if compute_depth(k, reg, PKGNAME) > MAX_DEP_DEPTH]
         if over_depth:
             return ("fail", f"dep depth exceeded {MAX_DEP_DEPTH}: {over_depth}", None)

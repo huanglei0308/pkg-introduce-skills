@@ -231,6 +231,7 @@ def run_download(pkgname: str, upstream_url: str, expected_version: str, sources
         repo_url,
         "--output-dir",
         str(sources_dir),
+        "--pkgname", pkgname,
         "-o",
         str(path),
     ]
@@ -250,7 +251,8 @@ def run_download(pkgname: str, upstream_url: str, expected_version: str, sources
         )
         command = [
             sys.executable, str(DOWNLOAD_SCRIPT), "--upstream-url", repo_url,
-            "--output-dir", str(sources_dir), "-o", str(path),
+            "--output-dir", str(sources_dir), "--pkgname", pkgname,
+            "-o", str(path),
             "--ref", extracted_ref,
         ]
         proc = run_command(command)

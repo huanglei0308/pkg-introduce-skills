@@ -427,18 +427,22 @@ def detect_project_version(dest: Path) -> Optional[str]:
 
 
 def download_git_repo(url: str, output_dir: Path, version: Optional[str] = None,
-                      ref: Optional[str] = None, constraint: Optional[str] = None) -> Path:
+                      ref: Optional[str] = None, constraint: Optional[str] = None,
+                      pkgname: Optional[str] = None) -> Path:
     """下载 git 仓库，支持按版本解析 branch/tag。
 
     version 优先级：
     1. 精确版本（已指定）→ 直接用
     2. constraint 区间 → select_best_version 选最佳版本（稳定版优先，不稳定版回退）
     3. 都没有 → clone main，检测到开发版时自动切换稳定 tag
+
+    pkgname 不为空时，输出目录使用 pkgname（而非从 URL 提取的 repo 名），
+    保证 download 和后续 check/gate 步骤的 source_dir 一致。
     """
     repo_name = url.rstrip("/").split("/")[-1]
     if repo_name.endswith(".git"):
         repo_name = repo_name[:-4]
-    dest = output_dir / repo_name
+    dest = output_dir / (pkgname if pkgname else repo_name)
 
     if dest.exists():
         print(f"[INFO] 目录已存在，跳过克隆: {dest}")
@@ -533,8 +537,11 @@ def download_git_repo(url: str, output_dir: Path, version: Optional[str] = None,
     return dest
 
 
-def download_tarball(url: str, output_dir: Path) -> Path:
-    """下载压缩包并解压，返回解压后的目录路径"""
+def download_tarball(url: str, output_dir: Path, pkgname: Optional[str] = None) -> Path:
+    """下载压缩包并解压，返回解压后的目录路径。
+
+    pkgname 不为空时，将解压结果重命名为 pkgname，保证调用方按 pkgname 能找到目录。
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     filename = url.split("/")[-1].split("?")[0]
     dest_file = output_dir / filename
@@ -559,27 +566,42 @@ def download_tarball(url: str, output_dir: Path) -> Path:
 
     entries = [e for e in output_dir.iterdir() if e.is_dir()]
     if len(entries) == 1:
-        return entries[0]
-    stem = re.sub(r"\.(tar\.\w+|tgz|zip)$", "", filename)
-    for e in entries:
-        if stem in e.name:
-            return e
-    return entries[0] if entries else output_dir
+        extracted = entries[0]
+    else:
+        stem = re.sub(r"\.(tar\.\w+|tgz|zip)$", "", filename)
+        for e in entries:
+            if stem in e.name:
+                extracted = e
+                break
+        else:
+            extracted = entries[0] if entries else output_dir
+
+    if pkgname and extracted.name != pkgname:
+        target = output_dir / pkgname
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        shutil.move(str(extracted), str(target))
+        print(f"[INFO] tarball 解压目录已重命名: {extracted.name} -> {pkgname}")
+        return target
+    return extracted
 
 
 def download_source(url: str, output_dir: Path, version: Optional[str] = None,
-                    ref: Optional[str] = None, constraint: Optional[str] = None) -> Path:
+                    ref: Optional[str] = None, constraint: Optional[str] = None,
+                    pkgname: Optional[str] = None) -> Path:
     """根据 URL 类型自动选择下载方式"""
     url_type = detect_url_type(url)
     print(f"[INFO] URL 类型: {url_type}")
 
     if url_type == "git_repo":
-        return download_git_repo(url, output_dir, version=version, ref=ref, constraint=constraint)
+        return download_git_repo(url, output_dir, version=version, ref=ref, constraint=constraint,
+                                 pkgname=pkgname)
     elif url_type == "tarball":
-        return download_tarball(url, output_dir)
+        return download_tarball(url, output_dir, pkgname=pkgname)
     else:
         print(f"[WARN] 未知 URL 类型，尝试 git clone: {url}")
-        return download_git_repo(url, output_dir, version=version, ref=ref, constraint=constraint)
+        return download_git_repo(url, output_dir, version=version, ref=ref, constraint=constraint,
+                                 pkgname=pkgname)
 
 
 # ── 3. 主入口 ─────────────────────────────────────────────────────────────────
@@ -593,6 +615,7 @@ def main():
     parser.add_argument("--version", default="", help="期望版本，用于按版本选择 git tag/branch")
     parser.add_argument("--constraint", default="", help="版本约束（dependency mode），如 '>= 1.4.0'")
     parser.add_argument("--ref", default="", help="显式指定 git ref（内部扩展参数）")
+    parser.add_argument("--pkgname", default="", help="输出目录名（默认从 URL 提取 repo 名；传此参数则用指定名，保证与后续步骤的 source_dir 一致）")
     parser.add_argument("-o", "--output", default="", help="将结果写入 JSON 文件")
     args = parser.parse_args()
 
@@ -612,8 +635,10 @@ def main():
     requested_version = args.version.strip() or None
     requested_ref = args.ref.strip() or None
     requested_constraint = args.constraint.strip() or None
+    requested_pkgname = args.pkgname.strip() or None
     source_dir = download_source(url, output_dir, version=requested_version,
-                                 ref=requested_ref, constraint=requested_constraint)
+                                 ref=requested_ref, constraint=requested_constraint,
+                                 pkgname=requested_pkgname)
     print(f"\nSOURCE_DIR={source_dir}")
 
     if args.output:

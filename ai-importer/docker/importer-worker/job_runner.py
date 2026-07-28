@@ -22,6 +22,7 @@ SKILLS_DIR    = os.environ.get("SKILLS_DIR", "/app/.claude/skills")
 SESSIONS_BASE = Path(os.environ.get("SESSIONS_BASE", "/tmp/ai-sessions"))
 
 SUPERVISOR    = Path(SKILLS_DIR) / "import-package-step/scripts/step_supervisor.py"
+RUN_EVALUATE  = Path(SKILLS_DIR) / "import-package-step/scripts/run_evaluate_dep.py"
 
 MAX_JOB_SECONDS = int(os.environ.get("MAX_JOB_SECONDS", str(4 * 3600)))
 MAX_LOOPS       = int(os.environ.get("MAX_LOOPS", "200"))
@@ -413,6 +414,57 @@ def run_job(r, proj, job_id):
         if action in ("fix_failure", "fix_failure_dep"):
             target_pkg = sv.get("pkgname", "") if action == "fix_failure" else sv.get("target", "")
             _sync_copr_result(session_dir, target_pkg, job_id)
+
+        # ── 脚本先行：evaluate / evaluate_main 优先用脚本，不启 Claude ──
+        # run_check.py + run_gate.py 本身是纯 Python 脚本，95%+ 的 dep 不需要 AI。
+        # 脚本返回 needs_ai 时才 fall through 到 Claude agent。
+        if action in ("evaluate", "evaluate_main"):
+            target = sv.get("target", "")
+            mode = "top-level" if action == "evaluate_main" else "dependency"
+            constraint = sv.get("constraint", "")
+            # 读取 upstream URL
+            url = ""
+            version = ""
+            if mode == "dependency":
+                _dep_path = session_dir / "dep_registry.json"
+                if _dep_path.exists():
+                    _dep_reg = json.loads(_dep_path.read_text())
+                    url = _dep_reg.get(target, {}).get("url", "")
+            else:
+                _sess_path = session_dir / "session.json"
+                if _sess_path.exists():
+                    _sess = json.loads(_sess_path.read_text())
+                    url = _sess.get("upstream_url", "")
+                    version = _sess.get("version", "")
+
+            if url:
+                _log(r, job_id, f"[script] trying direct evaluate for {target}")
+                try:
+                    rc = subprocess.run(
+                        [sys.executable, str(RUN_EVALUATE),
+                         "--pkg", target, "--mode", mode,
+                         "--url", url, "--constraint", constraint,
+                         "--version", version,
+                         "--session-dir", str(session_dir)],
+                        capture_output=True, text=True, timeout=300,
+                    )
+                    if rc.returncode == 0:
+                        result = json.loads(rc.stdout)
+                        st = result.get("status", "")
+                        if st == "done":
+                            _log(r, job_id, f"[script] {target} evaluate done (no Claude)")
+                            loop += 1
+                            continue
+                        if st == "failed":
+                            _log(r, job_id, f"[script] {target} evaluate failed: {result.get('reason', '')}")
+                            loop += 1
+                            continue
+                        # st == "needs_ai" → fall through to Claude
+                        _log(r, job_id, f"[script] {target} needs_ai, falling back to Claude")
+                    else:
+                        _log(r, job_id, f"[script] {target} script error (rc={rc.returncode}), falling back to Claude")
+                except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
+                    _log(r, job_id, f"[script] {target} exception: {e}, falling back to Claude")
 
         if not action:
             _finish(r, job_id, "failed", "supervisor returned no action")
