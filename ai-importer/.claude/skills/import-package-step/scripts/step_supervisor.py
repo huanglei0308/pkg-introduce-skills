@@ -34,6 +34,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
+# timeline 事件写入（快照 diff）
+from timeline import _snapshot_statuses, diff_and_write_transitions
+
 # build_rpm_result.json 的合法终态
 # precheck_done  — 预检通过但构建未完成（agent 中断），视为"待构建"
 # interrupted    — agent 异常退出，视为"待构建"
@@ -872,8 +875,13 @@ def main() -> int:
 
     # ── 更新模式 ──────────────────────────────────────────────────────────────
     if args.update_action:
+        # 快照：记录更新前的所有状态
+        snap_before = _snapshot_statuses(sd)
+
         if args.update_action == "evaluate_main":
             update_after_evaluate_main(sd, wf, wf_path, args.gate_decision)
+            # 主包 evaluate 完成：记录主包状态转移
+            diff_and_write_transitions(sd, snap_before)
             print(json.dumps({"updated": True}))
             return 0
 
@@ -896,10 +904,17 @@ def main() -> int:
 
         wf["loop_count"] = wf.get("loop_count", 0) + 1
         write_json(wf_path, wf)
+
+        # diff + 写 state.transition 事件
+        diff_and_write_transitions(sd, snap_before)
+
         print(json.dumps({"updated": True}))
         return 0
 
     # ── 读状态模式：输出下一步 action ─────────────────────────────────────────
+    # 快照：记录 determine_action 前的状态（COPR 轮询、vendor_only 判定等可能改变状态）
+    snap_before = _snapshot_statuses(sd)
+
     # 检查 dep 的非标准 status，打印警告
     for dep_name, dep_info in reg.items():
         if dep_info["status"] != "evaluate_done":
@@ -912,6 +927,9 @@ def main() -> int:
 
     action, target, delay = determine_action(sd, wf, reg)
     loop = wf.get("loop_count", 0) + 1
+
+    # diff + 写 state.transition 事件
+    diff_and_write_transitions(sd, snap_before)
 
     print_progress(sd, wf, reg, action, target)
 

@@ -149,10 +149,21 @@ d=json.loads(urllib.request.urlopen(r,timeout=10).read())
 print(d.get('source_package',{}).get('name',''))
 " 2>/dev/null)
   fi
+  _CI_START=$(date +%s)
   python3 $SKILLS_DIR/pkg-introduce/scripts/run_ci_check.py \
     --pkgs "${_SRPM:-$TARGET}" \
     --session-dir "$SESSION_DIR"
-  echo "[step] CI 验证完成"
+  _CI_DURATION=$(( $(date +%s) - _CI_START ))
+  echo "[step] CI 验证完成 (${_CI_DURATION}s)"
+
+  # ── 时间线：ci_check 细节补充（骨架 action.start/end 由 job_runner 写）─────
+  python3 "$SCRIPTS_DIR/timeline.py" --session-dir "$SESSION_DIR" \
+    --type ci_check.end --pkg "$TARGET" \
+    --data "$(python3 -c "
+import json
+ci = json.load(open('$SESSION_DIR/pkgs/$TARGET/ci_check_result.json'))
+print(json.dumps({'status': ci.get('status','?'), 'errors': ci.get('errors',[])[:5], 'duration_s': $_CI_DURATION}))
+" 2>/dev/null || echo '{\"status\":\"?\",\"errors\":[],\"duration_s\":'$_CI_DURATION'}')"
   ;;
 
 feedback)

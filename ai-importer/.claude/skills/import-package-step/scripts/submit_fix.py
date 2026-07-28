@@ -28,12 +28,15 @@
 """
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+from timeline import write_event
 
 # build-rpm skill 的 COPR 提交脚本（相对于本脚本：skills/build-rpm/scripts/copr_client.py）
 _COPR_CLIENT = Path(__file__).resolve().parent.parent.parent / "build-rpm" / "scripts" / "copr_client.py"
@@ -256,6 +259,17 @@ def main() -> int:
     new_build_id, rc = _submit(sd, pkg, srpm, chroot, session)
     if rc != 0:
         return rc
+
+    # ── 时间线：构建已提交 ────────────────────────────────────────────────
+    spec_md5 = ""
+    if spec_path.exists():
+        spec_md5 = hashlib.md5(spec_path.read_bytes()).hexdigest()
+    write_event(sd, "build.submitted", pkg, {
+        "build_id": new_build_id,
+        "srpm": srpm.name,
+        "submitted_by": "submit_fix.py",
+        "spec_md5": spec_md5,
+    })
 
     # spec 快照存档（地面真值，供下轮修复对照）；reuse 路径 spec 未变，同样记录
     if spec_path.exists():
