@@ -96,6 +96,40 @@ go build -v -o %{name} ./...
 - 不得手动修改 vendor/ 中的文件（review-rpm 会检测 `vendor_direct_edit`）
 - 若需 patch 依赖，使用 `%prep` 中的 `sed`/`patch` 而不是直接编辑
 
+### 2.4 混合包变体（主语言非 go，源码内含 go.mod）
+
+适用场景：主包是 python / c / cpp / nodejs 等语言，但源码内嵌 go 组件
+（precheck 的 `secondary_langs` 含 `go`，`secondary_manifests["go"]` 给出
+go.mod 相对路径）。go 部分的 module 依赖处理与纯 go vendor 路径相同：
+
+```bash
+# vendor_fetch（必须记录到 build_actions.json）：在 go.mod 所在目录执行
+MANIFEST_DIR=./sources/${pkgname}/<secondary_manifests["go"] 的父目录>
+(cd $MANIFEST_DIR && go mod vendor && go mod verify)
+tar czf ./sources/${pkgname}/${pkgname}-vendor.tar.gz -C $MANIFEST_DIR vendor/
+```
+
+spec 中声明：
+
+```spec
+BuildRequires: golang
+Source1: %{name}-vendor.tar.gz
+
+%prep
+%autosetup -n %{name}-%{version}
+# 在 go.mod 所在目录解 vendor（以 secondary_manifests 路径为准）
+tar xf %{SOURCE1} -C <manifest父目录>
+
+%build
+# 主语言构建系统中触发 go build 时，在 go.mod 所在目录加 -mod=vendor
+(cd <manifest父目录> && go build -mod=vendor ...)
+```
+
+**注意**：
+- 主语言的依赖检查、BuildRequires、spec 结构仍按主语言规则执行，本节只追加 go 部分
+- module 依赖**不写入** BuildRequires、**不得**用 register-dep.py 注册（由 vendor 保证）
+- CGO 系统库按 pre_check.json 的 `c_library_build_requires[]` 照常填入
+
 ## 3. CGO 处理
 
 | 情况 | 处理 |

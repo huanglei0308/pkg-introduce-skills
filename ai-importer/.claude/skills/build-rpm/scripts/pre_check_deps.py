@@ -64,6 +64,40 @@ ANALYZERS = {
     "java":   {"script": "analyze_java_deps.py",   "extra_args": []},
 }
 
+# vendor 语言闭集：这些语言的语言级依赖（crate/module）由 vendor 解决，
+# 不进 dep_registry、不打独立 RPM。
+VENDOR_LANGS = {"go", "rust"}
+
+# ── 混合包副语言探测（与主 lang 正交，语言无关）─────────────────────────────
+# 主包是 python/c 等语言时，源码里可能混入 Cargo.toml / go.mod（如 pendulum
+# 的 rust/ 子目录、setuptools-rust 的 src/rust/）。只探测 vendor 语言，
+# 浅层 glob：根目录 + 至多两层子目录。
+
+SECONDARY_PROBE = {"Cargo.toml": "rust", "go.mod": "go"}
+
+
+def detect_secondary_langs(lang: str, source_dir: str) -> tuple[list[str], dict[str, str]]:
+    """返回 (secondary_langs, secondary_manifests)。
+
+    secondary_manifests: lang → manifest 相对路径，如 {"rust": "rust/Cargo.toml"}，
+    供 builder 定位 vendor / analyzer 的工作目录。
+    """
+    src = Path(source_dir)
+    secondary: list[str] = []
+    manifests: dict[str, str] = {}
+    for fname, probe_lang in SECONDARY_PROBE.items():
+        if probe_lang == lang:
+            continue
+        candidates = (
+            list(src.glob(fname))
+            + list(src.glob(f"*/{fname}"))
+            + list(src.glob(f"*/*/{fname}"))
+        )
+        if candidates:
+            secondary.append(probe_lang)
+            manifests[probe_lang] = str(min(candidates, key=lambda p: len(p.parts)).relative_to(src))
+    return secondary, manifests
+
 
 def load_existing_checker() -> Any:
     script_dir = str(SCRIPT_DIR)
@@ -902,30 +936,55 @@ def main():
         print(f"[WARN] 分析脚本不存在: {script}，跳过预检", file=sys.stderr)
         sys.exit(0)
 
+    # ── 混合包副语言探测（ANALYZERS 分发之前，与主 lang 正交）────────────────
+    secondary, secondary_manifests = detect_secondary_langs(lang, args.source_dir)
+    if secondary:
+        print(f"[pre_check] 检测到副语言 {secondary}，manifests: {secondary_manifests}", file=sys.stderr)
+    # vendor_langs：本包参与 vendor 的语言（主语言或副语言中的 go/rust），
+    # 替代原全局 vendor_mode 布尔——混合包只有副语言进 vendor_langs，
+    # 主语言的依赖检查照常进行。
+    vendor_langs = [lang] if lang in VENDOR_LANGS else []
+    vendor_langs += [l for l in secondary if l in VENDOR_LANGS]
+
+    def attach_hybrid_fields(summary: dict) -> dict:
+        summary["secondary_langs"] = secondary
+        summary["secondary_manifests"] = secondary_manifests
+        summary["vendor_langs"] = vendor_langs
+        return summary
+
     out_file = make_output_path(args.pkgname, args.output)
     analysis_path = make_analysis_path(out_file, args.pkgname)
 
     # ── Rust MSRV / toolchain 结构性冲突检查（vendor 早退之前，见函数注释）──────
     # 这类冲突无法通过修改 spec 解决，提前拦截可以省掉一整轮"编译失败→AI诊断"。
+    # 混合包（如 pendulum：主 lang=python + rust/Cargo.toml）同样需要做此检查：
+    # Cargo.toml 在子目录（rust-version 在此），rust-toolchain.toml 通常在仓库根，两处都查。
+    rust_check_dirs: list[Path] = []
     if lang == "rust":
-        conflict = check_rust_toolchain(args.pkgname, args.source_dir)
+        rust_check_dirs.append(Path(args.source_dir))
+    elif "rust" in secondary_manifests:
+        rust_check_dirs.append(Path(args.source_dir))
+        rust_check_dirs.append(Path(args.source_dir) / Path(secondary_manifests["rust"]).parent)
+    for check_dir in rust_check_dirs:
+        conflict = check_rust_toolchain(args.pkgname, str(check_dir))
         if conflict:
             output_path = Path(out_file)
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            summary = build_summary(args.pkgname, lang, args.source_dir, "", [])
+            summary = attach_hybrid_fields(build_summary(args.pkgname, lang, args.source_dir, "", []))
             summary["blocked"] = [conflict]
             output_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"[BLOCK] {conflict['name']}: {conflict['reason']}", file=sys.stderr)
             sys.exit(1)
 
-    # ── vendor 语言早退：Go/Rust 永远 vendor，跳过语言级依赖存在性检查 ──────────
+    # ── vendor 语言早退：主语言为 Go/Rust 时永远 vendor，跳过语言级依赖存在性检查 ──
     # 构建环境离线，这两种语言没有"不 vendor"的场景。
     # 系统库依赖（CGO、-sys crate）由 rpmbuild 循环兜底（报 missing header → 补 BuildRequires）。
-    VENDOR_LANGS = {"go", "rust"}
+    # 注意：主语言不是 vendor 语言的混合包（lang=python + Cargo.toml）不命中本分支，
+    # 主语言依赖照查，副语言的 crate/module 由 vendor_langs 标记交给 builder vendor。
     if lang in VENDOR_LANGS:
         output_path = Path(out_file)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        summary = build_summary(args.pkgname, lang, args.source_dir, "", [])
+        summary = attach_hybrid_fields(build_summary(args.pkgname, lang, args.source_dir, "", []))
         summary["vendor_mode"] = True
         output_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"[pre_check] {lang} vendor 模式，跳过语言级依赖检查", file=sys.stderr)
@@ -953,13 +1012,14 @@ def main():
             output_path.parent.mkdir(parents=True, exist_ok=True)
             if not has_lockfile:
                 print(f"[pre_check] nodejs: {deps_count} 个依赖 > 阈值 {NODEJS_VENDOR_THRESHOLD} 但无 lockfile，无法确定性 vendor", file=sys.stderr)
-                summary = build_summary(args.pkgname, lang, args.source_dir, str(analysis_path), [])
+                summary = attach_hybrid_fields(build_summary(args.pkgname, lang, args.source_dir, str(analysis_path), []))
                 summary["blocked"] = [{"name": args.pkgname, "reason": f"{deps_count} npm deps declared but no lockfile (package-lock.json/yarn.lock), cannot vendor deterministically"}]
                 output_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
                 sys.exit(1)
             print(f"[pre_check] nodejs: {deps_count} 个依赖 > 阈值 {NODEJS_VENDOR_THRESHOLD}，切换 vendor 模式", file=sys.stderr)
-            summary = build_summary(args.pkgname, lang, args.source_dir, str(analysis_path), [])
+            summary = attach_hybrid_fields(build_summary(args.pkgname, lang, args.source_dir, str(analysis_path), []))
             summary["vendor_mode"] = True
+            summary["vendor_langs"] = ["nodejs"] + vendor_langs
             output_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
             sys.exit(0)
         # deps <= THRESHOLD → 走原有 --check-rpm 路径（查实际 missing 数量）
@@ -1004,6 +1064,53 @@ def main():
         if rpm and rpm not in seen_brs:
             seen_brs.add(rpm)
             c_lib_brs.append(rpm)
+
+    # ── 副语言 analyzer：提取混合包中 vendor 语言部分的系统 C 库依赖 + crate 清单 ──
+    # 混合包（如 python + rust/Cargo.toml）同样可能链接 openssl 等系统库；
+    # crate/module 清单供 supervisor 识别 vendor_only 依赖、供 builder 做 vendor。
+    vendor_crates: dict[str, list[str]] = {}
+    for sec_lang in secondary:
+        sec_cfg = ANALYZERS.get(sec_lang)
+        if not sec_cfg:
+            continue
+        sec_script = SCRIPT_DIR / sec_cfg["script"]
+        if not sec_script.exists():
+            continue
+        manifest_rel = secondary_manifests.get(sec_lang, "")
+        if not manifest_rel:
+            continue
+        # analyzer 在 manifest 所在目录工作（Cargo.toml / go.mod 的父目录）
+        sec_dir = str(Path(args.source_dir) / Path(manifest_rel).parent)
+        sec_out = analysis_path.with_name(f"{analysis_path.stem}_{sec_lang}{analysis_path.suffix}")
+        sec_cmd = [resolve_python_executable(), str(sec_script), sec_dir, "--check-rpm", "-o", str(sec_out)]
+        print(f"[pre_check] 副语言 {sec_lang} 分析: {' '.join(sec_cmd)}", file=sys.stderr)
+        sec_proc = subprocess.run(sec_cmd, capture_output=False)
+        if sec_proc.returncode not in (0, 2):
+            print(f"[WARN] 副语言 {sec_lang} 分析失败（忽略，由构建失败循环兜底），退出码 {sec_proc.returncode}", file=sys.stderr)
+            continue
+        try:
+            sec_result = load_json(sec_out)
+        except Exception as e:
+            print(f"[WARN] 无法读取副语言 {sec_lang} 分析结果: {e}", file=sys.stderr)
+            continue
+        # 系统 C 库（已验证存在）并入 c_library_build_requires；missing 的不阻断，
+        # 与纯 rust 路径一致，由 rpmbuild 循环兜底。
+        for item in (sec_result.get("rpm_check") or {}).get("available", []):
+            rpm = item.get("rpm", "")
+            if rpm and rpm not in seen_brs:
+                seen_brs.add(rpm)
+                c_lib_brs.append(rpm)
+        # crate/module 依赖：vendor 解决，不进 pending、不写 BuildRequires
+        crates = [c.get("name", "") for c in sec_result.get("crate_deps", []) if isinstance(c, dict) and c.get("name")]
+        go_mod_info = sec_result.get("go_mod") or {}
+        crates += [m.get("name", "") for m in go_mod_info.get("module_deps", []) if isinstance(m, dict) and m.get("name")]
+        if crates:
+            vendor_crates[sec_lang] = sorted(set(crates))
+            print(f"[pre_check] 副语言 {sec_lang} crate/module 依赖（vendor 解决）: {vendor_crates[sec_lang]}", file=sys.stderr)
+
+    attach_hybrid_fields(summary)
+    if vendor_crates:
+        summary["vendor_crates"] = vendor_crates
     summary["c_library_build_requires"] = c_lib_brs
     if c_lib_brs:
         print(f"[pre_check] C 扩展链接库 BuildRequires: {c_lib_brs}", file=sys.stderr)

@@ -30,6 +30,17 @@ pkg-fixer 阶段 2 诊断时对照本表判断失败类别，再回到 pkg-fixer
 **构建工具版本不足**是特例，verdict 固定为 `rebuild`：**修改 spec/源码适应当前 chroot 的工具链版本**；
 禁止引入/升级构建工具（红线）；确实无法适配 → `abort`。
 
+**混合包 vendor 语言依赖缺失**也是特例，verdict 固定为 `rebuild`：主包语言不是 go/rust
+（如 python），但日志出现 cargo/crates.io 报错（`no matching package named 'xxx' found` /
+`failed to download from crates.io`）或 go 报错（`missing go.sum entry` /
+`cannot find module providing package`）——说明包内含 Cargo.toml/go.mod 的混合组件需要
+vendor（如 pendulum 类）。修法：读 `./pkgs/${PKGNAME}/pre_check.json` 的 `secondary_langs` /
+`secondary_manifests`，按对应规范的混合包变体节（rust → spec-rules-rust.md §3.4，
+go → spec-rules-go.md §2.4）补 vendor：cargo vendor / go mod vendor 打 Source1 tarball +
+`%prep` 解包配离线源。**⛔ 严禁把 crate/module 名用 register-dep.py 注册为依赖**——
+crate/module 由父包 vendor 解决，永远不会以 RPM 形式存在；注册了也只会被 supervisor
+置 vendor_only 或构建出无意义产物。
+
 ## 类别 C：spec 问题（与语言无关）→ `rebuild`
 
 | 特征 | 修法方向 |

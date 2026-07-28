@@ -96,6 +96,84 @@ install -Dm755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
 
 **严禁**：`--ignore-rust-version`（掩盖 MSRV 冲突，review-rpm 会标记 E 级错误）
 
+### 3.4 混合包变体（主语言非 rust，源码内含 Cargo.toml）
+
+适用场景：主包是 python / c / cpp / nodejs / ruby 等语言，但源码内嵌 rust 组件
+（precheck 的 `secondary_langs` 含 `rust`，`secondary_manifests["rust"]` 给出
+Cargo.toml 相对路径，如 pendulum 的 `rust/Cargo.toml`、cryptography 的
+`src/rust/Cargo.toml`）。rust 部分的 crate 依赖处理与纯 rust 包相同：
+**cargo vendor 打 Source1 + `%prep` 配 `.cargo/config.toml` 离线源**，差异只在
+BuildRequires 和 config.toml 的落点目录。
+
+**通用步骤**（两条路径共用）：
+
+```bash
+# 1. vendor_fetch（必须记录到 build_actions.json）：在 Cargo.toml 所在目录执行
+MANIFEST_DIR=./sources/${pkgname}/<secondary_manifests["rust"] 的父目录>
+(cd $MANIFEST_DIR && cargo vendor vendor/)
+# 验证完整性（每个 crate 必须有 .cargo-checksum.json）
+find $MANIFEST_DIR/vendor/ -name '.cargo-checksum.json' | wc -l
+# 打包 vendor  tarball（含 .cargo/config.toml）
+tar czf ./sources/${pkgname}/${pkgname}-vendor.tar.gz -C $MANIFEST_DIR vendor/
+```
+
+**路径 A — maturin 包**（特征：`pyproject.toml` 的 `[build-system] build-backend = "maturin"`，
+如 pendulum）：
+
+```spec
+BuildRequires: rust
+BuildRequires: cargo
+BuildRequires: maturin
+Source1: %{name}-vendor.tar.gz
+
+%prep
+%autosetup -n %{name}-%{version}
+# 在 Cargo.toml 所在目录解 vendor 并配置离线源（以 secondary_manifests 路径为准）
+tar xf %{SOURCE1} -C <manifest父目录>
+mkdir -p <manifest父目录>/.cargo
+cat > <manifest父目录>/.cargo/config.toml << 'EOF'
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+EOF
+
+%build
+%py3_build   # maturin 检测到 .cargo/config.toml 后自动走 vendored-sources 离线编译
+```
+
+**路径 B — setuptools-rust 包**（特征：`pyproject.toml` build-backend 为
+`setuptools.build_meta`，或有 `setup.py` + `RustExtension`，如 cryptography）：
+
+```spec
+BuildRequires: rust
+BuildRequires: cargo
+BuildRequires: python3-setuptools-rust
+Source1: %{name}-vendor.tar.gz
+
+%prep
+%autosetup -n %{name}-%{version}
+tar xf %{SOURCE1} -C <manifest父目录>
+mkdir -p <manifest父目录>/.cargo
+cat > <manifest父目录>/.cargo/config.toml << 'EOF'
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"
+EOF
+```
+
+**其他主语言（c / cpp / nodejs / ruby 等）**：vendor + Source1 + `%prep` 配置模式
+相同，BuildRequires 只需 `rust` `cargo`（加主语言自身工具链），由主语言构建系统
+（cmake / meson / make 等）触发 cargo build 时自动走 vendored-sources。
+
+**注意**：
+- 主语言的依赖检查、BuildRequires、spec 结构仍按主语言规则执行，本节只追加 rust 部分
+- crate 依赖**不写入** BuildRequires、**不得**用 register-dep.py 注册（由 vendor 保证）
+- 系统 C 库（如 openssl-devel）按 pre_check.json 的 `c_library_build_requires[]` 照常填入
+
 ## 4. git 依赖处理
 
 Cargo.toml 中含 `git = "..."` 的依赖需特殊处理：

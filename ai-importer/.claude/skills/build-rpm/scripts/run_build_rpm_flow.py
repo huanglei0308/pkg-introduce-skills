@@ -237,7 +237,10 @@ def main() -> int:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
             return 1
 
-        vendor_mode = precheck.get("vendor_mode", False)
+        # vendor_mode（旧字段，纯 go/rust/nodejs 超阈值）或主语言在 vendor_langs 中
+        # （混合包：主语言自身被 vendor 时其 pending 才豁免；python 主包不豁免）
+        vendor_mode = precheck.get("vendor_mode", False) \
+            or args.lang.lower() in (precheck.get("vendor_langs") or [])
         if pending and not vendor_mode:
             payload = build_result_payload(
                 pkgname=args.pkgname, lang=args.lang, version=args.version,

@@ -85,6 +85,8 @@ session_dir/
 ```
 
 依赖状态转换：`pending_evaluate → evaluate_done → build_done | build_failed | copr_running | pending_deps`
+crate/module 类依赖（go/rust，由父包 vendor 解决）：注册时带 `--lang` 或 evaluate 后按 crate 身份判定 → `vendor_only` 终态（等价 build_done，无 RPM 产物，不写父包 BuildRequires）
+混合包（主语言 + 内嵌 Cargo.toml/go.mod）：pre_check_deps.py 输出 `secondary_langs` / `secondary_manifests` / `vendor_langs` / `vendor_crates`，builder 按 SKILL.md 副语言判定块追加读 rust §3.4 / go §2.4 混合包变体
 
 ## 构建
 

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -42,10 +43,15 @@ VALID_BUILD_STATUSES = {
 }
 
 # dep_registry 中表示"已就绪"的状态（等价于 build_done）
-DEP_READY_STATUSES = {"build_done", "reused"}
+# vendor_only — crate/module 类依赖，无 RPM 产物，可用性由父包 vendor 保证
+DEP_READY_STATUSES = {"build_done", "reused", "vendor_only"}
 
 # dep_registry 中表示"等待自身前置依赖就绪"的状态
 DEP_WAITING_STATUS = "pending_deps"
+
+# vendor 语言闭集：crate/module 由父包 vendor 解决，不打独立 RPM。
+# C/C++ 库依赖不在此列（走 BuildRequires + 独立 RPM 正路）。
+VENDOR_LANGS = {"go", "rust"}
 
 # 编译慢的语言，用较长延迟
 SLOW_LANGS = {"rust", "go", "c", "cpp"}
@@ -103,6 +109,77 @@ def get_lang(sd: Path, pkgname: str) -> str:
 
 def build_delay(lang: str) -> int:
     return 270 if lang in SLOW_LANGS else 60
+
+
+# ── vendor_only / crate 身份判定 ─────────────────────────────────────────────
+# 拦截依据是"crate 身份"而非"检测语言"：ripgrep（rust 二进制）、pydantic-core
+# （python+rust 混合，detect_lang 会判成 rust）都是合法 RPM 包级依赖，误标
+# vendor_only 会让父包等一个永远不会出现的 RPM。
+
+def _parent_vendor_crates(sd: Path, parent: str) -> set[str]:
+    """读取父包 precheck 结果中的 vendor_crates 清单（crate/module 名集合）。
+
+    precheck 文件可能在 pkgs/<parent>/pre_check.json 或 reports/pre_check_<parent>.json。
+    """
+    crates: set[str] = set()
+    for cand in (sd / "pkgs" / parent / "pre_check.json",
+                 sd / "reports" / f"pre_check_{parent}.json"):
+        if not cand.exists():
+            continue
+        try:
+            data = read_json(cand)
+        except Exception:
+            continue
+        for names in (data.get("vendor_crates") or {}).values():
+            if isinstance(names, list):
+                crates.update(str(n) for n in names)
+    return crates
+
+
+def _is_pure_lib_crate(sd: Path, dep: str) -> bool:
+    """evaluate 源码证据判定 dep 是否为纯库 crate/module（不可能是合法 RPM 依赖）。
+
+    rust：Cargo.toml 存在、无 [[bin]]、且无其他生态的包级 manifest；
+    go：go.mod 存在、无其他生态 manifest、且全仓库无 package main（纯库 module）。
+    证据不足时返回 False（保守放行，正常构建）。
+    """
+    _OTHER_MANIFESTS = ("pyproject.toml", "setup.py", "package.json", "pom.xml", "Gemfile")
+    src = sd / "sources" / dep
+    if not src.is_dir():
+        return False
+    if any((src / f).exists() for f in _OTHER_MANIFESTS):
+        return False  # 混合包级依赖（如 pydantic-core），不是纯 crate
+    cargo = src / "Cargo.toml"
+    if cargo.exists():
+        try:
+            content = cargo.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return False
+        return "[[bin]]" not in content
+    if (src / "go.mod").exists():
+        for go_file in src.rglob("*.go"):
+            try:
+                head = go_file.read_text(encoding="utf-8", errors="ignore")[:4096]
+            except OSError:
+                continue
+            if re.search(r"^package main$", head, re.MULTILINE):
+                return False
+        return True
+    return False
+
+
+def _is_vendor_crate(sd: Path, dep: str, reg: dict) -> bool:
+    """crate 身份判定：满足其一即为 crate/module（vendor 解决，不打 RPM）：
+    1. dep 名出现在父包 precheck 的 vendor_crates 清单（父包 Cargo.toml/go.mod 声明）；或
+    2. gate 检测为 go/rust 且源码证据确认为纯库 crate/module。
+    """
+    entry = reg.get(dep, {})
+    parent = entry.get("required_by", "")
+    if parent and dep in _parent_vendor_crates(sd, parent):
+        return True
+    if get_lang(sd, dep) in VENDOR_LANGS and _is_pure_lib_crate(sd, dep):
+        return True
+    return False
 
 
 MAX_DEP_DEPTH = 5
@@ -296,6 +373,17 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
     # 优先级 1b：有 dep 待 evaluate
     pending_eval = [k for k, v in reg.items() if v["status"] == "pending_evaluate"]
     if pending_eval:
+        # vendor 拦截（第一层）：注册时带 lang 的 crate/module 不进 evaluate/build，
+        # 直接置 vendor_only 终态——可用性由父包 vendor 保证，无 RPM 产物。
+        vendor_eval = [k for k in pending_eval
+                       if str(reg[k].get("lang", "")).lower() in VENDOR_LANGS]
+        if vendor_eval:
+            for d in vendor_eval:
+                reg[d]["status"] = "vendor_only"
+                print(f"[supervisor] {d} lang ∈ {sorted(VENDOR_LANGS)}，置 vendor_only（父包 vendor 解决）",
+                      file=sys.stderr)
+            write_json(sd / "dep_registry.json", reg)
+            return determine_action(sd, wf, reg)
         dep = pending_eval[0]
         # 上游 URL 未填写时，优先用脚本直查（npm/PyPI/crates.io API），
         # 脚本查不到再走 resolve_upstream AI agent 兜底。
@@ -343,6 +431,16 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
 
     pending_build = [k for k, v in reg.items() if v["status"] == "evaluate_done"]
     if pending_build:
+        # vendor 拦截（第二层）：按 crate 身份判定（父包 crate 清单命中，或证据
+        # 确认为纯库 crate/module）；ripgrep / pydantic-core 类包级依赖不拦截。
+        crate_deps = [k for k in pending_build if _is_vendor_crate(sd, k, reg)]
+        if crate_deps:
+            for d in crate_deps:
+                reg[d]["status"] = "vendor_only"
+                print(f"[supervisor] {d} 判定为 crate/module，置 vendor_only（父包 vendor 解决）",
+                      file=sys.stderr)
+            write_json(reg_path_local, reg)
+            return determine_action(sd, wf, reg)
         over_depth = [k for k in pending_build if compute_depth(k, reg, PKGNAME) > MAX_DEP_DEPTH]
         if over_depth:
             return ("fail", f"dep depth exceeded {MAX_DEP_DEPTH}: {over_depth}", None)
@@ -400,6 +498,12 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
             write_json(reg_path_local, reg)
             pending_build = [k for k, v in reg.items() if v["status"] == "evaluate_done"]
             if pending_build:
+                crate_deps = [k for k in pending_build if _is_vendor_crate(sd, k, reg)]
+                if crate_deps:
+                    for d in crate_deps:
+                        reg[d]["status"] = "vendor_only"
+                    write_json(reg_path_local, reg)
+                    return determine_action(sd, wf, reg)
                 dep = pending_build[0]
                 lang = get_lang(sd, dep)
                 return ("build_dep", dep, build_delay(lang))
@@ -682,6 +786,7 @@ _STATUS_LABEL: dict[str, str] = {
     "build_done":       "构建完成",
     "build_failed":     "构建失败",
     "copr_running":     "COPR构建中",
+    "vendor_only":      "vendor(已满足)",
 }
 
 _MAIN_STATUS_LABEL: dict[str, str] = {

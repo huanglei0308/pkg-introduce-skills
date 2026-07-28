@@ -95,6 +95,9 @@ def main():
     parser.add_argument("--url", default="", help="upstream git 仓库 URL")
     parser.add_argument("--constraint", default="", help="版本约束，如 '>= 1.4.0'")
     parser.add_argument("--required-by", default="", help="哪个包需要它")
+    parser.add_argument("--lang", default="",
+                        help="依赖语言（仅注册方确知是 crate/module 时携带，如 rust/go；"
+                             "包级依赖即使知道是 rust 写的也不要带）")
     parser.add_argument("--skip-url-check", action="store_true", help="跳过 URL 格式校验（慎用）")
     args = parser.parse_args()
 
@@ -131,6 +134,9 @@ def main():
     if args.pkg in reg:
         old = reg[args.pkg]
         changed = []
+        if args.lang and not old.get("lang"):
+            old["lang"] = args.lang.strip().lower()
+            changed.append("lang")
         if args.url and not old.get("url"):
             # 已有条目补充 URL 时也校验
             if not args.skip_url_check:
@@ -169,6 +175,10 @@ def main():
         "status": "pending_evaluate",
         "required_by": args.required_by,
     }
+    if args.lang:
+        # 仅 crate/module 类依赖携带 lang（见 --lang 帮助）；supervisor 据此
+        # 在 pending_evaluate 路由前置 vendor_only 终态，跳过 evaluate/build。
+        reg[args.pkg]["lang"] = args.lang.strip().lower()
     reg_path.write_text(json.dumps(reg, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"[register-dep] registered {args.pkg} (url={args.url!r}, constraint={args.constraint!r})")
 
