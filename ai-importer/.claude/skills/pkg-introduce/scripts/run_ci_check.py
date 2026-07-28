@@ -74,12 +74,18 @@ def _get_copr_result_url(session_dir: Path) -> tuple[str, str]:
         with urllib.request.urlopen(req, timeout=10) as r:
             data = json.loads(r.read())
         chroot_repos = data.get("chroot_repos", {})
-        # 优先 x86_64
-        for c, repo in chroot_repos.items():
-            if c.endswith("-x86_64"):
-                chroot = c
-                result_url = repo
-                break
+        target_chroot = session.get("copr_chroot", "")
+        # 优先匹配 session.json 里的 copr_chroot
+        if target_chroot and target_chroot in chroot_repos:
+            chroot = target_chroot
+            result_url = chroot_repos[target_chroot]
+        else:
+            # 兜底：挑第一个 x86_64
+            for c, repo in chroot_repos.items():
+                if c.endswith("-x86_64"):
+                    chroot = c
+                    result_url = repo
+                    break
         if not chroot and chroot_repos:
             chroot, result_url = next(iter(chroot_repos.items()))
     except Exception as e:
