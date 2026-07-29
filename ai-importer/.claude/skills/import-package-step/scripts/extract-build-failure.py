@@ -143,6 +143,35 @@ def main() -> int:
         except Exception:
             pass
 
+    # 语言 import 缺包 → RPM 包名 hint（闭世界查表，低置信，pkg-fixer 可推翻）
+    hints: list[dict] = []
+    lang = ""
+    gate = pkg_dir / f"gate_result_{args.pkg}.json"
+    if gate.exists():
+        try:
+            lang = json.loads(gate.read_text(encoding="utf-8")).get("result", {}).get("lang", "")
+        except Exception:
+            pass
+    if lang in ("python", "nodejs"):
+        mods: list[str] = []
+        for line in lines:
+            m = re.search(r"ModuleNotFoundError: No module named ['\"]([^'\"]+)['\"]", line) or \
+                re.search(r"Cannot find module ['\"]([^'\"]+)['\"]", line)
+            if m:
+                mods.append(m.group(1))
+        if mods:
+            try:
+                _d = str(Path(__file__).resolve().parents[2] / "build-rpm" / "scripts")
+                if _d not in sys.path:
+                    sys.path.insert(0, _d)
+                from rpm_naming import get_rpm_pkg_name
+                for mod in dict.fromkeys(mods)[:10]:
+                    hints.append({"module": mod,
+                                  "rpm_hint": get_rpm_pkg_name(lang, mod.split(".")[0]),
+                                  "confidence": "low"})
+            except Exception:
+                hints = []
+
     report = {
         "build_id": build_id,
         "failed_phase": failed_phase,
@@ -151,6 +180,7 @@ def main() -> int:
         "spec_hash": spec_hash,
         "same_as_previous": same_as_previous,
         "failure_reason": br.get("failure_reason", ""),
+        "missing_module_hints": hints,
         "log_tail": "\n".join(lines[-_CAP_LOG_TAIL:]),
     }
 

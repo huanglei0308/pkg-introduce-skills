@@ -181,6 +181,16 @@ def _sync_copr_result(session_dir: Path, pkgname: str, job_id: str = "") -> None
                     f"is '{actual_pkg}', expected '{pkgname}'"
                 )
                 br_path.write_text(_json.dumps(br, indent=2, ensure_ascii=False))
+                # MISMATCH 计数写入 fix_state.json：supervisor 对第 2 次 MISMATCH
+                # 直接 fail（重生成一次仍 mismatch = 根因不在 spec 文本）
+                try:
+                    fs_path = session_dir / "pkgs" / pkgname / "fix_state.json"
+                    fs = _json.loads(fs_path.read_text()) if fs_path.exists() else {}
+                    fs["mismatch_count"] = int(fs.get("mismatch_count", 0) or 0) + 1
+                    fs_path.parent.mkdir(parents=True, exist_ok=True)
+                    fs_path.write_text(_json.dumps(fs, indent=2, ensure_ascii=False))
+                except Exception as e:
+                    print(f"[sync_copr][{job_id}] warn: mismatch_count 写入失败: {e}", flush=True)
                 print(f"[sync_copr][{job_id}] MISMATCH: build {build_id} is {actual_pkg}, expected {pkgname}",
                       flush=True)
                 _extract_build_failure(session_dir, pkgname, job_id)

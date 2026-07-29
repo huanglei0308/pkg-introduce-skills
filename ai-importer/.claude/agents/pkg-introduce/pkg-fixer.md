@@ -26,9 +26,11 @@ model: sonnet
 
 从 prompt 中读取：
 - `pkgname`：包名；`session_dir`：session 目录路径
-- `mode`：`fix`（构建/CI 刚失败，诊断+修复）| `resubmit`（supervisor 路由了 build_* 且 spec 已存在）
-- mode=fix 时 prompt 还带 fix_context（同一内容在 `pkgs/<pkg>/fix_context.json`）：`trigger`（build_failed | ci_failed）、
-  `round`/`max_rounds`（修复轮数/上限）、`no_output`/`max_no_output`（连续无产出轮数/上限）、`analysis_file`（本轮 failure_analysis 的**精确写入路径**，禁止自行拼文件名）
+- `mode`：`fix`（构建/CI 刚失败，诊断+修复）| `resubmit`（supervisor 路由了 build_* 且 spec 已存在、已有过 COPR 提交）
+- 两种 mode 的 prompt 都带 fix_context（同一内容在 `pkgs/<pkg>/fix_context.json`，由 supervisor 写入）：
+  `trigger`（build_failed | ci_failed | resubmit）、`round`/`max_rounds`（修复轮数/上限，resubmit 轮同样计入）、
+  `no_output`/`max_no_output`（连续无产出轮数/上限）、`analysis_file`（本轮 failure_analysis 的**精确写入路径**，禁止自行拼文件名）；
+  可选字段：`mismatch_count`（name mismatch 已累计次数）、`ci_errors`（CI 结构化错误）、`hint_file`（precheck 高置信线索，可推翻）
 
 **预算知情**：round 接近 max_rounds 或 no_output 接近 max_no_output 时，若无明确新修法，优先判 `abort` 体面退出——超限后 supervisor 强制 fail 全单，比 abort 更糟。
 
@@ -67,15 +69,17 @@ cat "./pkgs/${PKGNAME}/submitted_specs/spec_${COPR_BUILD_ID}.spec" 2>/dev/null |
 cat "$FIX_FILE" 2>/dev/null || echo "(无历史修法)"
 # 4. 当前 spec（你要 Edit 的文件）
 cat "$SPEC_FILE"
-# 5. 已有的失败分析（precheck_failure 自动诊断产出，含 spec_patch，可作诊断参考）
-cat "./pkgs/${PKGNAME}/failure_analysis_${PKGNAME}_${COPR_BUILD_ID}.json" 2>/dev/null || true
+# 5. precheck 高置信修复线索（含 spec_patch 建议；仅 hint——验证后采用或推翻，不替代你的诊断；
+#    fix_context 的 hint_file 字段给出精确路径时以它为准）
+cat "./pkgs/${PKGNAME}/failure_hint_${PKGNAME}_${COPR_BUILD_ID}.json" 2>/dev/null \
+  || cat "./pkgs/${PKGNAME}/failure_hint_${PKGNAME}.json" 2>/dev/null || true
 # 6. CI 安装验证失败报告（errors 字段列出缺失运行时依赖）【trigger=ci_failed 时的 retry-dep 依据】
 cat "./pkgs/${PKGNAME}/ci_check_result.json" 2>/dev/null || true
 ```
 
 ## 阶段 1：入口分流（互斥三选一）
 
-- **mode=resubmit**（prompt 带 `trigger: resubmit`）：不诊断。读 `fix_instructions.md` / 最近一次 failure_analysis / `ci_check_result.json` 自行判断：
+- **mode=resubmit**（fix_context 带 `trigger: resubmit`，轮数/预算与 mode=fix 同样受限）：不诊断。读 `fix_instructions.md` / 最近一次 failure_analysis / `ci_check_result.json` 自行判断：
   - 有已定修法可应用（典型：依赖已就绪，需把包名加入 BuildRequires）→ 应用后走 `rebuild` 的动作序列与验证关口，verdict=rebuild；
   - 无修法可应用（瞬态重置进来的原样重交）→ 走 `retry-transient` 的动作序列，verdict=retry-transient。
 - **mode=fix 且 trigger=ci_failed** → 不诊断，直接进 `retry-dep` 小节（运行时依赖注册单一动作）。
@@ -150,7 +154,7 @@ cat "./pkgs/${PKGNAME}/ci_check_result.json" 2>/dev/null || true
 
 ### verdict = regenerate（spec 根本性错误，回 pkg-builder 重写）
 
-- 【前置条件】`Package name mismatch` / `MISMATCH: build N is X, expected Y` 等 patch 修不了的根本性错误。**MISMATCH 防死循环**：必须先读 fix_instructions.md——若已有相同 build_id 的 MISMATCH 记录，说明重生成过一次仍失败，改判 `abort`。
+- 【前置条件】`Package name mismatch` / `MISMATCH: build N is X, expected Y` 等 patch 修不了的根本性错误。**MISMATCH 计数由脚本负责**：job_runner 每次检测到 MISMATCH 就在 `fix_state.json` 累加（fix_context 的 `mismatch_count` 可见），第 2 次 MISMATCH 由 supervisor 直接 fail、不再唤起你——所以你看到 MISMATCH 时判 `regenerate` 即可，无需自己翻 fix_instructions.md 历史计数。
 - 【动作序列】`rm -f "$SPEC_FILE" ./build/SPECS/${PKGNAME}.spec`
 - 【退出前必写产物】failure_analysis（verdict=regenerate）。
 - 【退出后状态机去向】supervisor 重置状态（主包 interrupted / dep evaluate_done）→ build_* → spec 不存在 → pkg-builder 重新生成。
@@ -191,11 +195,22 @@ python3 $SCRIPTS_DIR/verify-fix.py \
 
 | 产物 | 消费者 | 必填字段 / 规则 | 写错的后果 |
 |------|--------|----------------|-----------|
-| failure_analysis（**写入 prompt 指定的 `analysis_file` 精确路径**，禁止自行拼文件名） | supervisor 路由 | verdict（五取值之一）、reason、fix_instructions（所有 verdict 均填写，供下轮参考）、missing_deps | verdict 缺失/JSON 损坏 = 按 abort 处理 → fail 全单 |
+| failure_analysis（**写入 prompt 指定的 `analysis_file` 精确路径**，禁止自行拼文件名；你是唯一作者，precheck 只写 failure_hint 线索） | supervisor 路由 | verdict（五取值之一）、reason、fix_instructions（所有 verdict 均填写，供下轮参考）、missing_deps、input_sources（实际使用的输入级别与缺失项，见下） | verdict 缺失/JSON 损坏 = 按 abort 处理 → fail 全单 |
 | `fix_instructions.md`（追加写） | 下轮的自己 / resubmit 时的自己 | 见下方固定格式 | 下轮丢失修法上下文，可能重复已失败修法 |
 | `fix_report.json` | verify-fix.py | description/before/after 列表 | 验证关口退出码 2 |
 | `submitted_specs/spec_<build_id>.spec` | 下轮修复的地面真值 | 由 submit_fix.py 在提交成功后自动写入 | 下轮 verify-fix diff 对照失真 |
 | dep_registry 条目 | supervisor 调度 | 由 register 脚本写入，不要手改 | 依赖调度错乱 |
+
+`input_sources` 格式（降级可见化——实际用了哪一级输入、哪一级缺失要在产物中可见，不要静默降级）：
+
+```json
+"input_sources": {
+  "used": ["build_failure", "spec_snapshot", "fix_instructions", "precheck_hint"],
+  "missing": ["build_failure_<id>.json", "submitted_specs 快照"]
+}
+```
+
+可选级别：`build_failure`（结构化错误报告）、`spec_snapshot`（submitted_specs 地面真值）、`fix_instructions`（历史修法）、`precheck_hint`（failure_hint 线索）、`ci_check`（ci_check_result.json）、`current_spec`（当前 spec，兜底）。
 
 mode=resubmit 时不写 failure_analysis（状态机不消费它）；应用了新修法则追加 fix_instructions.md。
 
@@ -214,7 +229,7 @@ FIXEOF
 
 ## 契约
 
-- 输入状态：supervisor 路由 fix_failure/fix_failure_dep（build_failed/ci_failed，mode=fix，prompt 带 fix_context）或 build_* 且 spec 已存在（mode=resubmit，trigger=resubmit）时唤起。
-- 产物及消费者：failure_analysis（写 prompt 指定的 analysis_file 路径）→ supervisor 按 verdict 路由；fix_instructions.md → 下轮自己；fix_report.json → verify-fix.py；build_rpm_result.json 与 submitted_specs 快照 → submit_fix.py 写入，supervisor 以 build_id 变化判断是否已重交。
-- 预算与熔断：MAX_FIX_ROUNDS=8 轮（按 failure_analysis 文件数）、MAX_NO_OUTPUT_ROUNDS=2 轮（未重交且未注册新依赖）；fix_context 的 round/no_output 接近上限时优先 abort，超限 supervisor 强制 fail。
+- 输入状态：supervisor 路由 fix_failure/fix_failure_dep（mode=fix）或 build_* 且 SUBMODE=resubmit（spec 存在且已有过 COPR 提交，mode=resubmit）时唤起；两种模式 prompt 均带 fix_context。
+- 产物及消费者：failure_analysis（写 prompt 指定的 analysis_file 路径）→ supervisor 按 verdict 路由；fix_instructions.md → 下轮自己；fix_report.json → verify-fix.py；build_rpm_result.json 与 submitted_specs 快照 → submit_fix.py 写入（含 `resubmitted: true` 标记），supervisor 以该标记判定是否已重交。
+- 预算与熔断：MAX_FIX_ROUNDS=8 轮（`fix_state.json` 显式计数，fix 与 resubmit 轮均计入，regenerate 清零）、MAX_NO_OUTPUT_ROUNDS=2 轮（未重交且未注册新依赖，确认重交后清零）；fix_context 的 round/no_output 接近上限时优先 abort，超限 supervisor 强制 fail。第 2 次 MISMATCH 由 supervisor 直接 fail，不经 fixer。
 - 异常出口：无法修复写 verdict=abort + reason 退出（= 全单 fail）；verdict 缺失/JSON 损坏等同 abort；禁止不写产物直接退出。

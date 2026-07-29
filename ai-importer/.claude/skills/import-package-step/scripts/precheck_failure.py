@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """Build failure pre-check: scan build log for high-confidence fixable patterns.
 
-If a pattern matches, writes failure_analysis_*.json with verdict=rebuild and
-populated spec_patch for pkg-fixer to apply. Does NOT modify the spec
-itself — the AI reads the analysis and learns to apply the fix, so it can handle
-similar issues in the future without new precheck rules.
+If a pattern matches, writes failure_hint_*.json — a *hint* for pkg-fixer
+(pattern name, reason, fix instructions, optional spec_patch suggestion).
+It does NOT write failure_analysis (pkg-fixer is the single author of that
+file), does NOT append fix_instructions.md, and does NOT modify the spec —
+pattern 命中不等于修复正确，修复动作与最终诊断均由 pkg-fixer 完成。
 
 Usage:
   python3 precheck_failure.py --session-dir <dir> --pkgname <pkg>
-  # stdout: auto_fixed | needs_ai
+  # stdout: hint_written | needs_ai
 """
 
 import argparse
 import json
 import re
 import sys
-from datetime import date
 from pathlib import Path
 
 
@@ -63,7 +63,7 @@ def _resolve_macro_fix(spec_lines: list[str]) -> tuple[list[str], list[dict]] | 
 # Each pattern dict:
 #   name:      unique identifier (for logging)
 #   regex:     compiled regex to match against build log
-#   verdict:   always "rebuild"
+#   verdict:   always "rebuild"（仅作 hint，最终 verdict 由 fixer 决定）
 #   reason:    human-readable reason (static)
 #   fix_instructions: human-readable fix description
 #   resolve:   function(spec_lines) -> (fixed_lines, spec_patch) or None
@@ -103,7 +103,7 @@ PATTERNS = [
             "将 %autosetup -n 参数改为 %{name}-%{version}"
             "（build-rpm 的 --transform 已统一目录名）。"
         ),
-        "resolve": None,  # pkg-builder rebuild 模式会根据 fix_instructions 处理
+        "resolve": None,  # pkg-fixer rebuild 模式会根据 fix_instructions 处理
     },
 ]
 
@@ -120,13 +120,13 @@ def find_pattern(log_text: str) -> dict | None:
     return None
 
 
-def write_analysis(session_dir: Path, pkgname: str, copr_build_id: str,
-                   pattern: dict) -> None:
-    """Write failure_analysis_*.json and fix_instructions.md.
+def write_hint(session_dir: Path, pkgname: str, copr_build_id: str,
+               pattern: dict) -> None:
+    """Write failure_hint_*.json — pkg-fixer 的可推翻线索，不是诊断产物。
 
-    Does NOT modify the spec — only diagnoses and generates structured fix
-    instructions (spec_patch). The AI in rebuild mode reads the analysis and
-    applies the fix, so it learns the pattern for future similar issues.
+    Does NOT modify the spec, does NOT write failure_analysis, does NOT
+    append fix_instructions.md（后两者分别是 fixer 的诊断产物与历史档案，
+    由 fixer 单一作者维护）。
     """
     pkg_dir = session_dir / "pkgs" / pkgname
     pkg_dir.mkdir(parents=True, exist_ok=True)
@@ -140,7 +140,7 @@ def write_analysis(session_dir: Path, pkgname: str, copr_build_id: str,
         else:
             reason = f"{reason}：{m.group(1)}"
 
-    # Generate spec_patch: try resolve() to detect the exact fix needed
+    # Generate spec_patch suggestion: try resolve() to detect the exact fix needed
     spec_patch: list[dict] = []
     spec_path = pkg_dir / f"{pkgname}.spec"
 
@@ -159,35 +159,25 @@ def write_analysis(session_dir: Path, pkgname: str, copr_build_id: str,
         # No resolver — AI will figure out the fix from fix_instructions
         print(f"[precheck] pattern {pattern['name']} requires AI-driven spec fix", file=sys.stderr)
 
-    # Write failure_analysis JSON — AI reads this in rebuild mode
     if copr_build_id:
-        analysis_path = pkg_dir / f"failure_analysis_{pkgname}_{copr_build_id}.json"
+        hint_path = pkg_dir / f"failure_hint_{pkgname}_{copr_build_id}.json"
     else:
-        analysis_path = pkg_dir / f"failure_analysis_{pkgname}.json"
+        hint_path = pkg_dir / f"failure_hint_{pkgname}.json"
 
-    analysis = {
-        "verdict": pattern["verdict"],
+    hint = {
+        "type": "hint",
+        "confidence": "high",
+        "pattern": pattern["name"],
+        "verdict_hint": pattern["verdict"],
         "reason": reason,
         "fix_instructions": pattern["fix_instructions"],
-        "missing_deps": [],
         "spec_patch": spec_patch,
+        "note": "precheck 脚本的高置信线索，pkg-fixer 验证后可推翻；不替代 failure_analysis",
     }
-    analysis_path.write_text(
-        json.dumps(analysis, ensure_ascii=False, indent=2) + "\n",
+    hint_path.write_text(
+        json.dumps(hint, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-
-    # Append to fix_instructions history
-    fix_path = pkg_dir / "fix_instructions.md"
-    today = date.today().isoformat()
-    fix_entry = (
-        f"## build_id={copr_build_id} {today}\n"
-        f"verdict: {pattern['verdict']}\n"
-        f"reason: {reason}\n"
-        f"fix: {pattern['fix_instructions']}\n"
-    )
-    with open(fix_path, "a", encoding="utf-8") as f:
-        f.write(fix_entry)
 
 
 def get_build_log(session_dir: Path, pkgname: str) -> tuple[str, str]:
@@ -204,7 +194,7 @@ def get_build_log(session_dir: Path, pkgname: str) -> tuple[str, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Pre-check build failure for known fixable patterns"
+        description="Pre-check build failure for known fixable patterns (hint only)"
     )
     parser.add_argument("--session-dir", required=True)
     parser.add_argument("--pkgname", required=True)
@@ -226,8 +216,8 @@ def main() -> int:
         return 0
 
     print(f"[precheck] matched pattern: {pattern['name']}", file=sys.stderr)
-    write_analysis(session_dir, pkgname, copr_build_id, pattern)
-    print("auto_fixed")
+    write_hint(session_dir, pkgname, copr_build_id, pattern)
+    print("hint_written")
     return 0
 
 

@@ -183,4 +183,4 @@ echo "${PKGNAME}" >> ./build_state/introduced.txt
 - 输入状态：supervisor 路由 build_dep/build_main 且 `pkgs/<pkg>/<pkg>.spec` 不存在时唤起（首次构建；spec 已存在的修复场景归 pkg-fixer）。
 - 产物及消费者：`pkgs/<pkg>/<pkg>.spec` + `srpms/*.src.rpm` → pkg-fixer 修复/重交的基准；`build_rpm_result.json` → supervisor 决定后续路由（copr_running 轮询 / dep_needed 注册依赖 / failed 走修复）；`build_state/introduced.txt` → 归档。
 - 预算与熔断：spec 内容自检最多 2 次，第 2 次失败必须写 `build_rpm_result.json`（status=failed）后退出；什么都不写直接退出会让 supervisor 无感知自旋到 max_loops。
-- 异常出口：URL 缺失、skill 失败、自检两次失败等无法完成时，写 `build_rpm_result.json`（status=failed/interrupted + failure_reason）再退出；写 status=failed 会进入 pkg-fixer 修复流程，修复不了由 fixer 判 abort 终止全单。
+- 异常出口：URL 缺失、skill 失败、自检两次失败等无法完成时，写 `build_rpm_result.json`（status=failed/interrupted + failure_reason）再退出；无 copr_build_id 的 failed（自检失败）由 supervisor 路由回本 agent 重建（重试上限后 fail 全单），已有 COPR 提交的 failed 才进入 pkg-fixer 修复流程，修复不了由 fixer 判 abort 终止全单。

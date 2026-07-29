@@ -187,7 +187,8 @@ def _is_vendor_crate(sd: Path, dep: str, reg: dict) -> bool:
 
 MAX_DEP_DEPTH = 5
 
-# 单包修复轮数上限：按 failure_analysis_<pkg>_<build_id>.json 文件数计（每轮失败构建一份）。
+# 单包修复轮数上限：按 pkgs/<pkg>/fix_state.json 的 fix_round 显式计数
+# （supervisor 每次路由 fixer——fix 或 resubmit 模式——时 +1，regenerate 时清零）。
 # 超过上限强制 abort，防止 rebuild 死循环（此前没有任何上限）。
 MAX_FIX_ROUNDS = 8
 
@@ -199,58 +200,142 @@ MAX_NO_OUTPUT_ROUNDS = 2
 MAX_CI_ATTEMPTS = 3
 
 
-def _fix_rounds(sd: Path, pkgname: str) -> int:
-    """统计该包已经历的修复轮数（按失败分析的 build 数）。
-    同时计入无 build_id 的 failure_analysis_<pkg>.json（否则该轮次会绕过熔断）。"""
-    n = len(list(sd.glob(f"pkgs/{pkgname}/failure_analysis_{pkgname}_*.json")))
-    if (sd / f"pkgs/{pkgname}/failure_analysis_{pkgname}.json").exists():
-        n += 1
-    return n
+# ── fix_state.json：修复链路计数器的唯一事实来源 ─────────────────────────────
+# 计数器不能放 build_rpm_result.json（copr_client 提交、pkg-builder 自检失败都会
+# 整文件覆写，计数会被静默清零），也不能用 glob failure_analysis 文件数
+# （precheck 预写污染、regenerate 后不重置）。fix_state.json 只有本脚本读写
+# （另有 job_runner 仅对 mismatch_count 做 read-modify-write），无覆写风险。
+
+def _fix_state_path(sd: Path, pkgname: str) -> Path:
+    return sd / "pkgs" / pkgname / "fix_state.json"
 
 
-def fix_context(sd: Path, pkgname: str, old_build_id) -> dict:
-    """生成 pkg-fixer 的上下文参数：trigger / 修复轮数 / 无产出计数 / analysis_file 精确路径。
+def _read_fix_state(sd: Path, pkgname: str) -> dict:
+    """读取修复计数器（fix_round / no_output_rounds / mismatch_count）。
 
-    trigger 推断：build_rpm_result.status == "ci_failed" → ci_failed，否则 build_failed。
-    （resubmit 场景不经 fix_failure 入口，trigger 由 SKILL.md 在 prompt 中直接写死。）
+    兼容旧位置：build_rpm_result.no_output_rounds、dep_registry[pkg].no_output_rounds
+    仅作 fallback 读取，不再写入。
     """
+    state: dict = {}
     result_path = sd / f"pkgs/{pkgname}/build_rpm_result.json"
-    status = ""
-    no_output = 0
     if result_path.exists():
         try:
-            result = read_json(result_path)
-            status = result.get("status", "")
-            no_output = result.get("no_output_rounds", 0)
+            br = read_json(result_path)
+            if "no_output_rounds" in br:
+                state["no_output_rounds"] = br["no_output_rounds"]
         except Exception:
             pass
-    # dep 的无产出计数在 dep_registry 里
     reg_path = sd / "dep_registry.json"
     if reg_path.exists():
         try:
             entry = read_json(reg_path).get(pkgname, {})
             if isinstance(entry, dict) and "no_output_rounds" in entry:
-                no_output = entry["no_output_rounds"]
+                state["no_output_rounds"] = entry["no_output_rounds"]
         except Exception:
             pass
-    trigger = "ci_failed" if status == "ci_failed" else "build_failed"
+    p = _fix_state_path(sd, pkgname)
+    if p.exists():
+        try:
+            state.update(read_json(p))
+        except Exception:
+            pass
+    return state
+
+
+def _write_fix_state(sd: Path, pkgname: str, state: dict) -> None:
+    p = _fix_state_path(sd, pkgname)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    write_json(p, state)
+
+
+def _fix_rounds(sd: Path, pkgname: str) -> int:
+    """该包已经历的修复轮数（显式计数，见 _bump_fix_round）。"""
+    return int(_read_fix_state(sd, pkgname).get("fix_round", 0) or 0)
+
+
+def _bump_fix_round(sd: Path, pkgname: str) -> int:
+    """supervisor 每次路由 fixer（fix 或 resubmit 模式）时计一轮，返回新轮数。"""
+    state = _read_fix_state(sd, pkgname)
+    state["fix_round"] = int(state.get("fix_round", 0) or 0) + 1
+    _write_fix_state(sd, pkgname, state)
+    return state["fix_round"]
+
+
+def _clear_fix_counters(sd: Path, pkgname: str, *keys: str) -> None:
+    """清零指定计数器：regenerate 清 fix_round/no_output_rounds；确认重交后清 no_output_rounds。"""
+    p = _fix_state_path(sd, pkgname)
+    state = _read_fix_state(sd, pkgname)
+    for k in keys:
+        state.pop(k, None)
+    if state or p.exists():
+        _write_fix_state(sd, pkgname, state)
+
+
+def _current_build_id(sd: Path, pkgname: str, reg: dict | None = None):
+    """该包最近一次 COPR build_id（build_rpm_result 优先，dep 兜底 dep_registry）。"""
+    result_path = sd / f"pkgs/{pkgname}/build_rpm_result.json"
+    if result_path.exists():
+        try:
+            bid = read_json(result_path).get("copr_build_id")
+            if bid:
+                return bid
+        except Exception:
+            pass
+    if reg and isinstance(reg.get(pkgname), dict):
+        return reg[pkgname].get("copr_build_id")
+    return None
+
+
+def fix_context(sd: Path, pkgname: str, old_build_id, trigger: str | None = None) -> dict:
+    """生成 pkg-fixer 的上下文参数：mode / trigger / 修复轮数 / 无产出计数 / analysis_file 精确路径。
+
+    trigger 由调用方显式指定；缺省时按 build_rpm_result.status 推断
+    （ci_failed → ci_failed，否则 build_failed）。resubmit 入口由 supervisor 直接
+    指定 trigger="resubmit"，resubmit 轮同样计入 fix_round 熔断。
+    """
+    result_path = sd / f"pkgs/{pkgname}/build_rpm_result.json"
+    status = ""
+    ci_errors: list = []
+    if result_path.exists():
+        try:
+            result = read_json(result_path)
+            status = result.get("status", "")
+            ci_errors = result.get("ci_errors", []) or []
+        except Exception:
+            pass
+    state = _read_fix_state(sd, pkgname)
+    if trigger is None:
+        trigger = "ci_failed" if status == "ci_failed" else "build_failed"
     if old_build_id:
         analysis_file = f"pkgs/{pkgname}/failure_analysis_{pkgname}_{old_build_id}.json"
     else:
         analysis_file = f"pkgs/{pkgname}/failure_analysis_{pkgname}.json"
-    return {
+    ctx: dict = {
+        "mode": "resubmit" if trigger == "resubmit" else "fix",
         "trigger": trigger,
-        "round": _fix_rounds(sd, pkgname) + 1,
+        "round": int(state.get("fix_round", 0) or 0),
         "max_rounds": MAX_FIX_ROUNDS,
-        "no_output": no_output,
+        "no_output": int(state.get("no_output_rounds", 0) or 0),
         "max_no_output": MAX_NO_OUTPUT_ROUNDS,
         "analysis_file": analysis_file,
     }
+    if state.get("mismatch_count"):
+        ctx["mismatch_count"] = state["mismatch_count"]
+    if ci_errors:
+        ctx["ci_errors"] = ci_errors
+    # precheck 的高置信修复线索（仅 hint，fixer 可推翻）
+    hint = f"pkgs/{pkgname}/failure_hint_{pkgname}_{old_build_id}.json" if old_build_id \
+        else f"pkgs/{pkgname}/failure_hint_{pkgname}.json"
+    if (sd / hint).exists():
+        ctx["hint_file"] = hint
+    return ctx
 
 
-def _emit_fix_action(sd: Path, action: str, pkgname: str, old_build_id) -> tuple[str, str, int]:
-    """写 pkgs/<pkg>/fix_context.json 后返回 fix_failure/fix_failure_dep action。"""
-    ctx = fix_context(sd, pkgname, old_build_id)
+def _emit_fix_action(sd: Path, action: str, pkgname: str, old_build_id,
+                     trigger: str | None = None) -> tuple[str, str, int]:
+    """计一轮修复，写 pkgs/<pkg>/fix_context.json 后返回 fix_failure/fix_failure_dep action。"""
+    _bump_fix_round(sd, pkgname)
+    ctx = fix_context(sd, pkgname, old_build_id, trigger=trigger)
     pkg_dir = sd / "pkgs" / pkgname
     pkg_dir.mkdir(parents=True, exist_ok=True)
     write_json(pkg_dir / "fix_context.json", ctx)
@@ -258,11 +343,16 @@ def _emit_fix_action(sd: Path, action: str, pkgname: str, old_build_id) -> tuple
 
 
 def _resubmitted(result: dict | None, old_build_id) -> bool:
-    """判断 fixer 是否已重新提交构建（build_rpm_result 变为 copr_running 且 build_id 更新）。"""
-    if not result:
+    """判断 fixer 是否已重新提交构建。
+
+    单一事实来源：submit_fix.py 提交成功后写入的 resubmitted: true
+    （旧启发式 status==copr_running 且 new_id != old_id 已废弃——copr_client
+    异步返回同 id 时会误判为未重交）。
+    """
+    if not result or not result.get("resubmitted"):
         return False
     new_id = result.get("copr_build_id")
-    return result.get("status") == "copr_running" and bool(new_id) and str(new_id) != str(old_build_id)
+    return bool(new_id) and str(new_id) != str(old_build_id)
 
 
 def compute_depth(dep_name: str, reg: dict, pkgname: str, _seen: frozenset = frozenset()) -> int:
@@ -530,7 +620,29 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
     failed_deps = [k for k, v in reg.items() if v["status"] == "build_failed"]
     if failed_deps:
         dep = failed_deps[0]
+        # 失败构建的 id 以 dep_registry 为准：fixer 重交后 build_rpm_result 已是新 id，
+        # 若从 br 读，_resubmitted 的新旧 id 比较会失效（永远相等）
         dep_build_id = reg[dep].get("copr_build_id")
+        dep_result_path = sd / f"pkgs/{dep}/build_rpm_result.json"
+        dep_result = read_json(dep_result_path) if dep_result_path.exists() else None
+
+        # builder 自检失败（从未提交 COPR，reg 与 br 都无 build_id）：fixer 无任何可诊断输入，
+        # 回 builder 重建（SUBMODE=builder），重试 MAX_NO_OUTPUT_ROUNDS 次后 fail
+        if not dep_build_id and not _current_build_id(sd, dep):
+            if _fix_rounds(sd, dep) >= MAX_NO_OUTPUT_ROUNDS:
+                return ("fail", f"dep {dep} builder 自检连续失败（未提交 COPR），已达重试上限", None)
+            _bump_fix_round(sd, dep)
+            reg[dep]["status"] = "evaluate_done"
+            write_json(reg_path_local, reg)
+            return ("build_dep", dep, build_delay(get_lang(sd, dep)))
+
+        # MISMATCH 二次：job_runner 已在 fix_state.mismatch_count 计数，重生成一次仍
+        # mismatch 说明根因不在 spec 文本，直接 fail，不再路由 fixer
+        if dep_result and "Package name mismatch" in dep_result.get("failure_reason", ""):
+            mc = int(_read_fix_state(sd, dep).get("mismatch_count", 0) or 0)
+            if mc >= 2:
+                return ("fail", f"dep {dep} 第 {mc} 次 Package name mismatch，强制 abort", None)
+
         analysis_file = sd / f"pkgs/{dep}/failure_analysis_{dep}_{dep_build_id}.json" if dep_build_id else sd / f"pkgs/{dep}/failure_analysis_{dep}.json"
         # 兜底：agent 在 build_id 为空时可能写成 failure_analysis_{dep}_.json（尾部多下划线）
         if not analysis_file.exists():
@@ -541,19 +653,22 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
                 return _emit_fix_action(sd, "fix_failure_dep", dep, dep_build_id)
         verdict = read_json(analysis_file).get("verdict", "abort")
         if verdict == "regenerate":
-            # fixer 已删除 spec，回到 build_dep 由 pkg-builder 重新生成
+            # fixer 已删除 spec，回到 build_dep 由 pkg-builder 重新生成；
+            # 清零修复计数（重新生成是重置事件；mismatch_count 保留以防重生成死循环）
             reg[dep]["status"] = "evaluate_done"
-            reg[dep].pop("no_output_rounds", None)
+            reg[dep].pop("no_output_rounds", None)  # legacy 字段清理
+            _clear_fix_counters(sd, dep, "fix_round", "no_output_rounds")
             write_json(reg_path_local, reg)
             return ("build_dep", dep, build_delay(get_lang(sd, dep)))
         if verdict in ("rebuild", "retry", "retry-transient", "retry-dep"):
-            # fixer 已重新提交构建？（build_rpm_result 已变为 copr_running 且 build_id 更新）
-            dep_result_path = sd / f"pkgs/{dep}/build_rpm_result.json"
-            dep_result = read_json(dep_result_path) if dep_result_path.exists() else None
+            # fixer 已重新提交构建？（submit_fix 成功写入 resubmitted: true 且 build_id 更新）
             if _resubmitted(dep_result, dep_build_id):
                 reg[dep]["status"] = "copr_running"
                 reg[dep]["copr_build_id"] = dep_result["copr_build_id"]
-                reg[dep].pop("no_output_rounds", None)
+                reg[dep].pop("no_output_rounds", None)  # legacy 字段清理
+                dep_result.pop("resubmitted", None)
+                write_json(dep_result_path, dep_result)
+                _clear_fix_counters(sd, dep, "no_output_rounds")
                 write_json(reg_path_local, reg)
                 return determine_action(sd, wf, reg)
             # 检查 analyze 过程中是否有新增的未就绪前置依赖（required_by 指向当前 dep）。
@@ -572,11 +687,12 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
             if _fix_rounds(sd, dep) >= MAX_FIX_ROUNDS:
                 return ("fail", f"dep {dep} 修复轮数达到上限 {MAX_FIX_ROUNDS}，强制 abort", None)
             # fixer 既未重新提交也未注册依赖 → 无产出计数，超限强制 abort
-            n = reg[dep].get("no_output_rounds", 0) + 1
+            state = _read_fix_state(sd, dep)
+            n = int(state.get("no_output_rounds", 0) or 0) + 1
             if n >= MAX_NO_OUTPUT_ROUNDS:
                 return ("fail", f"dep {dep} 连续 {n} 轮修复无产出，强制 abort", None)
-            reg[dep]["no_output_rounds"] = n
-            write_json(reg_path_local, reg)
+            state["no_output_rounds"] = n
+            _write_fix_state(sd, dep, state)
             return _emit_fix_action(sd, "fix_failure_dep", dep, dep_build_id)
         reason = read_json(analysis_file).get("reason", f"dep {dep} build failed")
         return ("fail", reason, None)
@@ -586,6 +702,12 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
     if all_deps_ready or not reg:
         # 主包 copr_running：轮询 COPR API，只更新本地状态文件
         if main_status == "copr_running":
+            # fixer 重交已被确认（submit_fix 写入 resubmitted）→ 本轮修复有产出，
+            # 消费标记并清零无产出计数
+            if main_result and main_result.get("resubmitted"):
+                main_result.pop("resubmitted", None)
+                write_json(main_result_path, main_result)
+                _clear_fix_counters(sd, PKGNAME, "no_output_rounds")
             build_id = main_result.get("copr_build_id") if main_result else None
             if build_id:
                 copr_state = _poll_copr_build(build_id, sd)
@@ -611,13 +733,37 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
 
         if main_status in ("failed", "ci_failed"):
             build_id = main_result.get("copr_build_id") if main_result else None
+
+            # builder 自检失败（从未提交 COPR，无 build_id）：fixer 无任何可诊断输入
+            # （无 build_id / 无 build_failure / 无 submitted 快照），回 builder 重建
+            # （SUBMODE=builder），重试 MAX_NO_OUTPUT_ROUNDS 次后 fail
+            if main_status == "failed" and not build_id:
+                if _fix_rounds(sd, PKGNAME) >= MAX_NO_OUTPUT_ROUNDS:
+                    return ("fail",
+                            f"{PKGNAME} builder 自检连续失败（未提交 COPR），已达重试上限", None)
+                _bump_fix_round(sd, PKGNAME)
+                lang = get_lang(sd, PKGNAME)
+                return ("build_main", PKGNAME, build_delay(lang))
+
+            # MISMATCH 二次：job_runner 已在 fix_state.mismatch_count 计数，重生成一次仍
+            # mismatch 说明根因不在 spec 文本，直接 fail，不再路由 fixer
+            if main_status == "failed" and main_result and \
+               "Package name mismatch" in main_result.get("failure_reason", ""):
+                mc = int(_read_fix_state(sd, PKGNAME).get("mismatch_count", 0) or 0)
+                if mc >= 2:
+                    return ("fail", f"{PKGNAME} 第 {mc} 次 Package name mismatch，强制 abort", None)
+
             analysis_file = sd / f"pkgs/{PKGNAME}/failure_analysis_{PKGNAME}_{build_id}.json" if build_id else sd / f"pkgs/{PKGNAME}/failure_analysis_{PKGNAME}.json"
             if not analysis_file.exists():
                 return _emit_fix_action(sd, "fix_failure", PKGNAME, build_id)
             verdict = read_json(analysis_file).get("verdict", "abort")
             if verdict == "regenerate":
-                # fixer 已删除 spec，回到 build_main 由 pkg-builder 重新生成
-                main_result_path.write_text(json.dumps({"status": "interrupted"}))
+                # fixer 已删除 spec，回到 build_main 由 pkg-builder 重新生成。
+                # 手术式更新（保留 copr_build_id/build_log 等历史字段），
+                # 清零修复计数（重新生成是重置事件；mismatch_count 保留以防死循环）
+                main_result["status"] = "interrupted"
+                write_json(main_result_path, main_result)
+                _clear_fix_counters(sd, PKGNAME, "fix_round", "no_output_rounds")
                 lang = get_lang(sd, PKGNAME)
                 return ("build_main", PKGNAME, build_delay(lang))
             if verdict in ("rebuild", "retry-dep"):
@@ -627,17 +773,20 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
                 # dep 全就绪后再唤起 fixer（fix 模式）把可用依赖加入 BuildRequires。
                 if _fix_rounds(sd, PKGNAME) >= MAX_FIX_ROUNDS:
                     return ("fail", f"{PKGNAME} 修复轮数达到上限 {MAX_FIX_ROUNDS}，强制 abort", None)
-                n = main_result.get("no_output_rounds", 0) + 1
+                state = _read_fix_state(sd, PKGNAME)
+                n = int(state.get("no_output_rounds", 0) or 0) + 1
                 if n >= MAX_NO_OUTPUT_ROUNDS:
                     return ("fail", f"{PKGNAME} 连续 {n} 轮修复无产出，强制 abort", None)
-                main_result["no_output_rounds"] = n
-                write_json(main_result_path, main_result)
+                state["no_output_rounds"] = n
+                _write_fix_state(sd, PKGNAME, state)
                 return _emit_fix_action(sd, "fix_failure", PKGNAME, build_id)
             if verdict in ("retry", "retry-transient"):
-                # fixer 已自行重提交时不会走到这里；走到这里按原逻辑重置重建
+                # fixer 已自行重提交时不会走到这里；走到这里 = 未重交，手术式重置为
+                # interrupted（保留历史字段），由 build_main 重走（spec 存在 → resubmit）
                 if _fix_rounds(sd, PKGNAME) >= MAX_FIX_ROUNDS:
                     return ("fail", f"{PKGNAME} 修复轮数达到上限 {MAX_FIX_ROUNDS}，强制 abort", None)
-                main_result_path.write_text(json.dumps({"status": "interrupted"}))
+                main_result["status"] = "interrupted"
+                write_json(main_result_path, main_result)
                 lang = get_lang(sd, PKGNAME)
                 return ("build_main", PKGNAME, build_delay(lang))
             reason = read_json(analysis_file).get("reason", f"main build {main_status}")
@@ -952,6 +1101,29 @@ def main() -> int:
     action, target, delay = determine_action(sd, wf, reg)
     loop = wf.get("loop_count", 0) + 1
 
+    # build_* 的子模式路由（原 SKILL.md 的 [ -f spec ] 启发式收回脚本，确定性判定）：
+    #   resubmit = spec 存在且已有过 COPR 提交 → pkg-fixer 重交模式（计一轮修复，
+    #              写 fix_context.json，trigger=resubmit，受 MAX_FIX_ROUNDS 熔断）；
+    #   builder  = 首次构建 / regenerate 后 / builder 自检失败重试 → pkg-builder。
+    submode = ""
+    if action in ("build_dep", "build_main"):
+        spec_exists = (sd / "pkgs" / target / f"{target}.spec").exists()
+        build_id = _current_build_id(sd, target, reg)
+        if spec_exists and build_id:
+            if _fix_rounds(sd, target) >= MAX_FIX_ROUNDS:
+                action, target, delay = (
+                    "fail",
+                    f"{target} 修复轮数达到上限 {MAX_FIX_ROUNDS}（含重交轮），强制 abort",
+                    None,
+                )
+            else:
+                submode = "resubmit"
+                _bump_fix_round(sd, target)
+                ctx = fix_context(sd, target, build_id, trigger="resubmit")
+                write_json(sd / "pkgs" / target / "fix_context.json", ctx)
+        else:
+            submode = "builder"
+
     # diff + 写 state.transition 事件
     diff_and_write_transitions(sd, snap_before)
 
@@ -963,7 +1135,7 @@ def main() -> int:
         entry = reg[target]
         constraint = entry.get("constraint", "") if isinstance(entry, dict) else ""
 
-    result = {"action": action, "target": target, "delay": delay, "loop": loop, "pkgname": PKGNAME, "constraint": constraint}
+    result = {"action": action, "target": target, "delay": delay, "loop": loop, "pkgname": PKGNAME, "constraint": constraint, "submode": submode}
     for k, v in result.items():
         print(f"{k.upper()}={shlex.quote(str(v) if v is not None else '')}")
     return 0

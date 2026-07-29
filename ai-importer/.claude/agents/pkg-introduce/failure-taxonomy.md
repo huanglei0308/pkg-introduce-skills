@@ -50,7 +50,14 @@ crate/module 由父包 vendor 解决，永远不会以 RPM 形式存在；注册
 | rpmbuild error / bad exit status（spec 语法/宏错误） | 修语法/宏 |
 | %check 失败 / 测试未通过 | 修测试或合理跳过 |
 | `Installed (but unpackaged) file(s) found`（%files 缺条目） | 补全 %files 列表 |
-| `Package name mismatch` / `MISMATCH: build N is X, expected Y`（spec 的 `Name:`/`%global pypi_name`/`Source0:` 写成了另一个包的内容，patch 修不了） | **不是 rebuild，是 `regenerate`**——必须读 fix_instructions.md：若已有相同 build_id 的 MISMATCH 记录，说明重生成过一次仍失败，改为 abort 防止死循环 |
+| `Package name mismatch` / `MISMATCH: build N is X, expected Y`（spec 的 `Name:`/`%global pypi_name`/`Source0:` 写成了另一个包的内容，patch 修不了） | **不是 rebuild，是 `regenerate`**。MISMATCH 次数由 job_runner 在 `fix_state.json` 计数（fix_context 的 `mismatch_count` 可见），第 2 次由 supervisor 直接 fail——fixer 无需翻历史计数 |
+
+> 📌 本类别中 `fg: no job control` / `bg:` 与 `cd: ...: No such file or directory`（%prep）两个 pattern
+> 已由 precheck_failure.py 脚本检测并写 `failure_hint_<pkg>_<build_id>.json`（含 spec_patch 建议），
+> 是 fixer 阶段 0 必读输入 #5——验证后采用或推翻，脚本不直接改 spec。
+
+> 📌 类别 B 的 `ModuleNotFoundError` / `Cannot find module`，extract-build-failure.py 会在
+> `build_failure_<id>.json` 中生成 `missing_module_hints`（语言→RPM 名映射，低置信），可采用或自行修正。
 
 > ⚠️ **常见误判提醒**：以下错误**不是**基础设施/环境问题，属于类别 C，应判 `rebuild`：
 > - `fg: no job control` / `bg:` — shell 作业控制错误。只要 configure 阶段已成功，替换 `%cmake_build` → `cmake --build . -j$(nproc)` 即可修复

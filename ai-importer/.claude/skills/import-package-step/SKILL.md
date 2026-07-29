@@ -19,6 +19,7 @@ allowed-tools:
 | 职责 | 负责方 |
 |------|--------|
 | 状态机决策（下一步是什么）| `step_supervisor.py`（纯 Python，job_runner 调用） |
+| 修复路由 / 轮数计数 / 熔断（fix_round、no_output、resubmit 判定） | `step_supervisor.py`（计数存 `pkgs/<pkg>/fix_state.json`，builder/fixer 子模式由 `SUBMODE` 输出） |
 | COPR 构建轮询 / wait loop | `job_runner.py`（Python 进程，不启 Claude） |
 | 日志拉取 / build_rpm_result 写入 | `job_runner.py` 的 `_sync_copr_result` |
 | 首次构建：spec 生成 + SRPM 提交 | `pkg-builder` agent（提交后立即退出） |
@@ -95,11 +96,17 @@ resolve_upstream)
 
 build_dep)
   # COPR 模式：依赖包直接构建到 COPR project，不需要本地安装
-  # spec 已存在 → 失败修复场景，路由到 pkg-fixer（resubmit 模式）；否则 pkg-builder 首次构建
-  if [ -f "$SESSION_DIR/pkgs/$TARGET/$TARGET.spec" ]; then
+  # 子模式由 supervisor 判定并输出 SUBMODE（原 [ -f spec ] 启发式已收回脚本）：
+  # resubmit = spec 存在且已提交过 COPR → pkg-fixer（重交/修复模式，prompt 带 fix_context）；
+  # builder  = 首次构建 / regenerate 后 / builder 自检失败重试 → pkg-builder
+  if [ "$SUBMODE" = "resubmit" ]; then
+    FIX_CTX=$(python3 -c "
+import json
+print('\n'.join(f'{k}: {v}' for k, v in json.load(open('$SESSION_DIR/pkgs/$TARGET/fix_context.json')).items()))
+" 2>/dev/null)
     Agent(
       subagent_type="pkg-fixer",
-      prompt=f"pkgname: {TARGET}\nmode: resubmit\ntrigger: resubmit\nsession_dir: {SESSION_DIR}"
+      prompt=f"pkgname: {TARGET}\nmode: resubmit\nsession_dir: {SESSION_DIR}\n${FIX_CTX}"
     )
   else
     Agent(
@@ -115,11 +122,15 @@ build_dep)
   ;;
 
 build_main)
-  # spec 已存在 → 失败修复场景，路由到 pkg-fixer（resubmit 模式）；否则 pkg-builder 首次构建
-  if [ -f "$SESSION_DIR/pkgs/$PKGNAME/$PKGNAME.spec" ]; then
+  # 子模式路由同 build_dep（SUBMODE 由 supervisor 输出）
+  if [ "$SUBMODE" = "resubmit" ]; then
+    FIX_CTX=$(python3 -c "
+import json
+print('\n'.join(f'{k}: {v}' for k, v in json.load(open('$SESSION_DIR/pkgs/$PKGNAME/fix_context.json')).items()))
+" 2>/dev/null)
     Agent(
       subagent_type="pkg-fixer",
-      prompt=f"pkgname: {PKGNAME}\nmode: resubmit\ntrigger: resubmit\nsession_dir: {SESSION_DIR}"
+      prompt=f"pkgname: {PKGNAME}\nmode: resubmit\nsession_dir: {SESSION_DIR}\n${FIX_CTX}"
     )
   else
     Agent(
@@ -199,8 +210,8 @@ analyze_evaluate)
 fix_failure)
   PRE=$(python3 "$SCRIPTS_DIR/precheck_failure.py" \
     --session-dir "$SESSION_DIR" --pkgname "$PKGNAME")
-  if [ "$PRE" = "auto_fixed" ]; then
-    echo "[step] precheck wrote diagnosis, pkg-fixer will apply it"
+  if [ "$PRE" = "hint_written" ]; then
+    echo "[step] precheck 命中高置信 pattern，已写修复线索 failure_hint（供 pkg-fixer 参考，可推翻）"
   fi
   # 读 supervisor 写入的 fix_context（trigger/round/预算/analysis_file 精确路径），逐行传入 prompt
   FIX_CTX=$(python3 -c "
@@ -221,8 +232,8 @@ print('\n'.join(f'{k}: {v}' for k, v in json.load(open('$SESSION_DIR/pkgs/$PKGNA
 fix_failure_dep)
   PRE=$(python3 "$SCRIPTS_DIR/precheck_failure.py" \
     --session-dir "$SESSION_DIR" --pkgname "$TARGET")
-  if [ "$PRE" = "auto_fixed" ]; then
-    echo "[step] precheck wrote diagnosis, pkg-fixer will apply it"
+  if [ "$PRE" = "hint_written" ]; then
+    echo "[step] precheck 命中高置信 pattern，已写修复线索 failure_hint（供 pkg-fixer 参考，可推翻）"
   fi
   # 读 supervisor 写入的 fix_context（trigger/round/预算/analysis_file 精确路径），逐行传入 prompt
   FIX_CTX=$(python3 -c "

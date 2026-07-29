@@ -260,6 +260,16 @@ def main() -> int:
     if rc != 0:
         return rc
 
+    # 显式重交标记：supervisor 以此判定"fixer 已重交"（替代 build_id 变化启发式）。
+    # 必须在 copr_client --output 覆写之后写入；supervisor 消费后会清除该标记。
+    result_json = sd / "pkgs" / pkg / "build_rpm_result.json"
+    try:
+        br = _read_json(result_json)
+        br["resubmitted"] = True
+        result_json.write_text(json.dumps(br, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print(f"[submit_fix] WARN: 无法写入 resubmitted 标记: {e}", file=sys.stderr)
+
     # ── 时间线：构建已提交 ────────────────────────────────────────────────
     spec_md5 = ""
     if spec_path.exists():
