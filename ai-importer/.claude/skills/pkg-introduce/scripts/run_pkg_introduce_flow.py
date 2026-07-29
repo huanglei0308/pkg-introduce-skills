@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -46,6 +47,34 @@ class FlowError(RuntimeError):
 
 def run_command(command: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(command, capture_output=True, text=True, check=False)
+
+
+# 网络类瞬时错误特征（git clone / wget 的 stderr/stdout 文本，小写匹配）。
+# 这类错误重试有意义；404 / 认证失败 / 仓库不存在等不在此列，直接判死。
+TRANSIENT_NET_PATTERNS = (
+    "failure when receiving data",
+    "recv failure",
+    "send failure",
+    "connection reset",
+    "connection refused",
+    "connection timed out",
+    "operation timed out",
+    "could not resolve host",
+    "temporary failure in name resolution",
+    "empty reply from server",
+    "returned error: 50",      # 502/503/504 网关类错误
+    "early eof",
+    "rpc failed",
+    "the remote end hung up",
+    "gnutls",
+)
+
+DOWNLOAD_MAX_ATTEMPTS = 3  # 1 次原始 + 2 次重试
+
+
+def _is_transient_network_error(text: str) -> bool:
+    t = text.lower()
+    return any(p in t for p in TRANSIENT_NET_PATTERNS)
 
 
 # ---------- Step tracking ----------
@@ -256,9 +285,30 @@ def run_download(pkgname: str, upstream_url: str, expected_version: str, sources
             "--ref", extracted_ref,
         ]
         proc = run_command(command)
+    # 网络类瞬时错误：脚本内重试吸收（确定性行为），重试无效才上报 failed
+    attempt = 1
+    while (
+        proc.returncode != 0
+        and attempt < DOWNLOAD_MAX_ATTEMPTS
+        and _is_transient_network_error(proc.stderr + "\n" + proc.stdout)
+    ):
+        wait_s = 10 * attempt
+        print(
+            f"[WARN] download 遇到网络错误，{wait_s}s 后重试（第 {attempt + 1}/{DOWNLOAD_MAX_ATTEMPTS} 次）",
+            file=sys.stderr,
+        )
+        time.sleep(wait_s)
+        proc = run_command(command)
+        attempt += 1
     if proc.returncode != 0:
+        err_text = proc.stderr.strip() or proc.stdout.strip() or "download failed"
+        failure_type = (
+            "retryable_network"
+            if _is_transient_network_error(proc.stderr + "\n" + proc.stdout)
+            else "non_retryable_source_missing"
+        )
         mark_step(pkgname, reports_dir, "download", "failed")
-        raise FlowError(proc.stderr.strip() or proc.stdout.strip() or "download failed", "non_retryable_source_missing")
+        raise FlowError(err_text, failure_type)
     mark_step(pkgname, reports_dir, "download")
     return {"status": "done", "source_dir": str(source_dir), "download_result": str(path)}
 

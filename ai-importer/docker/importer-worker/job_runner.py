@@ -33,6 +33,38 @@ from timeline import write_event
 MAX_JOB_SECONDS = int(os.environ.get("MAX_JOB_SECONDS", str(4 * 3600)))
 MAX_LOOPS       = int(os.environ.get("MAX_LOOPS", "200"))
 
+# 脚本直评连续 failed 熔断阈值：同一 action:target 连续 failed 达到该次数后
+# 不再原地重试，fall through 到 Claude（原则：脚本执行不了就交 AI 决策）。
+MAX_SCRIPT_FAILS = int(os.environ.get("MAX_SCRIPT_FAILS", "3"))
+
+
+def _bump_script_fail_count(session_dir: Path, key: str) -> int:
+    """同一 key（action:target）的脚本连续 failed 计数 +1，持久化到 session 目录。"""
+    path = session_dir / "script_fail_counts.json"
+    counts = {}
+    if path.exists():
+        try:
+            counts = json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            counts = {}
+    counts[key] = counts.get(key, 0) + 1
+    path.write_text(json.dumps(counts))
+    return counts[key]
+
+
+def _clear_script_fail_count(session_dir: Path, key: str) -> None:
+    """脚本成功后清除对应 key 的 failed 计数。"""
+    path = session_dir / "script_fail_counts.json"
+    if not path.exists():
+        return
+    try:
+        counts = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return
+    if key in counts:
+        counts.pop(key)
+        path.write_text(json.dumps(counts))
+
 
 def _log(r, job_id, msg):
     r.rpush(f"{LOGS_PREFIX}{job_id}", json.dumps({"msg": msg, "t": time.time()}))
@@ -536,6 +568,7 @@ def run_job(r, proj, job_id):
                         st = result.get("status", "")
                         if st == "done":
                             _log(r, job_id, f"[script] {target} evaluate done (no Claude)")
+                            _clear_script_fail_count(session_dir, f"{action}:{target}")
                             write_event(session_dir, "loop.skip", "", {
                                 "loop": loop + 1,
                                 "action": action,
@@ -546,16 +579,22 @@ def run_job(r, proj, job_id):
                             loop += 1
                             continue
                         if st == "failed":
-                            _log(r, job_id, f"[script] {target} evaluate failed: {result.get('reason', '')}")
+                            fail_count = _bump_script_fail_count(session_dir, f"{action}:{target}")
+                            _log(r, job_id, f"[script] {target} evaluate failed ({fail_count}/{MAX_SCRIPT_FAILS}): {result.get('reason', '')}")
                             write_event(session_dir, "loop.skip", "", {
                                 "loop": loop + 1,
                                 "action": action,
                                 "target": target,
                                 "reason": "script_direct_evaluate",
                                 "script_result": "failed",
+                                "fail_count": fail_count,
                             })
-                            loop += 1
-                            continue
+                            if fail_count < MAX_SCRIPT_FAILS:
+                                # 未达熔断阈值：下一轮重试（循环间隔天然退避）
+                                loop += 1
+                                continue
+                            # 达到熔断阈值：脚本解决不了，fall through 交 Claude 决策
+                            _log(r, job_id, f"[script] {target} 连续 failed {fail_count} 次，falling back to Claude")
                         # st == "needs_ai" → fall through to Claude
                         _log(r, job_id, f"[script] {target} needs_ai, falling back to Claude")
                     else:
