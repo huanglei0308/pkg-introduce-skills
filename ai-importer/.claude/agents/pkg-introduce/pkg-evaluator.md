@@ -120,6 +120,34 @@ GATE_RC=$?
 
 **GATE_RC=1：** 在 gate_result 中已写失败原因，直接退出。
 
+### Phase 3：依赖评估与注册（仅 introduce_new 类决策）
+
+当 gate 判定包需引入（`introduce_new` / `introduce_new_with_ref`）时，对依赖做级联评估，
+将需要引入的依赖注册到 `dep_registry.json`，供 supervisor 在 build_main 之前递归处理。
+
+```bash
+GATE_DECISION=$(python3 -c "import json; d=json.load(open('./pkgs/${PKGNAME}/gate_result_${PKGNAME}.json')); print(d.get('result',{}).get('decision',''))" 2>/dev/null)
+case "$GATE_DECISION" in
+  introduce_new|introduce_new_with_ref)
+    LANG=$(python3 -c "import json; d=json.load(open('./pkgs/${PKGNAME}/gate_result_${PKGNAME}.json')); print(d.get('result',{}).get('lang',''))" 2>/dev/null)
+    echo "[evaluate] 依赖评估：提取 + 级联 + 注册 (lang=$LANG)"
+    python3 $SCRIPTS_DIR/evaluate-deps.py \
+      --session-dir "$SESSION_DIR" \
+      --pkg "$PKGNAME" \
+      --lang "$LANG" \
+      --source-dir "./sources/$PKGNAME"
+    echo "[evaluate] 依赖评估完成"
+    ;;
+  *)
+    echo "[evaluate] decision=$GATE_DECISION — 跳过依赖评估"
+    ;;
+esac
+```
+
+- 脚本对每个依赖做 4 级级联检查（与主包同一套 `cascade_package_check`）。
+- 需要引入的依赖（级联 decision = `evaluate` / `introduce_new_with_ref` / `introduce_new`）调 `register-dep.py` 写入 `dep_registry.json`。
+- 输出摘要：`reports/evaluate_deps_<pkg>.json`。
+
 ## 输出
 
 gate_result_$PKGNAME.json 已由 run_gate.py 写入，lead 直接读取：
@@ -140,6 +168,6 @@ gate_result_$PKGNAME.json 已由 run_gate.py 写入，lead 直接读取：
 ## 契约
 
 - 输入状态：supervisor 路由 evaluate_main（主包 gate_result 缺失/无效）或 evaluate（dep 处于 pending_evaluate）时唤起。
-- 产物及消费者：`gate_result_<pkg>.json`（decision/lang/version）→ supervisor 决定 reuse 直完、进入构建还是 evaluate_failed 待分析；`check_result_<pkg>.json` → pkg-evaluate-analyzer 失败诊断的输入。
+- 产物及消费者：`gate_result_<pkg>.json`（decision/lang/version）→ supervisor 决定 reuse 直完、进入构建还是 evaluate_failed 待分析；`check_result_<pkg>.json` → pkg-evaluate-analyzer 失败诊断的输入。`evaluate_deps_<pkg>.json`（依赖评估摘要）→ 记录用。`dep_registry.json`（由 evaluate-deps.py 通过 register-dep.py 写入）→ supervisor 在 build_main 前调度依赖构建。
 - 预算与熔断：evaluate 失败由 analyze_evaluate 判 retry/abort，retry 时带 `evaluate_retry_hint.txt` 重试（Phase 0 必读）；无 hint 的反复失败最终由 analyzer 判 abort 终止。
 - 异常出口：check 失败写 `gate_result`（decision=check_failed + reason）后退出；Gradle 等确定性不可构建场景直接按 check_failed 写原因，不做任何构建尝试。
