@@ -29,6 +29,8 @@ _RUN_GATE = _PKG_INTRODUCE_SCRIPTS / "run_gate.py"
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 _EVALUATE_DEPS = _SCRIPTS_DIR / "evaluate-deps.py"
 
+from timeline import write_event  # noqa: E402  同目录脚本，直接运行时已入 sys.path
+
 
 def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -151,16 +153,29 @@ def run(session_dir: Path, pkgname: str, mode: str, url: str,
                     if v:
                         env[k_map] = v
                 try:
-                    subprocess.run(
+                    proc = subprocess.run(
                         [sys.executable, str(_EVALUATE_DEPS),
                          "--session-dir", str(session_dir),
                          "--pkg", pkgname,
                          "--lang", lang,
                          "--source-dir", str(source_dir)],
-                        capture_output=True, timeout=300, env=env,
+                        capture_output=True, text=True, timeout=300, env=env,
                     )
+                    # rc 与 stderr 摘要落日志 + timeline，避免静默失败不可见
+                    stderr_lines = (proc.stderr or "").strip().splitlines()
+                    detail = " | ".join(stderr_lines[-3:])[:300]
+                    print(f"[run_evaluate_dep] evaluate-deps rc={proc.returncode}: {detail}",
+                          file=sys.stderr)
+                    write_event(session_dir, "evaluate_deps.end", pkgname, {
+                        "rc": proc.returncode,
+                        "detail": detail,
+                    })
                 except Exception as exc:
                     print(f"[run_evaluate_dep] evaluate-deps 失败（不阻塞主流程）: {exc}", file=sys.stderr)
+                    write_event(session_dir, "evaluate_deps.end", pkgname, {
+                        "rc": -1,
+                        "detail": f"exception: {exc}",
+                    })
 
         return {
             "status": "done",

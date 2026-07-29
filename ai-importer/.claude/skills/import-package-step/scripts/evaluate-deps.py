@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-BUILD_RPM_SCRIPTS = SCRIPT_DIR.parents[2] / "build-rpm" / "scripts"
+BUILD_RPM_SCRIPTS = SCRIPT_DIR.parents[1] / "build-rpm" / "scripts"
 sys.path.insert(0, str(BUILD_RPM_SCRIPTS))
 
 # 语言 → analyzer 映射（与 pre_check_deps.py 保持一致）
