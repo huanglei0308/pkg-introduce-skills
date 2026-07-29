@@ -67,6 +67,24 @@ def _clear_script_fail_count(session_dir: Path, key: str) -> None:
         path.write_text(json.dumps(counts))
 
 
+def _get_script_fail_counts(session_dir: Path) -> dict:
+    """读取全部脚本 failed 计数（用于并行批次的熔断排除）。"""
+    path = session_dir / "script_fail_counts.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _cap_script_fail_count(session_dir: Path, key: str) -> None:
+    """将对应 key 的计数直接置为熔断阈值（脚本判定无法处理，不再重试）。"""
+    counts = _get_script_fail_counts(session_dir)
+    counts[key] = MAX_SCRIPT_FAILS
+    (session_dir / "script_fail_counts.json").write_text(json.dumps(counts))
+
+
 def _log(r, job_id, msg):
     r.rpush(f"{LOGS_PREFIX}{job_id}", json.dumps({"msg": msg, "t": time.time()}))
 
@@ -594,20 +612,23 @@ def run_job(r, proj, job_id):
         elif action == "evaluate":
             target = sv.get("target", "")
             _dep_path = session_dir / "dep_registry.json"
-            if not _dep_path.exists():
-                loop += 1
-                continue
-            _dep_reg = json.loads(_dep_path.read_text())
+            if _dep_path.exists():
+                _dep_reg = json.loads(_dep_path.read_text())
+            else:
+                _dep_reg = {}
 
-            # 收集所有 pending_evaluate 且有 url 的依赖
+            # 收集所有 pending_evaluate 且有 url 的依赖；
+            # 脚本已连续失败达熔断阈值（或判定 needs_ai）的 dep 排除在外，交由 Claude 兜底
+            _fail_counts = _get_script_fail_counts(session_dir)
             pending = [(d, info) for d, info in _dep_reg.items()
                        if isinstance(info, dict)
                        and info.get("status") == "pending_evaluate"
-                       and info.get("url")]
+                       and info.get("url")
+                       and _fail_counts.get(f"evaluate:{d}", 0) < MAX_SCRIPT_FAILS]
 
             if not pending:
-                loop += 1
-                continue
+                # 无可由脚本处理的 dep（无 url / 均已熔断）→ fall through 到 Claude
+                _log(r, job_id, f"[script] no script-eligible pending dep for {target}, falling back to Claude")
 
             if len(pending) == 1:
                 # ── 单 dep：沿用现有逻辑（可 fall through 到 Claude） ──
@@ -656,7 +677,7 @@ def run_job(r, proj, job_id):
                     _log(r, job_id, f"[script] {d_name} exception: {e}, falling back to Claude")
                 # fall through → Claude 处理这个 dep
 
-            else:
+            elif pending:
                 # ── 多 dep 并行脚本 → 主线程统一写 registry ──
                 _log(r, job_id, f"[script] parallel evaluate {len(pending)} deps: {[d[0] for d in pending]}")
 
@@ -672,9 +693,11 @@ def run_job(r, proj, job_id):
                              "--no-update-registry"],
                             capture_output=True, text=True, timeout=300,
                         )
-                        if proc.returncode == 0:
+                        # needs_ai 时 rc=1 但 stdout 仍是合法 JSON，优先取真实状态
+                        try:
                             return dep_name, json.loads(proc.stdout)
-                        return dep_name, {"status": "failed", "reason": f"rc={proc.returncode}"}
+                        except json.JSONDecodeError:
+                            return dep_name, {"status": "failed", "reason": f"rc={proc.returncode}"}
                     except subprocess.TimeoutExpired:
                         return dep_name, {"status": "failed", "reason": "timeout"}
                     except Exception as e:
@@ -706,19 +729,35 @@ def run_job(r, proj, job_id):
                                 "target": dep_name, "reason": "script_parallel_evaluate",
                                 "script_result": "done",
                             })
-                        else:
-                            _log(r, job_id, f"[script] {dep_name} {st} (keep pending_evaluate → Claude fallback next round)")
+                        elif st == "needs_ai":
+                            # 脚本无法决策（重试无意义）：置满熔断计数，
+                            # 后续轮次从脚本批次排除，fall through 给 Claude
+                            _cap_script_fail_count(session_dir, f"evaluate:{dep_name}")
+                            needs_ai_list.append(dep_name)
                             failed_count += 1
-                            if st == "needs_ai":
-                                needs_ai_list.append(dep_name)
+                            write_event(session_dir, "loop.skip", "", {
+                                "loop": loop + 1, "action": "evaluate",
+                                "target": dep_name, "reason": "script_parallel_evaluate",
+                                "script_result": "needs_ai",
+                            })
+                            _log(r, job_id, f"[script] {dep_name} needs_ai (capped → Claude fallback)")
+                        else:
+                            fail_count = _bump_script_fail_count(session_dir, f"evaluate:{dep_name}")
+                            failed_count += 1
+                            write_event(session_dir, "loop.skip", "", {
+                                "loop": loop + 1, "action": "evaluate",
+                                "target": dep_name, "reason": "script_parallel_evaluate",
+                                "script_result": "failed", "fail_count": fail_count,
+                            })
+                            _log(r, job_id, f"[script] {dep_name} failed ({fail_count}/{MAX_SCRIPT_FAILS}): {result.get('reason','')}")
 
                 # 主线程统一写入 dep_registry（唯一写者，无竞争）
                 (session_dir / "dep_registry.json").write_text(
                     json.dumps(_dep_reg, ensure_ascii=False, indent=2))
 
                 _log(r, job_id,
-                     f"[script] parallel done: {done_count} done, {failed_count} pending "
-                     f"(needs_ai={needs_ai_list}, will fallback to Claude next round)")
+                     f"[script] parallel done: {done_count} done, {failed_count} not done "
+                     f"(needs_ai={needs_ai_list} → Claude fallback)")
                 loop += 1
                 continue
 
