@@ -544,6 +544,33 @@ def check_existing_package(pkgname: str, version: str = "", requirement: str = "
     chroot: 目标构建 chroot（如 openeuler-22.03_LTS_SP2-x86_64）。
             传入后自动切换到对应 openEuler 版本的 repo 查询。
     """
+    if chroot and _chroot_to_repo_base(chroot) is None:
+        # 未识别的 chroot：禁止静默回退到 worker 本地 repo（那可能是错误的
+        # OS 版本，查询结果会被误记为目标 OS 的结论）。显式标记查询不可用，
+        # 按"官方源未确认"处理（decision=introduce_new，构建是安全方向）。
+        print(f"[WARN] unknown chroot {chroot!r}: 无 repo 映射，跳过官方源查询",
+              file=sys.stderr)
+        not_found = {"exists": False, "highest": None, "meets_need": False,
+                     "matched_paths": [], "comparison_unknown": True}
+        return {
+            "requested": {
+                "pkgname":          pkgname,
+                "version":          version,
+                "requirement":      requirement,
+                "lang":             lang,
+                "chroot":           chroot,
+                "requirement_info": parse_requirement(requirement),
+            },
+            "official":              not_found,
+            "copr_project":          dict(not_found),
+            "exists_in_official":    False,
+            "exists_in_copr_project": False,
+            "decision":              "introduce_new",
+            "reason":                f"chroot {chroot} 无 repo 映射，官方源查询不可用",
+            "should_skip":           False,
+            "error":                 f"unknown chroot: {chroot}",
+        }
+
     repo_switched = False
     try:
         if chroot:

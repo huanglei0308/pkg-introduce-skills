@@ -709,6 +709,8 @@ def _enrich_via_cascade(pkgname: str, lang: str, requirement: str) -> dict | Non
     if not (copr_url and copr_owner and copr_project and copr_login and copr_token):
         return None
     try:
+        # version 留空：cascade 内部会从 requirement 推导下界版本（集中实现，
+        # 与 evaluate-deps / run_gate 等其他调用方共用同一份防线）
         return CASCADE_CHECKER.check_package_existence(
             pkgname,
             lang=lang,

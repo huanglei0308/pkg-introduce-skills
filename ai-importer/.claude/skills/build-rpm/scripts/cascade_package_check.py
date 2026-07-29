@@ -57,6 +57,81 @@ from rpm_naming import get_rpm_pkg_name, get_srpm_name  # noqa: E402
 import check_existing_package as _checker  # noqa: E402
 
 
+# ── chroot / 版本匹配辅助 ─────────────────────────────────────────────────────
+
+_ARCH_SUFFIX_RE = re.compile(r"-(x86_64|aarch64|noarch|i686|i386)$", re.IGNORECASE)
+
+
+def _split_chroot(chroot: str) -> tuple[str, str]:
+    """归一化 chroot → (os_base, arch)。os_base 小写、下划线转横线。
+
+    例: "openeuler-24.03_LTS_SP3-x86_64" → ("openeuler-24.03-lts-sp3", "x86_64")
+    """
+    c = (chroot or "").strip().rstrip("/")
+    arch = ""
+    m = _ARCH_SUFFIX_RE.search(c)
+    if m:
+        arch = m.group(1).lower()
+        c = c[: m.start()]
+    return c.replace("_", "-").lower(), arch
+
+
+def _chroot_matches(build_chroot: str, target_base: str, target_arch: str) -> bool:
+    """build chroot 是否匹配 target：OS 版本前缀一致且架构精确相等。
+
+    架构必须精确相等（target 指明架构时），避免 x86_64 target 复用 aarch64 构建。
+    """
+    b_base, b_arch = _split_chroot(build_chroot)
+    if not b_base.startswith(target_base):
+        return False
+    if target_arch and b_arch and b_arch != target_arch:
+        return False
+    return True
+
+
+def _requirement_min_version(requirement: str) -> str:
+    """从版本约束提取下界版本（>=/==/> 子句中的最高下界），作为级联检查的版本防线。
+
+    依赖路径没有显式 version，但 requirement（如 ">=2.0,<3"）隐含下界；
+    不推导的话 L0/L1 的版本检查会整体失效，任意老版本都会被误判为可复用。
+    """
+    info = _checker.parse_requirement(requirement)
+    if info.get("status") != "parsed":
+        return ""
+    lowers = [c["version"] for c in info.get("clauses", [])
+              if c.get("operator") in (">=", "==", ">") and c.get("version")]
+    if not lowers:
+        return ""
+    best = lowers[0]
+    for v in lowers[1:]:
+        if _checker.compare_versions(v, best) > 0:
+            best = v
+    return best
+
+
+def _version_satisfies(found_version: str, requested_version: str, requirement: str) -> bool:
+    """found 版本是否满足请求：>= requested_version 且满足 requirement 全部子句。
+
+    无版本号判不出来（空）→ 不满足；requirement 无法解析（含 or/!=/~=）→ 保守不满足；
+    两者都没有（无约束）→ 存在即满足。
+    """
+    if not found_version:
+        return False
+    checks = []
+    if requested_version:
+        checks.append(_checker.compare_versions(found_version, requested_version) >= 0)
+    req_info = _checker.parse_requirement(requirement)
+    if req_info.get("status") == "parsed":
+        sat = _checker.evaluate_requirement(found_version, req_info)
+        if sat is not None:
+            checks.append(sat)
+    elif req_info.get("status") == "unknown":
+        return False  # 约束解析不了，保守不复用（继续级联/构建是安全方向）
+    if not checks:
+        return True
+    return all(checks)
+
+
 # ── Level 1: EUR fulltext search ────────────────────────────────────────────────
 
 def _eur_fulltext_search(pkgname: str) -> list[dict[str, str]]:
@@ -123,11 +198,8 @@ def _scan_eur_results(projects: list[dict[str, str]], pkgname: str,
     若 target_version 指定，EUR 版本必须 >= 目标版本才返回命中。
     若 target_chroot 指定，仅扫描匹配的目标版本 chroot（如 openeuler-24.03-lts-sp3）。
     """
-    # Normalize target for chroot matching
-    target_base = ""
-    if target_chroot:
-        target_base = re.sub(r"-(x86_64|aarch64|noarch|i686|i386)$", "", target_chroot)
-        target_base = target_base.replace("_", "-").lower()
+    # Normalize target for chroot matching（OS 版本 + 架构拆分，匹配时架构精确相等）
+    target_base, target_arch = _split_chroot(target_chroot)
 
     for proj in projects:
         owner = proj["owner"]
@@ -145,7 +217,7 @@ def _scan_eur_results(projects: list[dict[str, str]], pkgname: str,
         chroot_dirs: list[str] = re.findall(r'href="([^"]+/)"', html)
         # If target_base is specified, prioritize matching chroots first
         if target_base:
-            matching = [c for c in chroot_dirs if c.rstrip("/").replace("_", "-").lower().startswith(target_base)]
+            matching = [c for c in chroot_dirs if _chroot_matches(c, target_base, target_arch)]
             non_matching = [c for c in chroot_dirs if c not in matching]
             chroot_dirs = matching + non_matching
 
@@ -360,13 +432,20 @@ def _check_src_openeuler(pkgname: str, lang: str, target: str = "") -> Optional[
 
 def _check_user_copr_project(pkgname: str, copr_url: str, owner: str,
                               project: str, login: str, token: str,
-                              target: str = "", lang: str = "") -> Optional[dict]:
+                              target: str = "", lang: str = "",
+                              version: str = "", requirement: str = "") -> Optional[dict]:
     """检查用户自己的 COPR project 是否已有此包（避免重复构建）。
 
-    仅当已有构建的 chroot 与 target 匹配时才返回复用结果，
-    避免将不同目标版本的构建误判为可复用。
+    仅当已有构建的 chroot 与 target 匹配（OS 版本前缀 + 架构精确相等）、
+    且构建版本满足请求版本/约束（version / requirement）时才返回复用结果，
+    避免将不同目标版本、不同架构或版本过低的构建误判为可复用。
+    target 为空时无法保证 chroot 精确匹配，直接放弃 L0 复用。
     """
     if not (copr_url and owner and project and login and token):
+        return None
+
+    target_base, target_arch = _split_chroot(target)
+    if not target_base:
         return None
 
     import base64
@@ -392,32 +471,38 @@ def _check_user_copr_project(pkgname: str, copr_url: str, owner: str,
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode())
         items = data.get("items", [])
-        # Normalize target for comparison (strip arch suffix)
-        target_base = ""
-        if target:
-            target_base = re.sub(r"-(x86_64|aarch64|noarch|i686|i386)$", "", target)
-            target_base = target_base.replace("_", "-").lower()
 
         best = None
+        best_chroot = ""
         for build in items:
             if build.get("state") != "succeeded":
                 continue
-            # If target is specified, ensure at least one chroot matches
-            if target_base:
-                build_chroots = [c.lower().replace("_", "-") for c in build.get("chroots", [])]
-                if not any(c.startswith(target_base) for c in build_chroots):
-                    continue
+            # chroot 必须匹配（OS 版本前缀 + 架构精确相等）
+            matched = [c for c in build.get("chroots", [])
+                       if _chroot_matches(c, target_base, target_arch)]
+            if not matched:
+                continue
             ver = build.get("source_package", {}).get("version", "")
             if ver and (best is None or _checker.compare_versions(ver, best["version"]) > 0):
                 best = {"name": pkgname, "version": ver}
-        if best:
-            return {
-                "level": 0,
-                "decision": "reuse_copr_project",
-                "rpm_name": pkgname,
-                "version": best["version"],
+                best_chroot = matched[0]
+        if not best:
+            return None
+        # 版本防线：project 里最高版本必须满足请求版本/约束，否则继续级联
+        if not _version_satisfies(best["version"], version, requirement):
+            return None
+        return {
+            "level": 0,
+            "decision": "reuse_copr_project",
+            "rpm_name": pkgname,
+            "version": best["version"],
+            "source": f"{owner}/{project}",
+            "match": {
                 "source": f"{owner}/{project}",
-            }
+                "version": best["version"],
+                "chroot": best_chroot,
+            },
+        }
     except Exception:
         pass
     return None
@@ -465,12 +550,28 @@ def check_package_existence(
         "reference": None,
     }
 
+    # 依赖路径常只给 requirement 不给 version：推导下界版本，
+    # 否则 L0/L1 的版本检查整体失效（任意老版本被误判可复用）
+    if not version and requirement:
+        version = _requirement_min_version(requirement)
+
     # ── Level 0: 用户 COPR project ──────────────────────────────────────────
     user_result = _check_user_copr_project(
-        pkgname, copr_url, copr_owner, copr_project, copr_login, copr_token, target, lang
+        pkgname, copr_url, copr_owner, copr_project, copr_login, copr_token, target, lang,
+        version=version, requirement=requirement,
     )
     if user_result:
         result.update(user_result)
+        return result
+
+    # ── Level 2: openEuler 目标版本 ─────────────────────────────────────────
+    # 官方源复用零成本，优先于 EUR SRPM 重建（原顺序 L1 在 L2 前，
+    # 官方源已有的包会被 EUR 命中抢走，白白重建一次）
+    target_match = _check_target_version(
+        pkgname, lang, target, version, requirement
+    )
+    if target_match:
+        result.update(target_match)
         return result
 
     # ── Level 1: EUR fulltext search ─────────────────────────────────────────
@@ -482,14 +583,6 @@ def check_package_existence(
             result["decision"] = "reuse_eur_srpm"
             result["match"] = eur_match
             return result
-
-    # ── Level 2: openEuler 目标版本 ─────────────────────────────────────────
-    target_match = _check_target_version(
-        pkgname, lang, target, version, requirement
-    )
-    if target_match:
-        result.update(target_match)
-        return result
 
     # ── Level 3: gitcode src-openeuler ──────────────────────────────────────
     gitcode_match = _check_src_openeuler(pkgname, lang, target)
