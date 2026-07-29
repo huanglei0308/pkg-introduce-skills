@@ -194,6 +194,10 @@ MAX_FIX_ROUNDS = 8
 # 连续"修复无产出"轮数上限：fixer 退出但既未重新提交构建、也未注册新依赖、也未 abort。
 MAX_NO_OUTPUT_ROUNDS = 2
 
+# verify_install 重返上限：ci_check_result.json 写入路径异常时 supervisor 会反复重跑 CI，
+# 超过上限直接 fail，把"路径类 bug"从死循环降级为快速失败。
+MAX_CI_ATTEMPTS = 3
+
 
 def _fix_rounds(sd: Path, pkgname: str) -> int:
     """统计该包已经历的修复轮数（按失败分析的 build 数）。
@@ -273,6 +277,16 @@ def compute_depth(dep_name: str, reg: dict, pkgname: str, _seen: frozenset = fro
     if parent in _seen:
         return 99  # 循环依赖保护：parent 已在访问链上
     return 1 + compute_depth(parent, reg, pkgname, _seen | {dep_name})
+
+
+def _record_built_pkg(sd: Path, wf: dict, pkg: str) -> None:
+    """异步轮询路径回填 built_pkgs（与 update_after_build 同步路径行为一致）。"""
+    wf.setdefault("built_pkgs", [])
+    if pkg not in wf["built_pkgs"]:
+        wf["built_pkgs"].append(pkg)
+        wf_files = list(sd.glob("workflow_*.json"))
+        if wf_files:
+            write_json(wf_files[0], wf)
 
 
 def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | None]:
@@ -466,6 +480,7 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
             copr_state = _poll_copr_build(build_id, sd)
             if copr_state == "succeeded":
                 reg[dep]["status"] = "build_done"
+                _record_built_pkg(sd, wf, dep)
                 changed = True
             elif copr_state == "failed":
                 reg[dep]["status"] = "build_failed"
@@ -577,6 +592,7 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
                 if copr_state == "succeeded":
                     main_result["status"] = "success"
                     write_json(main_result_path, main_result)
+                    _record_built_pkg(sd, wf, PKGNAME)
                     main_status = "success"
                 elif copr_state == "failed":
                     main_result["status"] = "failed"
@@ -631,6 +647,14 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
             # CI 安装验证：构建成功后必须通过 repoclosure 验证
             ci_result_path = sd / f"pkgs/{PKGNAME}/ci_check_result.json"
             if not ci_result_path.exists():
+                # 防死循环：CI 结果写入路径异常时会无限重跑 verify_install
+                attempts = main_result.get("ci_attempts", 0) + 1
+                main_result["ci_attempts"] = attempts
+                write_json(main_result_path, main_result)
+                if attempts > MAX_CI_ATTEMPTS:
+                    return ("fail",
+                            f"ci_check_result.json 缺失，verify_install 重跑 {attempts - 1} 次仍无结果",
+                            None)
                 return ("verify_install", PKGNAME, 0)
             ci_result = read_json(ci_result_path)
             if ci_result.get("status") != "pass":

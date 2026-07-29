@@ -281,8 +281,10 @@ def main() -> int:
             errors.append(f"repoclosure 失败:\n{msg}")
 
         # 4. dnf builddep（逐包验证编译期依赖）
+        # spec 在 reports_dir（= pkgs/$TARGET）下；--pkgs 传的是 SRPM/二进制名，未必等于目录名
+        spec_files = sorted(reports_dir.glob("*.spec"))
         for pkg in args.pkgs:
-            spec_path = session_dir / f"pkgs/{pkg}/{pkg}.spec"
+            spec_path = spec_files[0] if spec_files else reports_dir / f"{pkg}.spec"
             print(f"[CI] 运行 dnf builddep（{pkg}）...")
             ok, msg = run_builddep(pkg, spec_path, chroot, copr_result_url)
             if ok:

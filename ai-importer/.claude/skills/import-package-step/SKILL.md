@@ -152,7 +152,8 @@ print(d.get('source_package',{}).get('name',''))
   _CI_START=$(date +%s)
   python3 $SKILLS_DIR/pkg-introduce/scripts/run_ci_check.py \
     --pkgs "${_SRPM:-$TARGET}" \
-    --session-dir "$SESSION_DIR"
+    --session-dir "$SESSION_DIR" \
+    --reports-dir "$SESSION_DIR/pkgs/$TARGET"
   _CI_DURATION=$(( $(date +%s) - _CI_START ))
   echo "[step] CI 验证完成 (${_CI_DURATION}s)"
 
