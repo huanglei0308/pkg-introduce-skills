@@ -21,6 +21,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -173,6 +175,9 @@ def run_repoclosure(pkgs: list[str], chroot: str, copr_result_url: str) -> tuple
     cmd = ["repoclosure", "--newest"]
 
     if base:
+        # 显式按目标 chroot 架构解析（宿主 pod 架构可能与 chroot 不同，
+        # 如 x86_64 pod 检查 aarch64 包，缺省会按宿主架构漏报/误报）
+        cmd += ["--arch", arch]
         cmd += [
             "--repofrompath", f"ci-oe-official,{base}/everything/{arch}/",
             "--repofrompath", f"ci-oe-update,{base}/update/{arch}/",
@@ -215,6 +220,14 @@ def run_builddep(pkg: str, spec_path: Path, chroot: str, copr_result_url: str) -
 
     cmd = ["dnf", "builddep", "--assumeno"]
 
+    installroot = ""
+    if base and arch != platform.machine():
+        # 跨架构检查（如 x86_64 pod 检查 aarch64 chroot）：
+        # --forcearch 让 dnf 按目标架构过滤包（否则架构相关包被排除，误报 No matching package）；
+        # 空 installroot 避免与宿主 @System 已装包冲突
+        installroot = tempfile.mkdtemp(prefix="ci-builddep-")
+        cmd += [f"--forcearch={arch}", f"--installroot={installroot}", "--releasever=/"]
+
     if base:
         cmd += [
             "--repofrompath", f"ci-oe-official,{base}/everything/{arch}/",
@@ -234,7 +247,13 @@ def run_builddep(pkg: str, spec_path: Path, chroot: str, copr_result_url: str) -
 
     cmd.append(str(spec_path))
 
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    # 空 installroot 需重新下载仓库元数据，放宽超时
+    timeout = 300 if installroot else 120
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    finally:
+        if installroot:
+            shutil.rmtree(installroot, ignore_errors=True)
     combined = result.stdout + result.stderr
     # --assumeno 成功时返回非零（拒绝安装），只有含 Error 才是真正失败
     failed = ("Error:" in combined and
