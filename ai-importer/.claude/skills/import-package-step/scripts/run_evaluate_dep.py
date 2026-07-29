@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -25,6 +26,8 @@ _PKG_INTRODUCE_SCRIPTS = (
 )
 _RUN_CHECK = _PKG_INTRODUCE_SCRIPTS / "run_check.py"
 _RUN_GATE = _PKG_INTRODUCE_SCRIPTS / "run_gate.py"
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+_EVALUATE_DEPS = _SCRIPTS_DIR / "evaluate-deps.py"
 
 
 def _read_json(path: Path) -> dict:
@@ -128,6 +131,36 @@ def run(session_dir: Path, pkgname: str, mode: str, url: str,
                 if lang:
                     reg[pkgname]["lang"] = lang
                 _write_json(reg_path, reg)
+
+        # 依赖提取与注册（等价于 pkg-evaluator Phase 3）
+        # 脚本直调路径跳过了 agent，需在此补上 evaluate-deps.py
+        if mode == "top-level" and decision in ("introduce_new", "introduce_new_with_ref") and lang:
+            source_dir = session_dir / "sources" / pkgname
+            if source_dir.exists() and _EVALUATE_DEPS.exists():
+                print(f"[run_evaluate_dep] 依赖评估: evaluate-deps.py --pkg {pkgname} --lang {lang}", file=sys.stderr)
+                env = os.environ.copy()
+                for k_map, k_session in (
+                    ("COPR_FRONTEND_URL", "copr_url"),
+                    ("COPR_OWNER", "copr_owner"),
+                    ("COPR_PROJECT", "copr_project"),
+                    ("COPR_API_LOGIN", "copr_login"),
+                    ("COPR_API_TOKEN", "copr_token"),
+                    ("COPR_CHROOT", "copr_chroot"),
+                ):
+                    v = session.get(k_session, "")
+                    if v:
+                        env[k_map] = v
+                try:
+                    subprocess.run(
+                        [sys.executable, str(_EVALUATE_DEPS),
+                         "--session-dir", str(session_dir),
+                         "--pkg", pkgname,
+                         "--lang", lang,
+                         "--source-dir", str(source_dir)],
+                        capture_output=True, timeout=300, env=env,
+                    )
+                except Exception as exc:
+                    print(f"[run_evaluate_dep] evaluate-deps 失败（不阻塞主流程）: {exc}", file=sys.stderr)
 
         return {
             "status": "done",
