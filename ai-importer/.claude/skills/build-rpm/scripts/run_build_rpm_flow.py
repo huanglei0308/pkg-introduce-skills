@@ -55,6 +55,34 @@ def run_precheck(pkgname: str, lang: str, source_dir: str, reports_dir: Path) ->
     return proc.returncode, precheck_json, proc.stdout.strip(), proc.stderr.strip()
 
 
+def reconcile_pending_with_registry(pending: list[dict], session_dir: Path) -> list[dict]:
+    """与 dep_registry 对账：已 build_done 的依赖（本项目仓已构建成功）从 pending 剔除。
+
+    precheck 的 pending 基于官方源状态（官方源不会因本次引入而变化），
+    不与 registry 对账会导致 dep_needed 与 supervisor"依赖已就绪"结论矛盾，
+    build_main 空转死循环。
+    """
+    if not pending:
+        return pending
+    dep_reg_path = session_dir / "dep_registry.json"
+    if not dep_reg_path.exists():
+        return pending
+    try:
+        dep_reg = json.loads(dep_reg_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return pending
+    done = {k for k, v in dep_reg.items()
+            if isinstance(v, dict) and v.get("status") == "build_done"}
+    if not done:
+        return pending
+    skipped = [d.get("name") or d.get("dep", "") for d in pending
+               if (d.get("name") or d.get("dep", "")) in done]
+    if skipped:
+        print(f"[build-rpm] precheck 对账: {skipped} 已 build_done，从 pending 剔除",
+              file=sys.stderr)
+    return [d for d in pending if (d.get("name") or d.get("dep", "")) not in done]
+
+
 def build_result_payload(
     *,
     pkgname: str,
@@ -204,6 +232,10 @@ def main() -> int:
         blocked  = list(precheck.get("blocked") or [])
         pending  = list(precheck.get("pending") or [])
         needs_ai = list(precheck.get("needs_ai") or [])
+
+        # 已 build_done 的依赖不算 pending（详见 reconcile_pending_with_registry docstring）
+        pending = reconcile_pending_with_registry(pending, session_dir)
+        precheck_summary["pending_count"] = len(pending)
 
         if needs_ai:
             payload = build_result_payload(
