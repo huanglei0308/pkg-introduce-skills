@@ -218,10 +218,18 @@ def run_gate(args: argparse.Namespace) -> int:
                     f"{match_info.get('rpm_name', '')} {match_info.get('version', '')}"
                 )
             elif decision == "introduce_new_with_ref":
-                reason = (
-                    f"src-openeuler 仓库存在：{match_info.get('gitcode_repo', '')}，"
-                    f"以参考 spec 为起点构建"
-                )
+                ref_info = cascade_result.get("reference") or {}
+                if ref_info.get("source") == "eur":
+                    reason = (
+                        f"EUR 有 {ref_info.get('eur_owner', '')}/{ref_info.get('eur_project', '')} "
+                        f"version={ref_info.get('version', '')} 但 chroot 不匹配"
+                        f"（{ref_info.get('chroot', '')} vs {chroot}），以其 SRPM 为参考重建"
+                    )
+                else:
+                    reason = (
+                        f"src-openeuler 仓库存在：{match_info.get('gitcode_repo', '')}，"
+                        f"以参考 spec 为起点构建"
+                    )
             elif decision == "introduce_new":
                 reason = "所有来源均未找到，从头构建"
             else:
@@ -242,8 +250,14 @@ def run_gate(args: argparse.Namespace) -> int:
             session_dir = reports_dir.parent
             pkgs_dir = session_dir / "pkgs" / args.pkg
             srpms_dir = session_dir / "srpms"
+            ref_info = cascade_result.get("reference") or {}
             if decision == "reuse_eur_srpm" and match_info.get("srpm_url"):
                 _download_eur_srpm(match_info, args.pkg, pkgs_dir, srpms_dir)
+            elif decision == "introduce_new_with_ref" and ref_info.get("source") == "eur" \
+                    and ref_info.get("srpm_url"):
+                # EUR 参考源（chroot 不匹配降级）：下载 SRPM 提取 spec 作参考，
+                # 后续走完整构建流程（§3 自动检测 reference/ 下的参考 spec）
+                _download_eur_srpm(ref_info, args.pkg, pkgs_dir, srpms_dir)
             elif decision == "introduce_new_with_ref" and match_info.get("repo_name"):
                 _fetch_reference(match_info, args.pkg, pkgs_dir)
 

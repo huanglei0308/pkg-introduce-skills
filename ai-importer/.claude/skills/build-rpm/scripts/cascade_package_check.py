@@ -225,6 +225,9 @@ def _scan_eur_results(projects: list[dict[str, str]], pkgname: str,
             chroot = chroot_dir.rstrip("/")
             if not chroot or chroot.startswith(".."):
                 continue
+            # 命中的 chroot 是否与目标精确匹配（OS 前缀 + 架构）：
+            # 不匹配时 EUR 二进制无法直接复用，只能降级为参考源
+            chroot_matched = bool(target_base) and _chroot_matches(chroot_dir, target_base, target_arch)
 
             chroot_url = f"{results_url}{chroot}/"
             try:
@@ -286,15 +289,17 @@ def _scan_eur_results(projects: list[dict[str, str]], pkgname: str,
                     "binary_rpm_files": binary_files,
                     "version": version,
                     "chroot": chroot,
+                    "chroot_matched": chroot_matched,
                 }
 
-                # 版本匹配检查：EUR 版本必须 >= 目标版本
-                if target_version and version:
+                # 版本防线：EUR 版本必须满足目标版本。
+                # 版本号解析不出来 / 比较失败 → 保守跳过（复用错版本代价远高于重建）
+                if target_version:
                     try:
-                        if _checker.compare_versions(version, target_version) < 0:
-                            continue  # EUR 版本太低，继续搜下一个
+                        if not _version_satisfies(version or "", target_version, ""):
+                            continue  # EUR 版本不满足，继续搜下一个
                     except Exception:
-                        pass  # 版本比较失败不阻塞
+                        continue
 
                 if binary_files or srpm_files:
                     match_info["decision"] = "reuse_eur_srpm"
@@ -580,8 +585,26 @@ def check_package_existence(
         eur_match = _scan_eur_results(eur_projects, pkgname, target_chroot=target, target_version=version)
         if eur_match:
             result["level"] = 1
-            result["decision"] = "reuse_eur_srpm"
-            result["match"] = eur_match
+            if eur_match.get("chroot_matched"):
+                # chroot 精确匹配：EUR 二进制/SRPM 可直接复用
+                result["decision"] = "reuse_eur_srpm"
+                result["match"] = eur_match
+            else:
+                # chroot 不匹配：EUR 产物无法直接复用，降级为参考源，
+                # 以其 SRPM/spec 为起点重建（与 L3 gitcode 参考源同语义）。
+                # 依赖路径上没有"下载 EUR SRPM 重建"的执行通道，
+                # 判 reuse 会变成"假 resolved"（没人执行重建动作）。
+                result["decision"] = "introduce_new_with_ref"
+                result["match"] = None
+                result["reference"] = {
+                    "source": "eur",
+                    "eur_owner": eur_match.get("eur_owner", ""),
+                    "eur_project": eur_match.get("eur_project", ""),
+                    "srpm_url": eur_match.get("srpm_url"),
+                    "srpm_file": eur_match.get("srpm_file"),
+                    "version": eur_match.get("version"),
+                    "chroot": eur_match.get("chroot"),
+                }
             return result
 
     # ── Level 3: gitcode src-openeuler ──────────────────────────────────────

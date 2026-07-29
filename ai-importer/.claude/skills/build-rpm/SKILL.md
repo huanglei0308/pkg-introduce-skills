@@ -91,6 +91,9 @@ fi
 
 #### `reuse_eur_srpm` — EUR SRPM 重建
 
+仅当 EUR 命中的 chroot 与目标 chroot 精确匹配（OS 版本 + 架构）时才会得到该决策；
+chroot 不匹配的 EUR 命中会被级联降级为 `introduce_new_with_ref`（参考源）。
+
 gate 阶段已下载 SRPM 到 `./srpms/` 并提取 spec 到 `./pkgs/<pkgname>/reference/`。
 
 **跳过 §1-§5，直接到 §6 提交 COPR 构建**：
@@ -114,7 +117,9 @@ fi
 
 #### `introduce_new_with_ref` — 有参考源的新引入
 
-gate 阶段已拉取参考 spec/yaml/patches 到 `./pkgs/<pkgname>/reference/`。
+参考源有两种：gitcode src-openeuler 仓库，或 chroot 不匹配的 EUR 命中（降级）。
+gate 阶段已拉取参考 spec/yaml/patches 到 `./pkgs/<pkgname>/reference/`
+（EUR 参考源为 SRPM 中提取的 spec）。
 
 **跳过 §2.5**（参考源已在 gate 阶段拉取），§3 会自动检测参考 spec 并进入适配模式。
 

@@ -732,13 +732,16 @@ def _cascade_decision_to_action(decision: str, has_upstream_url: bool) -> tuple[
     if decision in ("reuse_copr_project",):
         return ("resolved", "用户 COPR project 已有成功构建，直接复用")
     elif decision in ("reuse_eur_srpm",):
-        return ("resolved", "EUR 已有匹配版本，将下载 SRPM 重建")
+        # 依赖路径没有"下载 EUR SRPM 重建"的执行通道（那是主包 run_gate 的能力），
+        # 判 resolved 会变成"假 resolved"：spec 照写 Requires 但没人把包建出来。
+        # 统一走递归引入，以 EUR SRPM 为参考重建。
+        return ("recurse", "EUR 已有匹配版本（chroot 一致），以 EUR SRPM 为参考重建到用户 project")
     elif decision in ("reuse_official",):
         return ("resolved", "openEuler 官方源版本满足要求，直接复用")
     elif decision in ("evaluate",):
         return ("recurse", "openEuler 官方源版本不满足要求，需引入更高版本")
     elif decision in ("introduce_new_with_ref",):
-        return ("recurse", "gitcode src-openeuler 有参考源，以参考 spec 为起点构建")
+        return ("recurse", "已有参考源（gitcode/EUR），以参考 spec 为起点构建")
     elif decision in ("introduce_new",):
         if has_upstream_url:
             return ("recurse", "所有来源均未找到，需全新引入")
@@ -750,7 +753,7 @@ def _cascade_decision_to_action(decision: str, has_upstream_url: bool) -> tuple[
 # 级联 decision → pre_check 内部 decision 映射
 _CASCADE_TO_PRECHECK_DECISION = {
     "reuse_copr_project": "reuse_user_repo",
-    "reuse_eur_srpm": "reuse_user_repo",
+    "reuse_eur_srpm": "introduce_new",
     "reuse_official": "reuse_official",
     "evaluate": "block_official_older",
     "introduce_new_with_ref": "introduce_new",
@@ -770,8 +773,10 @@ def _build_existing_check_from_cascade(cascade: dict, dep: dict) -> dict:
 
     decision = _CASCADE_TO_PRECHECK_DECISION.get(cascade_decision, cascade_decision)
 
-    # 从级联层级推断包在官方源中的存在性
-    official_exists = cascade_level <= 2 or cascade_decision in ("evaluate",)
+    # 从级联层级推断包在官方源中的存在性（参考源/全新引入显然不在官方源）
+    official_exists = (
+        cascade_level <= 2 or cascade_decision in ("evaluate",)
+    ) and cascade_decision not in ("introduce_new_with_ref", "introduce_new")
     official_version = ""
     if cascade_level == 0:
         official_version = cascade_match.get("version", "")
@@ -780,7 +785,9 @@ def _build_existing_check_from_cascade(cascade: dict, dep: dict) -> dict:
     elif cascade_level <= 2:
         official_version = cascade_match.get("version", "")
 
-    meets_need = cascade_decision in ("reuse_official", "reuse_copr_project", "reuse_eur_srpm")
+    # reuse_eur_srpm 不算 meets_need：依赖路径上它被映射为 introduce_new
+    # 走递归重建，EUR 里的包并不能直接满足需求
+    meets_need = cascade_decision in ("reuse_official", "reuse_copr_project")
 
     return {
         "official": {
