@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 JOB_PREFIX  = "job:ai:"
@@ -533,32 +534,25 @@ def run_job(r, proj, job_id):
         # ── 脚本先行：evaluate / evaluate_main 优先用脚本，不启 Claude ──
         # run_check.py + run_gate.py 本身是纯 Python 脚本，95%+ 的 dep 不需要 AI。
         # 脚本返回 needs_ai 时才 fall through 到 Claude agent。
-        if action in ("evaluate", "evaluate_main"):
+        # evaluate（依赖模式）：收集所有 pending_evaluate 的 dep 并行跑脚本，
+        # done 的由主线程统一写 dep_registry，needs_ai/failed 的保留下轮 Claude 兜底。
+        if action == "evaluate_main":
             target = sv.get("target", "")
-            mode = "top-level" if action == "evaluate_main" else "dependency"
-            constraint = sv.get("constraint", "")
-            # 读取 upstream URL
             url = ""
             version = ""
-            if mode == "dependency":
-                _dep_path = session_dir / "dep_registry.json"
-                if _dep_path.exists():
-                    _dep_reg = json.loads(_dep_path.read_text())
-                    url = _dep_reg.get(target, {}).get("url", "")
-            else:
-                _sess_path = session_dir / "session.json"
-                if _sess_path.exists():
-                    _sess = json.loads(_sess_path.read_text())
-                    url = _sess.get("upstream_url", "")
-                    version = _sess.get("version", "")
+            _sess_path = session_dir / "session.json"
+            if _sess_path.exists():
+                _sess = json.loads(_sess_path.read_text())
+                url = _sess.get("upstream_url", "")
+                version = _sess.get("version", "")
 
             if url:
                 _log(r, job_id, f"[script] trying direct evaluate for {target}")
                 try:
                     rc = subprocess.run(
                         [sys.executable, str(RUN_EVALUATE),
-                         "--pkg", target, "--mode", mode,
-                         "--url", url, "--constraint", constraint,
+                         "--pkg", target, "--mode", "top-level",
+                         "--url", url, "--constraint", sv.get("constraint", ""),
                          "--version", version,
                          "--session-dir", str(session_dir)],
                         capture_output=True, text=True, timeout=300,
@@ -567,11 +561,11 @@ def run_job(r, proj, job_id):
                         result = json.loads(rc.stdout)
                         st = result.get("status", "")
                         if st == "done":
-                            _log(r, job_id, f"[script] {target} evaluate done (no Claude)")
-                            _clear_script_fail_count(session_dir, f"{action}:{target}")
+                            _log(r, job_id, f"[script] {target} evaluate_main done (no Claude)")
+                            _clear_script_fail_count(session_dir, f"evaluate_main:{target}")
                             write_event(session_dir, "loop.skip", "", {
                                 "loop": loop + 1,
-                                "action": action,
+                                "action": "evaluate_main",
                                 "target": target,
                                 "reason": "script_direct_evaluate",
                                 "script_result": "done",
@@ -579,28 +573,154 @@ def run_job(r, proj, job_id):
                             loop += 1
                             continue
                         if st == "failed":
-                            fail_count = _bump_script_fail_count(session_dir, f"{action}:{target}")
-                            _log(r, job_id, f"[script] {target} evaluate failed ({fail_count}/{MAX_SCRIPT_FAILS}): {result.get('reason', '')}")
+                            fail_count = _bump_script_fail_count(session_dir, f"evaluate_main:{target}")
+                            _log(r, job_id, f"[script] {target} evaluate_main failed ({fail_count}/{MAX_SCRIPT_FAILS})")
                             write_event(session_dir, "loop.skip", "", {
-                                "loop": loop + 1,
-                                "action": action,
-                                "target": target,
-                                "reason": "script_direct_evaluate",
-                                "script_result": "failed",
-                                "fail_count": fail_count,
+                                "loop": loop + 1, "action": "evaluate_main",
+                                "target": target, "reason": "script_direct_evaluate",
+                                "script_result": "failed", "fail_count": fail_count,
                             })
                             if fail_count < MAX_SCRIPT_FAILS:
-                                # 未达熔断阈值：下一轮重试（循环间隔天然退避）
                                 loop += 1
                                 continue
-                            # 达到熔断阈值：脚本解决不了，fall through 交 Claude 决策
                             _log(r, job_id, f"[script] {target} 连续 failed {fail_count} 次，falling back to Claude")
-                        # st == "needs_ai" → fall through to Claude
                         _log(r, job_id, f"[script] {target} needs_ai, falling back to Claude")
                     else:
                         _log(r, job_id, f"[script] {target} script error (rc={rc.returncode}), falling back to Claude")
                 except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
                     _log(r, job_id, f"[script] {target} exception: {e}, falling back to Claude")
+            # evaluate_main 脚本失败 → 下轮 supervisor 重新路由
+
+        elif action == "evaluate":
+            target = sv.get("target", "")
+            _dep_path = session_dir / "dep_registry.json"
+            if not _dep_path.exists():
+                loop += 1
+                continue
+            _dep_reg = json.loads(_dep_path.read_text())
+
+            # 收集所有 pending_evaluate 且有 url 的依赖
+            pending = [(d, info) for d, info in _dep_reg.items()
+                       if isinstance(info, dict)
+                       and info.get("status") == "pending_evaluate"
+                       and info.get("url")]
+
+            if not pending:
+                loop += 1
+                continue
+
+            if len(pending) == 1:
+                # ── 单 dep：沿用现有逻辑（可 fall through 到 Claude） ──
+                d_name, d_info = pending[0]
+                url = d_info.get("url", "")
+                constraint = d_info.get("constraint", "")
+                _log(r, job_id, f"[script] trying direct evaluate for {d_name}")
+                try:
+                    rc = subprocess.run(
+                        [sys.executable, str(RUN_EVALUATE),
+                         "--pkg", d_name, "--mode", "dependency",
+                         "--url", url, "--constraint", constraint,
+                         "--session-dir", str(session_dir)],
+                        capture_output=True, text=True, timeout=300,
+                    )
+                    if rc.returncode == 0:
+                        result = json.loads(rc.stdout)
+                        st = result.get("status", "")
+                        if st == "done":
+                            _log(r, job_id, f"[script] {d_name} evaluate done (no Claude)")
+                            _clear_script_fail_count(session_dir, f"evaluate:{d_name}")
+                            write_event(session_dir, "loop.skip", "", {
+                                "loop": loop + 1, "action": "evaluate",
+                                "target": d_name, "reason": "script_direct_evaluate",
+                                "script_result": "done",
+                            })
+                            loop += 1
+                            continue
+                        if st == "failed":
+                            fail_count = _bump_script_fail_count(session_dir, f"evaluate:{d_name}")
+                            _log(r, job_id, f"[script] {d_name} evaluate failed ({fail_count}/{MAX_SCRIPT_FAILS}): {result.get('reason','')}")
+                            write_event(session_dir, "loop.skip", "", {
+                                "loop": loop + 1, "action": "evaluate",
+                                "target": d_name, "reason": "script_direct_evaluate",
+                                "script_result": "failed", "fail_count": fail_count,
+                            })
+                            if fail_count < MAX_SCRIPT_FAILS:
+                                loop += 1
+                                continue
+                            _log(r, job_id, f"[script] {d_name} 连续 failed {fail_count} 次，falling back to Claude")
+                        # needs_ai → fall through to Claude
+                        _log(r, job_id, f"[script] {d_name} needs_ai, falling back to Claude")
+                    else:
+                        _log(r, job_id, f"[script] {d_name} script error (rc={rc.returncode}), falling back to Claude")
+                except (subprocess.TimeoutExpired, json.JSONDecodeError, OSError) as e:
+                    _log(r, job_id, f"[script] {d_name} exception: {e}, falling back to Claude")
+                # fall through → Claude 处理这个 dep
+
+            else:
+                # ── 多 dep 并行脚本 → 主线程统一写 registry ──
+                _log(r, job_id, f"[script] parallel evaluate {len(pending)} deps: {[d[0] for d in pending]}")
+
+                def _eval_one(dep_name, dep_info):
+                    url_d = dep_info.get("url", "")
+                    constraint_d = dep_info.get("constraint", "")
+                    try:
+                        proc = subprocess.run(
+                            [sys.executable, str(RUN_EVALUATE),
+                             "--pkg", dep_name, "--mode", "dependency",
+                             "--url", url_d, "--constraint", constraint_d,
+                             "--session-dir", str(session_dir),
+                             "--no-update-registry"],
+                            capture_output=True, text=True, timeout=300,
+                        )
+                        if proc.returncode == 0:
+                            return dep_name, json.loads(proc.stdout)
+                        return dep_name, {"status": "failed", "reason": f"rc={proc.returncode}"}
+                    except subprocess.TimeoutExpired:
+                        return dep_name, {"status": "failed", "reason": "timeout"}
+                    except Exception as e:
+                        return dep_name, {"status": "failed", "reason": str(e)}
+
+                done_count = 0
+                failed_count = 0
+                needs_ai_list = []
+                with ThreadPoolExecutor(max_workers=min(len(pending), 8)) as pool:
+                    futures = {pool.submit(_eval_one, d[0], d[1]): d[0] for d in pending}
+                    for f in as_completed(futures):
+                        dep_name = futures[f]
+                        try:
+                            _, result = f.result()
+                        except Exception as e:
+                            _log(r, job_id, f"[script] {dep_name} thread error: {e}")
+                            failed_count += 1
+                            continue
+                        st = result.get("status", "")
+                        if st == "done":
+                            _dep_reg[dep_name]["status"] = "evaluate_done"
+                            lang = result.get("lang", "")
+                            if lang:
+                                _dep_reg[dep_name]["lang"] = lang
+                            done_count += 1
+                            _clear_script_fail_count(session_dir, f"evaluate:{dep_name}")
+                            write_event(session_dir, "loop.skip", "", {
+                                "loop": loop + 1, "action": "evaluate",
+                                "target": dep_name, "reason": "script_parallel_evaluate",
+                                "script_result": "done",
+                            })
+                        else:
+                            _log(r, job_id, f"[script] {dep_name} {st} (keep pending_evaluate → Claude fallback next round)")
+                            failed_count += 1
+                            if st == "needs_ai":
+                                needs_ai_list.append(dep_name)
+
+                # 主线程统一写入 dep_registry（唯一写者，无竞争）
+                (session_dir / "dep_registry.json").write_text(
+                    json.dumps(_dep_reg, ensure_ascii=False, indent=2))
+
+                _log(r, job_id,
+                     f"[script] parallel done: {done_count} done, {failed_count} pending "
+                     f"(needs_ai={needs_ai_list}, will fallback to Claude next round)")
+                loop += 1
+                continue
 
         if not action:
             _finish_with_timeline(r, job_id, session_dir, "failed",

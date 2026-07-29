@@ -42,7 +42,8 @@ def _write_json(path: Path, data: dict) -> None:
 
 
 def run(session_dir: Path, pkgname: str, mode: str, url: str,
-        constraint: str = "", version: str = "") -> dict:
+        constraint: str = "", version: str = "",
+        no_update_registry: bool = False) -> dict:
     """Run check + gate. Returns {"status": "done"|"needs_ai"|"failed", ...}."""
     reports_dir = session_dir / "pkgs" / pkgname
     sources_dir = session_dir / "sources"
@@ -124,15 +125,16 @@ def run(session_dir: Path, pkgname: str, mode: str, url: str,
         lang = (gate.get("result") or {}).get("lang", "")
         version_detected = (gate.get("result") or {}).get("version", "")
 
-        # Update dep_registry
-        reg_path = session_dir / "dep_registry.json"
-        if reg_path.exists() and mode == "dependency":
-            reg = _read_json(reg_path)
-            if pkgname in reg:
-                reg[pkgname]["status"] = "evaluate_done"
-                if lang:
-                    reg[pkgname]["lang"] = lang
-                _write_json(reg_path, reg)
+        # Update dep_registry（并行模式下由 job_runner 主线程统一写入）
+        if not no_update_registry:
+            reg_path = session_dir / "dep_registry.json"
+            if reg_path.exists() and mode == "dependency":
+                reg = _read_json(reg_path)
+                if pkgname in reg:
+                    reg[pkgname]["status"] = "evaluate_done"
+                    if lang:
+                        reg[pkgname]["lang"] = lang
+                    _write_json(reg_path, reg)
 
         # 依赖提取与注册（等价于 pkg-evaluator Phase 3）
         # 脚本直调路径跳过了 agent，需在此补上 evaluate-deps.py
@@ -200,6 +202,8 @@ def main() -> int:
     parser.add_argument("--constraint", default="")
     parser.add_argument("--version", default="")
     parser.add_argument("--session-dir", required=True)
+    parser.add_argument("--no-update-registry", action="store_true",
+                        help="不写 dep_registry（并行模式下由 job_runner 主线程统一写入）")
     args = parser.parse_args()
 
     session_dir = Path(args.session_dir)
@@ -210,6 +214,7 @@ def main() -> int:
         url=args.url,
         constraint=args.constraint,
         version=args.version,
+        no_update_registry=args.no_update_registry,
     )
     print(json.dumps(result, ensure_ascii=False))
     return 0 if result.get("status") in ("done", "failed") else 1
