@@ -89,7 +89,7 @@ cat "./pkgs/${PKGNAME}/ci_check_result.json" 2>/dev/null || true
 
 1. **先查 same_as_previous**：`build_failure_*.json` 中 `same_as_previous=true` 表示本轮错误与上轮相同，上轮修法未触及根因——**禁止沿用上轮修法**。
 2. **修法穷尽出口**：同一类别已连续 2 次 rebuild 且错误语义未变（对照 fix_instructions.md 历史判断）→ 直接判 `abort`，reason 写明"修法穷尽"。
-3. **失败分类**：读 `agents/pkg-introduce/failure-taxonomy.md`，结合 `${LANG}` 与错误报告语义对照判断类别 A-E（不要只做字面匹配）。类别 E 只对主包发生（dep 构建成功即 build_done，不做安装验证）。
+3. **失败分类**：读 `/app/.claude/skills/import-package-step/references/failure-taxonomy.md`，结合 `${LANG}` 与错误报告语义对照判断类别 A-E（不要只做字面匹配）。类别 E 只对主包发生（dep 构建成功即 build_done，不做安装验证）。
 4. **类别 B（缺依赖）verdict 由 `check_existing_package.py` 的 decision 写死映射**（不再两段式）：
    `reuse_official` / `reuse_copr_project` → `rebuild`（包名**无版本约束**加入 BuildRequires）；`introduce_new` → `retry-dep`（register 脚本注册依赖）。
 5. 输出**唯一** verdict：`retry-transient` / `retry-dep` / `rebuild` / `regenerate` / `abort`。
