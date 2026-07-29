@@ -832,7 +832,7 @@ def classify_dependency(dep: dict[str, Any], lang: str, source_index: dict[tuple
     # ── 级联检查（L0-L4）：统一使用 cascade_package_check，与主包同一套判定逻辑 ──
     # 级联内置了 L2（dnf repoquery）+ L0（COPR）/ L1（EUR）/ L3（gitcode），
     # 不再单独调 check_existing_package。
-    cascade = _enrich_via_cascade(dep_name, lang, dep.get("requirement", ""))
+    cascade = _enrich_via_cascade(dep.get("name", "") or dep.get("dep", ""), lang, dep.get("requirement", ""))
     if cascade:
         # 将级联结果映射为 pre_check 内部的 existing_check + decision 结构，
         # 保持后续 compat / build_system / constraint 等处理逻辑不变。
