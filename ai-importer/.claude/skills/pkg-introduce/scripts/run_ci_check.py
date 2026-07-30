@@ -158,11 +158,9 @@ def run_repoclosure(pkgs: list[str], chroot: str, copr_result_url: str) -> tuple
     """运行 repoclosure 检查运行时依赖。"""
     check = subprocess.run(["which", "repoclosure"], capture_output=True)
     if check.returncode != 0:
-        subprocess.run(["dnf", "install", "-y", "--quiet", "dnf-utils"],
-                       capture_output=True, timeout=60)
-        check = subprocess.run(["which", "repoclosure"], capture_output=True)
-        if check.returncode != 0:
-            return True, "[SKIP] repoclosure 不可用，跳过运行时依赖检查"
+        # repoclosure 由镜像内置（dnf-utils）提供；缺失视为环境异常，
+        # 显式失败而非静默跳过——跳过会让 CI 门禁形同虚设
+        return False, "repoclosure 不可用：镜像缺少 dnf-utils 包，需更新 worker 镜像"
 
     base = _chroot_repo_base(chroot)
     arch = _chroot_arch(chroot)
@@ -214,19 +212,34 @@ def run_builddep(pkg: str, spec_path: Path, chroot: str, copr_result_url: str) -
     if not spec_path.exists():
         return True, f"[SKIP] spec 文件不存在: {spec_path}"
 
+    # builddep 由镜像内置（dnf-plugins-core）提供；插件缺失时 dnf 报
+    # "No such command"，而失败判定只认 "Error:"，会静默误判为通过，
+    # 因此先显式探测，缺失即失败
+    try:
+        probe = subprocess.run(["dnf", "builddep", "--help"],
+                               capture_output=True, text=True, timeout=30)
+        unavailable = (probe.returncode != 0 or
+                       "No such command" in (probe.stdout + probe.stderr))
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        unavailable = True
+    if unavailable:
+        return False, "dnf builddep 不可用：镜像缺少 dnf-plugins-core 包，需更新 worker 镜像"
+
     base = _chroot_repo_base(chroot)
     arch = _chroot_arch(chroot)
     use_copr = bool(copr_result_url) and _copr_repo_accessible(copr_result_url)
 
     cmd = ["dnf", "builddep", "--assumeno"]
 
-    installroot = ""
+    # 始终使用空 installroot + --releasever=/，与宿主 pod 完全解耦：
+    # 否则宿主 @System 已装包会被当作已满足的 BuildRequires，
+    # worker 镜像里装过的包会掩盖缺失的 BR，检查结果随镜像内容变化。
+    # 跨架构（如 x86_64 pod 检查 aarch64 chroot）再加 --forcearch
+    # 让 dnf 按目标架构过滤包（否则架构相关包被排除，误报 No matching package）
+    installroot = tempfile.mkdtemp(prefix="ci-builddep-")
+    cmd += [f"--installroot={installroot}", "--releasever=/"]
     if base and arch != platform.machine():
-        # 跨架构检查（如 x86_64 pod 检查 aarch64 chroot）：
-        # --forcearch 让 dnf 按目标架构过滤包（否则架构相关包被排除，误报 No matching package）；
-        # 空 installroot 避免与宿主 @System 已装包冲突
-        installroot = tempfile.mkdtemp(prefix="ci-builddep-")
-        cmd += [f"--forcearch={arch}", f"--installroot={installroot}", "--releasever=/"]
+        cmd += [f"--forcearch={arch}"]
 
     if base:
         cmd += [
@@ -248,12 +261,10 @@ def run_builddep(pkg: str, spec_path: Path, chroot: str, copr_result_url: str) -
     cmd.append(str(spec_path))
 
     # 空 installroot 需重新下载仓库元数据，放宽超时
-    timeout = 300 if installroot else 120
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     finally:
-        if installroot:
-            shutil.rmtree(installroot, ignore_errors=True)
+        shutil.rmtree(installroot, ignore_errors=True)
     combined = result.stdout + result.stderr
     # --assumeno 成功时返回非零（拒绝安装），只有含 Error 才是真正失败
     failed = ("Error:" in combined and
