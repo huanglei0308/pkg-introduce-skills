@@ -43,6 +43,10 @@ def main():
         br["build_log_tail"] = build_log[-2000:] if build_log else ""
 
     br["copr_build_id"] = copr.get("copr_build_id")
+    # 多 chroot 字段透传（worker 写入 copr_build_result.json 时才有；缺省保持旧结构）
+    for key in ("copr_chroots", "copr_build_ids", "copr_chroot"):
+        if copr.get(key):
+            br[key] = copr[key]
     br_path.write_text(json.dumps(br, indent=2, ensure_ascii=False), encoding="utf-8")
     print(f"[sync-copr-result] {args.pkg}: copr_status={copr_status} → build_rpm_result.status={br['status']}")
 

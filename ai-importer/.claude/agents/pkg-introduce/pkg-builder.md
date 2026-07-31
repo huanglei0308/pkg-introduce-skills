@@ -62,34 +62,46 @@ UPSTREAM_URL="${DEP_URL:-$SESSION_UPSTREAM_URL}"
 LESSONS_FILE="$BUILD_RPM_DIR/lessons/${LANG}.json"
 LESSONS_ARG=""; [ -f "$LESSONS_FILE" ] && LESSONS_ARG="--lessons $LESSONS_FILE"
 
-# 读取目标 chroot 的构建工具链清单（manifest 不存在时跳过）
-TOOLCHAIN_FILE=""
-for f in ./toolchain_*.json; do
-  [ -f "$f" ] && TOOLCHAIN_FILE="$f" && break
+# 读取全部目标 chroot 的构建工具链清单（每个 chroot 一份 toolchain_<chroot>.json，缺失的 chroot 跳过）
+# 多 chroot 环境变量：COPR_CHROOTS=全部目标 chroot（逗号分隔）；
+# COPR_BUILD_CHROOTS=本轮可提交子集（supervisor 注入，未设置时回退 COPR_CHROOTS）
+TOOLCHAIN_FILES=""
+for c in ${COPR_CHROOTS//,/ }; do
+  f="./toolchain_${c}.json"
+  [ -f "$f" ] && TOOLCHAIN_FILES="$TOOLCHAIN_FILES $f"
 done
 ```
 
 ## 构建工具链约束（强制）
 
-`toolchain_<chroot>.json` 是当前 chroot 官方源中构建工具（golang、rust、cmake、python3-setuptools 等）的版本清单，作为**全局约束**：
+`toolchain_<chroot>.json` 是对应 chroot 官方源中构建工具（golang、rust、cmake、python3-setuptools 等）的版本清单，**每个目标 chroot 各有一份**，作为**全局约束**：
 
-- **只能用清单里的版本**，禁止在 spec 中写 `BuildRequires: <tool> >= <高于清单的版本>`；
-- 若上游源码要求更高版本（如 go.mod 写 `go 1.23` 但清单只有 1.21.4），正确做法是**修改源码/ spec 适应当前 chroot 版本**，而不是引入新版工具链；
+- **BuildRequires 版本约束取各 chroot manifest 的交集**：逐 chroot 读取 `$TOOLCHAIN_FILES`，同一工具以各 chroot 中的**最低公共版本**为准，禁止在 spec 中写 `BuildRequires: <tool> >= <高于任一 chroot 清单的版本>`；
+- 若上游源码要求更高版本（如 go.mod 写 `go 1.23` 但某 chroot 清单只有 1.21.4），正确做法是**修改源码/ spec 适应该 chroot 版本**（差异用 `%if 0%{?openeuler}` 等条件宏限定范围），而不是引入新版工具链；
 - 对 Python build backend（setuptools、flit-core、hatchling 等），spec 中 `BuildRequires` 不带版本约束，mock 会装源里版本；
 - 绝不允许因为工具链版本不足而触发 dep_registry 引入该工具链。
 
-生成 spec 前，先检查 `$TOOLCHAIN_FILE`：
+生成 spec 前，先逐 chroot 检查 `$TOOLCHAIN_FILES`：
 
 ```bash
-if [ -n "$TOOLCHAIN_FILE" ]; then
+for f in $TOOLCHAIN_FILES; do
   python3 -c "
-import json, sys
-m = json.load(open('$TOOLCHAIN_FILE'))
+import json
+m = json.load(open('$f'))
+print('[toolchain] manifest = $f')
 for t, info in m.get('toolchain', {}).items():
     if info.get('available'):
         print(f'[toolchain] {t} = {info[\"version\"]}')"
-fi
+done
 ```
+
+## 多 chroot spec 纪律（强制）
+
+**一份 spec 覆盖全部目标 chroot（`$COPR_CHROOTS`）**——同一份 SRPM 会在每个目标 chroot 上独立重建：
+
+- 架构/版本差异**一律用条件宏表达**：`%ifarch` / `%ifnarch` 处理架构差异，`%if 0%{?openeuler}` 处理 OS 版本差异；
+- **禁止硬编码 x86_64 路径**（如写死 `/usr/lib64`）与**架构专属编译 flags**（如 `-m64`、x86 专属 `-march=`）；安装路径一律用 `%{_libdir}`、`%{_bindir}` 等宏；
+- 确需架构专属处理时，条件块必须同时给出其他架构的合理分支，不得让一个 chroot 的适配破坏另一个 chroot 的构建。
 
 ## 阶段一：调用 build-rpm skill 生成 spec + SRPM
 
@@ -128,7 +140,7 @@ build-rpm skill 在 COPR 模式下（无 `SESSION_CONTAINER`）：
    "
    ```
 
-7. 提交 COPR 构建，`copr_client.py` 直接写 `build_rpm_result.json`
+7. 提交 COPR 构建，`copr_client.py` 直接写 `build_rpm_result.json`。提交范围为 `$COPR_BUILD_CHROOTS`（supervisor 注入的**本轮可提交 chroot 子集**——依赖在部分 chroot 未就绪时先交子集，可能小于 `$COPR_CHROOTS`）；未设置时用 `$COPR_CHROOTS` 全量。
 
 读取 `./pkgs/${PKGNAME}/build_rpm_result.json` 的 `status`：
 
@@ -182,5 +194,6 @@ echo "${PKGNAME}" >> ./build_state/introduced.txt
 
 - 输入状态：supervisor 路由 build_dep/build_main 且 `pkgs/<pkg>/<pkg>.spec` 不存在时唤起（首次构建；spec 已存在的修复场景归 pkg-fixer）。
 - 产物及消费者：`pkgs/<pkg>/<pkg>.spec` + `srpms/*.src.rpm` → pkg-fixer 修复/重交的基准；`build_rpm_result.json` → supervisor 决定后续路由（copr_running 轮询 / dep_needed 注册依赖 / failed 走修复）；`build_state/introduced.txt` → 归档。
+- `build_rpm_result.json` 多 chroot 结构（copr_client.py 写入，不要手改）：`copr_build_id` / `copr_chroot` 保留（主 chroot，兼容旧消费者）；新增 `copr_chroots`（本轮提交的全部 chroot，list）与 `copr_build_ids`（`{chroot: build_id}` 映射）。
 - 预算与熔断：spec 内容自检最多 2 次，第 2 次失败必须写 `build_rpm_result.json`（status=failed）后退出；什么都不写直接退出会让 supervisor 无感知自旋到 max_loops。
 - 异常出口：URL 缺失、skill 失败、自检两次失败等无法完成时，写 `build_rpm_result.json`（status=failed/interrupted + failure_reason）再退出；无 copr_build_id 的 failed（自检失败）由 supervisor 路由回本 agent 重建（重试上限后 fail 全单），已有 COPR 提交的 failed 才进入 pkg-fixer 修复流程，修复不了由 fixer 判 abort 终止全单。

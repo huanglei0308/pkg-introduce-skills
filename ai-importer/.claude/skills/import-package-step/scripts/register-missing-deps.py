@@ -74,6 +74,9 @@ def main():
             continue
         constraint = _extract_constraint(log_text, rpm_pkg)
         if pkg_name not in reg:
+            # 新条目不带 chroots 键：evaluate 阶段 chroot 无关（§8.1），
+            # per-chroot 状态由构建阶段的 step_supervisor 按需建立；
+            # 已有条目走整字典读-改-写，chroots 等未知键天然保留。
             reg[pkg_name] = {
                 "url": "",
                 "constraint": constraint,

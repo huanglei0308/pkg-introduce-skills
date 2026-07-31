@@ -24,7 +24,8 @@
   7  --reuse-srpm 但 srpms/ 下无可用 SRPM
 
 用法：
-  python3 submit_fix.py --session-dir . --pkg git [--chroot openeuler-24.03-x86_64] [--reuse-srpm]
+  python3 submit_fix.py --session-dir . --pkg git [--chroots a-x86_64,a-aarch64] [--reuse-srpm]
+  python3 submit_fix.py --session-dir . --pkg git [--chroot openeuler-24.03-x86_64] [--all-chroots]
 """
 
 import argparse
@@ -40,6 +41,8 @@ from timeline import write_event
 
 # build-rpm skill 的 COPR 提交脚本（相对于本脚本：skills/build-rpm/scripts/copr_client.py）
 _COPR_CLIENT = Path(__file__).resolve().parent.parent.parent / "build-rpm" / "scripts" / "copr_client.py"
+# 复用 copr_client 的 chroot 解析/主 chroot 规则（lazy import，存在性由 main() 检查）
+sys.path.insert(0, str(_COPR_CLIENT.parent))
 
 
 def _fail(code: int, stage: str, msg: str) -> int:
@@ -172,8 +175,51 @@ def _stale_gate(srpm: Path, pkg: str, spec_path: Path) -> int:
     return 0
 
 
-def _submit(sd: Path, pkg: str, srpm: Path, chroot: str, session: dict) -> tuple[str, int]:
+def _failed_chroots(sd: Path, pkg: str, chroots: list) -> list:
+    """dep_registry.json 中该包 per-chroot status == "failed" 的 chroot（保持入参顺序）。
+
+    无 dep_registry / 无该包条目 / 条目无 per-chroot "chroots" 映射（旧单 chroot
+    session）时返回 []，调用方退化为全量重交，行为与旧版一致。
+    """
+    reg_path = sd / "dep_registry.json"
+    if not reg_path.exists():
+        return []
+    try:
+        entry = _read_json(reg_path).get(pkg, {})
+    except Exception:
+        return []
+    chroot_map = entry.get("chroots") if isinstance(entry, dict) else None
+    if not isinstance(chroot_map, dict):
+        return []
+    return [c for c in chroots
+            if isinstance(chroot_map.get(c), dict) and chroot_map[c].get("status") == "failed"]
+
+
+def _resolve_chroots(args, session: dict, sd: Path) -> list:
+    """解析本次重交的 chroot 集合。
+
+    来源优先级：--chroots/--chroot 参数 > COPR_BUILD_CHROOTS 环境变量
+    > session.json["copr_chroots"] > session.json["copr_chroot"]。
+    未显式指定且未加 --all-chroots 时，默认只重交 dep_registry 中 failed 的
+    chroot 子集（增量重建）；无 per-chroot 信息时退化为全量（旧行为）。
+    """
+    from copr_client import parse_chroots
+
+    explicit = parse_chroots(args.chroots) or parse_chroots(args.chroot)
+    if explicit:
+        return explicit
+    full = (parse_chroots(os.environ.get("COPR_BUILD_CHROOTS"))
+            or parse_chroots(session.get("copr_chroots"))
+            or parse_chroots(session.get("copr_chroot")))
+    if not full or args.all_chroots:
+        return full
+    return _failed_chroots(sd, args.pkg, full) or full
+
+
+def _submit(sd: Path, pkg: str, srpm: Path, chroots: list, session: dict) -> tuple[str, int]:
     """调 copr_client.py 提交；成功返回 (新 copr_build_id, 0)。"""
+    from copr_client import primary_chroot
+
     result_json = sd / "pkgs" / pkg / "build_rpm_result.json"
     old_build_id = ""
     if result_json.exists():
@@ -190,11 +236,12 @@ def _submit(sd: Path, pkg: str, srpm: Path, chroot: str, session: dict) -> tuple
         "COPR_PROJECT": session.get("copr_project", ""),
         "COPR_API_LOGIN": session.get("copr_login", ""),
         "COPR_API_TOKEN": session.get("copr_token", ""),
-        "COPR_CHROOT": chroot,
+        "COPR_CHROOT": primary_chroot(chroots),
+        "COPR_CHROOTS": ",".join(chroots),
     })
     proc = subprocess.run(
         [sys.executable, str(_COPR_CLIENT), str(srpm),
-         "--output", str(result_json), "--chroot", chroot],
+         "--output", str(result_json), "--chroots", ",".join(chroots)],
         cwd=sd, env=env, capture_output=True, text=True,
     )
     if proc.returncode != 0:
@@ -214,7 +261,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="fixer 修复后重新提交 COPR 构建（原子）")
     parser.add_argument("--session-dir", required=True)
     parser.add_argument("--pkg", required=True)
-    parser.add_argument("--chroot", default="", help="目标 chroot（缺省从 session.json 读）")
+    parser.add_argument("--chroot", default="",
+                        help="单个目标 chroot（等价 --chroots 单元素；缺省从环境/session 解析）")
+    parser.add_argument("--chroots", default="",
+                        help="目标 chroot 列表，逗号分隔（显式指定时按原样提交，优先级最高）")
+    parser.add_argument("--all-chroots", action="store_true",
+                        help="全量重交所有目标 chroot（默认只重交 dep_registry 中 failed 的 chroot）")
     parser.add_argument("--reuse-srpm", action="store_true",
                         help="复用 srpms/ 下最新 SRPM 直接提交（仅 retry-transient）")
     args = parser.parse_args()
@@ -228,11 +280,11 @@ def main() -> int:
     if not session_file.exists():
         return _fail(1, "env", f"session.json 不存在: {session_file}")
     session = _read_json(session_file)
-    chroot = args.chroot or session.get("copr_chroot", "")
-    if not chroot:
-        return _fail(1, "env", "chroot 未知（--chroot 未给且 session.json 无 copr_chroot）")
     if not _COPR_CLIENT.exists():
         return _fail(1, "env", f"copr_client.py 不存在: {_COPR_CLIENT}")
+    chroots = _resolve_chroots(args, session, sd)
+    if not chroots:
+        return _fail(1, "env", "chroot 未知（--chroots/--chroot 未给且环境/session.json 无 chroot 信息）")
 
     if args.reuse_srpm:
         # 原样重交：取 srpms/ 下最新 SRPM，跳过重打和闸门
@@ -256,7 +308,7 @@ def main() -> int:
         if rc != 0:
             return rc
 
-    new_build_id, rc = _submit(sd, pkg, srpm, chroot, session)
+    new_build_id, rc = _submit(sd, pkg, srpm, chroots, session)
     if rc != 0:
         return rc
 
@@ -276,6 +328,7 @@ def main() -> int:
         spec_md5 = hashlib.md5(spec_path.read_bytes()).hexdigest()
     write_event(sd, "build.submitted", pkg, {
         "build_id": new_build_id,
+        "chroots": chroots,
         "srpm": srpm.name,
         "submitted_by": "submit_fix.py",
         "spec_md5": spec_md5,
@@ -287,7 +340,7 @@ def main() -> int:
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(spec_path, snapshot_dir / f"spec_{new_build_id}.spec")
 
-    print(f"[submit_fix] OK: submitted build_id={new_build_id} srpm={srpm.name}")
+    print(f"[submit_fix] OK: submitted build_id={new_build_id} chroots={','.join(chroots)} srpm={srpm.name}")
     return 0
 
 

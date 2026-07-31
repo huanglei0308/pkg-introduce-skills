@@ -43,7 +43,8 @@ cd "$SESSION_DIR"
 
 # 一次性读取 session.json 所有字段
 eval "$(python3 $READ_SESSION --session-dir .)"
-# 产出：COPR_FRONTEND_URL, COPR_OWNER, COPR_PROJECT, COPR_API_LOGIN, COPR_API_TOKEN, COPR_CHROOT, SESSION_UPSTREAM_URL
+# 产出：COPR_FRONTEND_URL, COPR_OWNER, COPR_PROJECT, COPR_API_LOGIN, COPR_API_TOKEN, COPR_CHROOT, COPR_CHROOTS, SESSION_UPSTREAM_URL
+# COPR_CHROOT=主 chroot（兼容字段）；COPR_CHROOTS=全部目标 chroot（逗号分隔），reuse 检查要逐个覆盖
 
 # 读取 URL（top-level 从 session.json，dependency 从 dep_registry.json）
 if [ "$MODE" = "top-level" ]; then
@@ -118,6 +119,8 @@ python3 $PKG_INTRODUCE_DIR/scripts/run_gate.py \
 GATE_RC=$?
 ```
 
+> **多 chroot reuse 检查（强制）**：reuse 判定必须对 `$COPR_CHROOTS` 中**每个 chroot 各查一次**官方源 / COPR 项目源——x86_64 源里有不代表 aarch64 源里有。`--copr-chroot "$COPR_CHROOT"` 传的是主 chroot（兼容入参）；逐 chroot 的 reuse 结果写入 dep_registry 条目的 `chroots` 映射（`chroots[<chroot>].status=reused`）。**评估的其余部分（活跃度 / 许可证 / 版本识别）是 chroot 无关的，只执行一次**，不要按 chroot 重复执行。
+
 **GATE_RC=1：** 在 gate_result 中已写失败原因，直接退出。
 
 ### Phase 3：依赖评估与注册（仅 introduce_new 类决策）
@@ -168,6 +171,6 @@ gate_result_$PKGNAME.json 已由 run_gate.py 写入，lead 直接读取：
 ## 契约
 
 - 输入状态：supervisor 路由 evaluate_main（主包 gate_result 缺失/无效）或 evaluate（dep 处于 pending_evaluate）时唤起。
-- 产物及消费者：`gate_result_<pkg>.json`（decision/lang/version）→ supervisor 决定 reuse 直完、进入构建还是 evaluate_failed 待分析；`check_result_<pkg>.json` → pkg-evaluate-analyzer 失败诊断的输入。`evaluate_deps_<pkg>.json`（依赖评估摘要）→ 记录用。`dep_registry.json`（由 evaluate-deps.py 通过 register-dep.py 写入）→ supervisor 在 build_main 前调度依赖构建。
+- 产物及消费者：`gate_result_<pkg>.json`（decision/lang/version）→ supervisor 决定 reuse 直完、进入构建还是 evaluate_failed 待分析；`check_result_<pkg>.json` → pkg-evaluate-analyzer 失败诊断的输入。`evaluate_deps_<pkg>.json`（依赖评估摘要）→ 记录用。`dep_registry.json`（由 evaluate-deps.py 通过 register-dep.py 写入）→ supervisor 在 build_main 前调度依赖构建。dep_registry 条目带 `chroots` 映射（`{chroot: {status, build_id}}`，状态词表 pending/building/build_done/failed/reused/skipped）：reuse 检查按 chroot 逐个执行并写 `chroots[<chroot>].status=reused`，supervisor 据此按 chroot 判定依赖就绪。
 - 预算与熔断：evaluate 失败由 analyze_evaluate 判 retry/abort，retry 时带 `evaluate_retry_hint.txt` 重试（Phase 0 必读）；无 hint 的反复失败最终由 analyzer 判 abort 终止。
 - 异常出口：check 失败写 `gate_result`（decision=check_failed + reason）后退出；Gradle 等确定性不可构建场景直接按 check_failed 写原因，不做任何构建尝试。

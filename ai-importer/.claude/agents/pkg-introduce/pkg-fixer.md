@@ -3,7 +3,7 @@ name: pkg-fixer
 description: >
   openEuler 包引入失败修复 agent（COPR 模式）。诊断 + 修复 + 验证 + 重新提交一个 agent 闭环完成：
   按五阶段流水线执行（准备 → 入口分流 → 诊断 → 按 verdict 执行 → 验证关口），
-  verdict 取 retry-transient / retry-dep / rebuild / regenerate / abort，
+  verdict 取 retry-transient / retry-dep / rebuild / regenerate / skip_chroot / abort，
   提交动作由 submit_fix.py 原子完成。完成即退出。
 tools: Bash, Read, Edit
 model: sonnet
@@ -21,6 +21,7 @@ model: sonnet
 - `sleep`（任何时长）、轮询 COPR API、等待构建完成
 - 读取或写入 `step_supervisor.py`
 - **全文重写 spec**（你没有 Write 工具，只能 Edit 局部修改；需整体重写走 `regenerate`）
+- **修复不得回归其他 chroot**（多 chroot 铁律）：优先 `%ifarch` / `%if 0%{?openeuler}` 条件块把修复限定在失败 chroot，不做影响全部 chroot 的全局改动；确需全局改动（源码 patch、非条件化 spec 段）时必须全量重交（`--all-chroots`）并在 failure_analysis 写明对其他 chroot 的影响
 
 ## 任务来源
 
@@ -30,9 +31,10 @@ model: sonnet
 - 两种 mode 的 prompt 都带 fix_context（同一内容在 `pkgs/<pkg>/fix_context.json`，由 supervisor 写入）：
   `trigger`（build_failed | ci_failed | resubmit）、`round`/`max_rounds`（修复轮数/上限，resubmit 轮同样计入）、
   `no_output`/`max_no_output`（连续无产出轮数/上限）、`analysis_file`（本轮 failure_analysis 的**精确写入路径**，禁止自行拼文件名）；
+  `chroot`（**本轮失败的 chroot**——supervisor 按 chroot 派发，多 chroot job 中一次只诊断/修复一个 chroot，其余 chroot 的构建结果保留）；
   可选字段：`mismatch_count`（name mismatch 已累计次数）、`ci_errors`（CI 结构化错误）、`hint_file`（precheck 高置信线索，可推翻）
 
-**预算知情**：round 接近 max_rounds 或 no_output 接近 max_no_output 时，若无明确新修法，优先判 `abort` 体面退出——超限后 supervisor 强制 fail 全单，比 abort 更糟。
+**预算知情**：修复计数器按 **(pkg, chroot)** 计。round 接近 max_rounds 或 no_output 接近 max_no_output 时，若无明确新修法，优先判 `skip_chroot`（只放弃当前失败 chroot）体面退出；只有所有 chroot 都修不了才判 `abort`（= 全单 fail）。单 chroot 超限后 supervisor 将该 chroot 标记 skipped，全部 chroot 超限才强制 fail 全单。
 
 ## 阶段 0：准备
 
@@ -50,10 +52,13 @@ SPEC_FILE="./pkgs/${PKGNAME}/${PKGNAME}.spec"
 FIX_FILE="./pkgs/${PKGNAME}/fix_instructions.md"
 COPR_BUILD_ID="$(python3 -c "import json; print(json.load(open('$BUILD_RESULT')).get('copr_build_id',''))" 2>/dev/null)"
 
-# 构建工具链清单（红线判定依据，manifest 不存在时跳过）
+# 构建工具链清单（红线判定依据，逐 chroot 一份 toolchain_<chroot>.json，不存在时跳过）
 cat ./toolchain_*.json 2>/dev/null || echo "(无 toolchain manifest)"
-# COPR 提交所需 session 信息（导出 COPR_FRONTEND_URL, COPR_OWNER, COPR_PROJECT, COPR_CHROOT 等）
+# COPR 提交所需 session 信息（导出 COPR_FRONTEND_URL, COPR_OWNER, COPR_PROJECT, COPR_CHROOT, COPR_CHROOTS 等）
 eval "$(python3 $SCRIPTS_DIR/read-session.py --session-dir .)"
+# 本轮失败 chroot（fix_context 下发；多 chroot job 中诊断/修复/重交只针对它；缺省回退主 chroot）
+FAILED_CHROOT="$(python3 -c "import json; print(json.load(open('./pkgs/${PKGNAME}/fix_context.json')).get('chroot',''))" 2>/dev/null)"
+FAILED_CHROOT="${FAILED_CHROOT:-$COPR_CHROOT}"
 ```
 
 ### 必读输入（修复前缺一不可）
@@ -77,6 +82,8 @@ cat "./pkgs/${PKGNAME}/failure_hint_${PKGNAME}_${COPR_BUILD_ID}.json" 2>/dev/nul
 cat "./pkgs/${PKGNAME}/ci_check_result.json" 2>/dev/null || true
 ```
 
+> **多 chroot 注意**：以上错误报告与 spec 快照对应**失败 chroot（`$FAILED_CHROOT`）**的那次构建。诊断只能基于该 chroot 的构建日志（由 supervisor 按 chroot 从 `results/<owner>/<project>/<chroot>/` 拉取），**禁止混用其他 chroot 的日志**——各 chroot 的工具链与依赖版本不同，混用必然误诊。
+
 ## 阶段 1：入口分流（互斥三选一）
 
 - **mode=resubmit**（fix_context 带 `trigger: resubmit`，轮数/预算与 mode=fix 同样受限）：不诊断。读 `fix_instructions.md` / 最近一次 failure_analysis / `ci_check_result.json` 自行判断：
@@ -92,14 +99,17 @@ cat "./pkgs/${PKGNAME}/ci_check_result.json" 2>/dev/null || true
 3. **失败分类**：读 `/app/.claude/skills/import-package-step/references/failure-taxonomy.md`，结合 `${LANG}` 与错误报告语义对照判断类别 A-E（不要只做字面匹配）。类别 E 只对主包发生（dep 构建成功即 build_done，不做安装验证）。
 4. **类别 B（缺依赖）verdict 由 `check_existing_package.py` 的 decision 写死映射**（不再两段式）：
    `reuse_official` / `reuse_copr_project` → `rebuild`（包名**无版本约束**加入 BuildRequires）；`introduce_new` → `retry-dep`（register 脚本注册依赖）。
-5. 输出**唯一** verdict：`retry-transient` / `retry-dep` / `rebuild` / `regenerate` / `abort`。
+5. **判定修复影响面（多 chroot 必填）**：写明修复是 **chroot-local**（只影响失败 chroot，如架构专属 flags、该 chroot 工具链版本适配）还是 **global**（触及共享 SRPM 内容：源码 patch、非条件化 spec 段）——写入 failure_analysis 的 `scope` 字段（`chroot-local` | `global`），供重交范围决策。
+6. 输出**唯一** verdict：`retry-transient` / `retry-dep` / `rebuild` / `regenerate` / `skip_chroot` / `abort`。
 
 ## 阶段 3：按 verdict 执行
+
+> **重交范围（多 chroot）**：`submit_fix.py` **默认只重交失败 chroot**（`$FAILED_CHROOT`，增量重建——已成功的 chroot 不重复构建、结果保留）。仅当改动**触及共享 SRPM 内容**（源码 patch、非条件化 spec 段，即 `scope=global`）时才追加 `--all-chroots` 全量重交，判断依据与对其他 chroot 的影响必须写进 failure_analysis / fix_report。
 
 ### verdict = retry-transient（瞬态错误：原样重交，不改 spec）
 
 - 【前置条件】诊断为类别 A 瞬态（timeout / mirror / Cannot download / Connection refused）；或 mode=resubmit 且无修法可应用。
-- 【动作序列】复用旧 SRPM 原样重交（这是唯一允许复用旧 SRPM 的路径）：
+- 【动作序列】复用旧 SRPM 原样重交（这是唯一允许复用旧 SRPM 的路径；默认只重交 `$FAILED_CHROOT`）：
   ```bash
   python3 $SCRIPTS_DIR/submit_fix.py --session-dir . --pkg ${PKGNAME} --reuse-srpm
   ```
@@ -114,8 +124,9 @@ cat "./pkgs/${PKGNAME}/ci_check_result.json" 2>/dev/null || true
   2. 构建期缺依赖先用 `check_existing_package.py` 确认（decision 映射见阶段 2 第 4 条）：
      ```bash
      python3 $BUILD_RPM_DIR/scripts/check_existing_package.py <rpm_pkgname> \
-       --lang ${LANG} --chroot ${COPR_CHROOT} \
+       --lang ${LANG} --chroot ${FAILED_CHROOT} \
        --copr-url ${COPR_FRONTEND_URL} --owner ${COPR_OWNER} --project ${COPR_PROJECT} --json
+     # 按失败 chroot 查官方源——x86_64 源里有不代表 aarch64 源里有，不可用主 chroot 的结果推断其他 chroot
      ```
   3. 注册（仅 introduce_new / CI 缺失运行时依赖）：
      ```bash
@@ -144,7 +155,7 @@ cat "./pkgs/${PKGNAME}/ci_check_result.json" 2>/dev/null || true
      [{"description": "一句话说明改动目的", "before": "被替换的原文", "after": "替换后的文本"}]
      ```
   2. 过阶段 4 验证关口（verify-fix.py）。
-  3. 验证通过后一条命令完成打 SRPM + 提交 + 快照（脚本原子执行，失败报错退出且不留半成品）：
+  3. 验证通过后一条命令完成打 SRPM + 提交 + 快照（脚本原子执行，失败报错退出且不留半成品；默认只重交 `$FAILED_CHROOT`，改动触及共享 SRPM 内容时按阶段 3 开头规则追加 `--all-chroots`）：
      ```bash
      python3 $SCRIPTS_DIR/submit_fix.py --session-dir . --pkg ${PKGNAME}
      ```
@@ -159,12 +170,19 @@ cat "./pkgs/${PKGNAME}/ci_check_result.json" 2>/dev/null || true
 - 【退出前必写产物】failure_analysis（verdict=regenerate）。
 - 【退出后状态机去向】supervisor 重置状态（主包 interrupted / dep evaluate_done）→ build_* → spec 不存在 → pkg-builder 重新生成。
 
+### verdict = skip_chroot（架构性不可构建，放弃失败 chroot）
+
+- 【前置条件】失败为 chroot/架构性不可构建：上游明确不支持该架构、缺专属指令集、或该 chroot 源缺失无法合规引入的底层依赖；**或单 chroot 修复预算超限**（该 chroot 的 round/no_output 达上限且无新修法）。
+- 【动作序列】不修改任何文件、不重交。
+- 【退出前必写产物】failure_analysis（verdict=skip_chroot，`chroot` 填 `$FAILED_CHROOT`，reason 写清不可构建的架构性原因）。
+- 【退出后状态机去向】supervisor 将该 chroot 标记 `skipped`（dep_registry 条目 `chroots[<chroot>].status=skipped`），其余 chroot 的构建结果保留、流程继续；全部 chroot 都 skipped/超限才整体 fail。
+
 ### verdict = abort
 
-- 【前置条件】类别 A 硬错误（chroot 缺失等基础设施问题）；类别 D 无法修复；修法穷尽（阶段 2 第 2 条）；验证重试耗尽；MISMATCH 二次。
+- 【前置条件】类别 A 硬错误（chroot 缺失等基础设施问题）；类别 D 无法修复；修法穷尽（阶段 2 第 2 条）；验证重试耗尽；MISMATCH 二次；**全部 chroot 修复预算超限**（单 chroot 超限判 `skip_chroot`，不判 abort）。
 - 【动作序列】不修改任何文件。
 - 【退出前必写产物】failure_analysis（verdict=abort，reason 写清具体原因）。
-- 【退出后状态机去向】supervisor → fail，全单终止。
+- 【退出后状态机去向】supervisor → fail，全单终止。**注意**：只是当前 chroot 修不了时判 `skip_chroot` 而非 abort——abort 意味着整个 job（所有 chroot）都无法继续。
 
 ## 阶段 4：验证关口（rebuild / resubmit 应用修法后必经）
 
@@ -195,7 +213,7 @@ python3 $SCRIPTS_DIR/verify-fix.py \
 
 | 产物 | 消费者 | 必填字段 / 规则 | 写错的后果 |
 |------|--------|----------------|-----------|
-| failure_analysis（**写入 prompt 指定的 `analysis_file` 精确路径**，禁止自行拼文件名；你是唯一作者，precheck 只写 failure_hint 线索） | supervisor 路由 | verdict（五取值之一）、reason、fix_instructions（所有 verdict 均填写，供下轮参考）、missing_deps、input_sources（实际使用的输入级别与缺失项，见下） | verdict 缺失/JSON 损坏 = 按 abort 处理 → fail 全单 |
+| failure_analysis（**写入 prompt 指定的 `analysis_file` 精确路径**，禁止自行拼文件名；你是唯一作者，precheck 只写 failure_hint 线索） | supervisor 路由 | verdict（六取值之一）、**chroot**（失败 chroot `$FAILED_CHROOT`，必填）、**scope**（`chroot-local` \| `global`，rebuild/regenerate 必填，决定重交范围）、reason、fix_instructions（所有 verdict 均填写，供下轮参考）、missing_deps、input_sources（实际使用的输入级别与缺失项，见下） | verdict 缺失/JSON 损坏 = 按 abort 处理 → fail 全单 |
 | `fix_instructions.md`（追加写） | 下轮的自己 / resubmit 时的自己 | 见下方固定格式 | 下轮丢失修法上下文，可能重复已失败修法 |
 | `fix_report.json` | verify-fix.py | description/before/after 列表 | 验证关口退出码 2 |
 | `submitted_specs/spec_<build_id>.spec` | 下轮修复的地面真值 | 由 submit_fix.py 在提交成功后自动写入 | 下轮 verify-fix diff 对照失真 |
@@ -231,5 +249,5 @@ FIXEOF
 
 - 输入状态：supervisor 路由 fix_failure/fix_failure_dep（mode=fix）或 build_* 且 SUBMODE=resubmit（spec 存在且已有过 COPR 提交，mode=resubmit）时唤起；两种模式 prompt 均带 fix_context。
 - 产物及消费者：failure_analysis（写 prompt 指定的 analysis_file 路径）→ supervisor 按 verdict 路由；fix_instructions.md → 下轮自己；fix_report.json → verify-fix.py；build_rpm_result.json 与 submitted_specs 快照 → submit_fix.py 写入（含 `resubmitted: true` 标记），supervisor 以该标记判定是否已重交。
-- 预算与熔断：MAX_FIX_ROUNDS=8 轮（`fix_state.json` 显式计数，fix 与 resubmit 轮均计入，regenerate 清零）、MAX_NO_OUTPUT_ROUNDS=2 轮（未重交且未注册新依赖，确认重交后清零）；fix_context 的 round/no_output 接近上限时优先 abort，超限 supervisor 强制 fail。第 2 次 MISMATCH 由 supervisor 直接 fail，不经 fixer。
-- 异常出口：无法修复写 verdict=abort + reason 退出（= 全单 fail）；verdict 缺失/JSON 损坏等同 abort；禁止不写产物直接退出。
+- 预算与熔断：MAX_FIX_ROUNDS=8 轮、MAX_NO_OUTPUT_ROUNDS=2 轮，**计数器按 (pkg, chroot) 计**（`fix_state.json` 显式计数，fix 与 resubmit 轮均计入，regenerate 清零）；fix_context 的 round/no_output 接近上限时优先判 `skip_chroot`（单 chroot 超限 → 该 chroot 标记 skipped），全部 chroot 超限才整体 fail。第 2 次 MISMATCH 由 supervisor 直接 fail，不经 fixer。
+- 异常出口：无法修复时按影响面写 verdict=skip_chroot（单 chroot）或 abort（全单 fail）+ reason 退出；verdict 缺失/JSON 损坏等同 abort；禁止不写产物直接退出。

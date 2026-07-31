@@ -105,7 +105,7 @@ if [ -f "$SRPM_FILE" ]; then
   python3 $SCRIPTS_DIR/copr_client.py \
     "$SRPM_FILE" \
     --output ./pkgs/<pkgname>/build_rpm_result.json \
-    --chroot "$COPR_CHROOT"
+    --chroots "${COPR_BUILD_CHROOTS:-$COPR_CHROOTS}"
   echo "✓ EUR SRPM 已提交 COPR 构建"
   exit 0
 else
@@ -320,11 +320,15 @@ BL_RC=${PIPESTATUS[0]}
 
 若 `BL_RC=0`：提交 COPR 构建，提交后**立即退出**：
 
+> **多 chroot 提交语义**：`--chroots` 接受逗号分隔的多个 chroot，同一份 SRPM 会在每个 chroot 上独立重建（`--chroot` 单值参数保留兼容）。提交范围用 `$COPR_BUILD_CHROOTS`——supervisor 注入的**本轮可提交 chroot 子集**（依赖未就绪的 chroot 本轮不提交，后续增量补交）；未设置时回退 `$COPR_CHROOTS`（全部目标 chroot）。
+>
+> `build_rpm_result.json` 多 chroot 结构：`copr_build_id` / `copr_chroot` 保留（主 chroot，兼容旧消费者）；新增 `copr_chroots`（本轮提交的全部 chroot，list）与 `copr_build_ids`（`{chroot: build_id}` 映射）。下方快照存档读的 `copr_build_id` 无需改动。
+
 ```bash
 python3 $SCRIPTS_DIR/copr_client.py \
   ./srpms/<pkgname>-<version>-1.src.rpm \
   --output ./pkgs/<pkgname>/build_rpm_result.json \
-  --chroot "$COPR_CHROOT"
+  --chroots "${COPR_BUILD_CHROOTS:-$COPR_CHROOTS}"
 
 # 【强制】spec 快照存档：记录本次实际提交的 spec（地面真值，供 pkg-fixer 下轮修复对照）
 BUILD_ID="$(python3 -c "import json; print(json.load(open('./pkgs/<pkgname>/build_rpm_result.json')).get('copr_build_id',''))" 2>/dev/null)"

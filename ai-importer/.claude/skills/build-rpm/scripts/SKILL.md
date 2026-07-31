@@ -220,7 +220,7 @@ BL_RC=${PIPESTATUS[0]}
 python3 $SCRIPTS_DIR/copr_client.py \
   ./srpms/<pkgname>-<version>-1.src.rpm \
   --output ./pkgs/<pkgname>/build_rpm_result.json \
-  --chroot "$COPR_CHROOT"
+  --chroots "${COPR_BUILD_CHROOTS:-$COPR_CHROOTS}"
 ```
 
 > **提交完成后立即退出，不要等待、不要轮询、不要 sleep。**

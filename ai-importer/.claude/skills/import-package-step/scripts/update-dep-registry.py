@@ -93,6 +93,9 @@ def main():
             continue
         new_constraint = dep.get("constraint", "")
         if name not in reg:
+            # 新条目不带 chroots 键：evaluate 阶段 chroot 无关（§8.1），
+            # per-chroot 状态由构建阶段的 step_supervisor 按需建立；
+            # 已有条目走整字典读-改-写，chroots 等未知键天然保留。
             reg[name] = {
                 "url": dep.get("url", ""),
                 "constraint": new_constraint,

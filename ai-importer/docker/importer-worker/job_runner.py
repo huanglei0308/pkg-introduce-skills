@@ -89,11 +89,136 @@ def _log(r, job_id, msg):
     r.rpush(f"{LOGS_PREFIX}{job_id}", json.dumps({"msg": msg, "t": time.time()}))
 
 
-def _finish(r, job_id, status, error=""):
+def _parse_job_chroots(job: dict) -> list:
+    """解析 job 的目标 chroot 列表：`copr_chroots`（JSON 数组字符串）优先，
+    fallback 到旧 `copr_chroot` 单值；两者都缺返回 []。"""
+    raw = job.get("copr_chroots", "")
+    if raw:
+        try:
+            chroots = [c for c in json.loads(raw) if isinstance(c, str) and c]
+            if chroots:
+                return chroots
+        except (json.JSONDecodeError, TypeError):
+            pass
+    single = job.get("copr_chroot", "")
+    return [single] if single else []
+
+
+def _primary_chroot(chroots: list) -> str:
+    """主 chroot（设计 §7.3）：排序后优先取第一个 -x86_64 结尾的，否则取排序后第一个。"""
+    ordered = sorted(chroots)
+    for c in ordered:
+        if c.endswith("-x86_64"):
+            return c
+    return ordered[0]
+
+
+def _safe_int(v):
+    """安全 int 转换：字符串数字也接受，转换失败返回 None（按缺失处理）。"""
+    if isinstance(v, bool):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _collect_chroot_status(session_dir: Path, job_status: str = "") -> dict:
+    """聚合 per-chroot 终态（设计 §3.4 chroot_status）：
+    {chroot: {"status": "succeeded"|"failed"|"skipped", "build_id": ...}}。
+    数据来自 session.json 的 chroot 列表 + dep_registry.json 条目的 chroots 映射（§8.1）；
+    读不到 per-chroot 数据时降级为只含主 chroot（状态按 job 终态映射）。"""
+    try:
+        sess_path = session_dir / "session.json"
+        if not sess_path.exists():
+            return {}
+        session = json.loads(sess_path.read_text())
+        chroots = [c for c in (session.get("copr_chroots") or []) if c]
+        if not chroots:
+            single = session.get("copr_chroot", "")
+            chroots = [single] if single else []
+        if not chroots:
+            return {}
+        pkgname = session.get("pkgname", "")
+        dep_reg = {}
+        dep_reg_path = session_dir / "dep_registry.json"
+        if dep_reg_path.exists():
+            dep_reg = json.loads(dep_reg_path.read_text())
+        # 主包 per-chroot 状态：step_supervisor 写在 pkgs/<主包>/build_rpm_result.json
+        # 的 chroot_status 键（与 dep_registry chroots 同构）。主包可能不在
+        # dep_registry 里，两处数据源合并，同一 chroot 冲突时主包优先。
+        main_chroots = {}
+        if pkgname:
+            br_path = session_dir / "pkgs" / pkgname / "build_rpm_result.json"
+            if br_path.exists():
+                try:
+                    br = json.loads(br_path.read_text())
+                    main_chroots = {c: v for c, v in (br.get("chroot_status") or {}).items()
+                                    if isinstance(v, dict)}
+                except (json.JSONDecodeError, OSError):
+                    main_chroots = {}
+
+        def _map_status(st: str) -> str:
+            if st == "failed":
+                return "failed"
+            if st in ("build_done", "reused"):
+                return "succeeded"
+            return "skipped"
+
+        result = {}
+        for c in chroots:
+            mc = main_chroots.get(c)
+            if mc is not None:
+                # 主包有该 chroot 的记录：主包优先，直接采用
+                result[c] = {"status": _map_status(mc.get("status", "")),
+                             "build_id": mc.get("build_id")}
+                continue
+            status = "succeeded"
+            build_id = None
+            saw_any = False
+            for name, entry in dep_reg.items():
+                if not isinstance(entry, dict):
+                    continue
+                ch = (entry.get("chroots") or {}).get(c)
+                if not isinstance(ch, dict):
+                    continue
+                saw_any = True
+                st = ch.get("status", "")
+                bid = ch.get("build_id")
+                # build_id 优先取主包条目的
+                if bid and (build_id is None or name == pkgname):
+                    build_id = bid
+                if st == "failed":
+                    status = "failed"
+                elif st == "skipped":
+                    if status != "failed":
+                        status = "skipped"
+                elif st not in ("build_done", "reused"):
+                    # 未到终态（pending/building 等）按 skipped 记
+                    if status == "succeeded":
+                        status = "skipped"
+            if saw_any:
+                result[c] = {"status": status, "build_id": build_id}
+        if result:
+            return result
+        # 降级：无 per-chroot 数据，只含主 chroot
+        mapped = {"success": "succeeded", "failed": "failed"}.get(job_status, "skipped")
+        return {_primary_chroot(chroots): {"status": mapped, "build_id": None}}
+    except Exception:
+        return {}
+
+
+def _finish(r, job_id, status, error="", chroot_status=None):
     _log(r, job_id, f"[引包] 完成  status={status}" + (f"  error={error}" if error else ""))
     r.hset(f"{JOB_PREFIX}{job_id}", "status", status)
     if error:
         r.hset(f"{JOB_PREFIX}{job_id}", "error", error)
+    if chroot_status:
+        try:
+            r.hset(f"{JOB_PREFIX}{job_id}", "chroot_status",
+                   json.dumps(chroot_status, ensure_ascii=False))
+        except Exception:
+            pass
     r.rpush(f"{LOGS_PREFIX}{job_id}", json.dumps({"done": True, "status": status}))
 
 def _finish_with_timeline(r, job_id, session_dir, status, error="",
@@ -118,7 +243,8 @@ def _finish_with_timeline(r, job_id, session_dir, status, error="",
         "duration_s": round(time.time() - start_time, 1) if start_time else 0,
         **wf_info,
     })
-    _finish(r, job_id, status, error)
+    _finish(r, job_id, status, error,
+            chroot_status=_collect_chroot_status(session_dir, status))
 
 
 def _init_workflow(session_dir: Path, pkgname: str) -> None:
@@ -150,8 +276,35 @@ def _extract_build_failure(session_dir: Path, pkgname: str, job_id: str = "") ->
         print(f"[sync_copr][{job_id}] extract-build-failure error: {e}", flush=True)
 
 
+def _poll_chroot_until_done(build_id, chroot, login, token, log_fn,
+                            max_wait=3600, interval=10):
+    """copr_client.poll_build_until_done 的 per-chroot 版本：
+    轮询指定 chroot 的状态直到终态（chroots 字典缺失时退回整体 state）。"""
+    from copr_client import get_build
+    terminal   = {"succeeded", "failed", "canceled", "skipped"}
+    deadline   = time.time() + max_wait
+    last_state = "unknown"
+    while time.time() < deadline:
+        try:
+            data  = get_build(build_id, login, token)
+            state = (data.get("chroots", {}) or {}).get(chroot) \
+                    or data.get("state", "unknown")
+            if state != last_state:
+                log_fn(f"  构建状态({chroot}): {state}")
+                last_state = state
+            if state in terminal:
+                return state
+        except Exception as exc:
+            log_fn(f"  轮询出错: {exc}")
+        time.sleep(interval)
+    return last_state
+
+
 def _sync_copr_result(session_dir: Path, pkgname: str, job_id: str = "") -> None:
-    """wait 结束后拉取 COPR build log，写入 build_rpm_result.json。"""
+    """wait 结束后拉取 COPR build log，写入 build_rpm_result.json。
+    多 chroot：按 chroot 循环拼 backend 结果 URL 拉日志、逐 chroot 归档到
+    chroot_results；legacy 单值字段（copr_status/build_log/...）镜像主 chroot，
+    单 chroot 时行为与旧版一致。"""
     if not pkgname:
         return
 
@@ -163,136 +316,199 @@ def _sync_copr_result(session_dir: Path, pkgname: str, job_id: str = "") -> None
     try:
         import json as _json
         br = _json.loads(br_path.read_text())
-        build_id = br.get("copr_build_id")
-        copr_chroot = br.get("copr_chroot", "")
+        legacy_build_id = _safe_int(br.get("copr_build_id"))
+        legacy_chroot = br.get("copr_chroot", "")
 
-        # fallback：从 dep_registry.json 里找 build_id
-        if not build_id:
-            dep_reg_path = session_dir / "dep_registry.json"
-            if dep_reg_path.exists():
-                dep_reg = _json.loads(dep_reg_path.read_text())
-                dep_entry = dep_reg.get(pkgname, {})
-                build_id = dep_entry.get("copr_build_id")
-                if not copr_chroot:
-                    copr_chroot = dep_entry.get("copr_chroot", "")
+        # per-chroot 视图：新字段（copr_chroots / copr_build_ids）优先，旧单值 fallback
+        # build_id 统一 int 归一（字符串数字也接受，转换失败按缺失处理），
+        # 避免下游 f"{bid:08d}-" 格式化崩溃
+        chroots = [c for c in (br.get("copr_chroots") or []) if c]
+        build_ids = {c: bid for c, bid in
+                     ((c, _safe_int(v)) for c, v in dict(br.get("copr_build_ids") or {}).items())
+                     if bid is not None}
+        if not chroots and legacy_chroot:
+            chroots = [legacy_chroot]
 
-        if not build_id or br.get("build_log"):
-            return
-
-        print(f"[sync_copr][{job_id}] pulling build log for {pkgname} build_id={build_id}", flush=True)
+        # fallback：从 dep_registry.json 里找 chroot → build_id 映射（§8.1 schema）
+        dep_reg_path = session_dir / "dep_registry.json"
+        if dep_reg_path.exists():
+            dep_reg = _json.loads(dep_reg_path.read_text())
+            dep_entry = dep_reg.get(pkgname, {})
+            dep_chroots = dep_entry.get("chroots") or {}
+            if not chroots:
+                chroots = [c for c in dep_chroots if c]
+            for c, ch_info in dep_chroots.items():
+                bid = _safe_int(ch_info.get("build_id")) if isinstance(ch_info, dict) else None
+                if c and bid is not None:
+                    build_ids.setdefault(c, bid)
+            if not legacy_build_id:
+                legacy_build_id = _safe_int(dep_entry.get("copr_build_id"))
+            if not chroots and dep_entry.get("copr_chroot"):
+                chroots = [dep_entry["copr_chroot"]]
 
         # 直接用 docker/importer-worker 里的 copr_client（jobs 凭据）
         session = _json.loads((session_dir / "session.json").read_text())
         login = session.get("copr_login", "")
         token = session.get("copr_token", "")
-        copr_url = session.get("copr_url", "http://copr-frontend:5000")
         owner = session.get("copr_owner", "")
         project = session.get("copr_project", "")
-        if not copr_chroot:
-            copr_chroot = session.get("copr_chroot", "")
+        if not chroots:
+            chroots = [c for c in (session.get("copr_chroots") or []) if c]
+        if not chroots and session.get("copr_chroot"):
+            chroots = [session["copr_chroot"]]
 
-        from copr_client import get_build, poll_build_until_done
+        primary = _primary_chroot(chroots) if chroots else ""
+
+        # 每个 chroot 用各自的 build_id（缺省退回 legacy 单 build_id——
+        # 同一个 COPR build 本来就覆盖多个 chroot）；缺 build_id 或日志已拉过的跳过
+        chroot_results = br.get("chroot_results") or {}
+        todo = []
+        for c in chroots:
+            bid = build_ids.get(c) or legacy_build_id
+            if not bid:
+                continue
+            if (chroot_results.get(c) or {}).get("build_log"):
+                continue
+            if c == primary and br.get("build_log"):
+                continue
+            todo.append((c, bid))
+        if not todo:
+            return
+
+        print(f"[sync_copr][{job_id}] pulling build log for {pkgname} "
+              f"chroots={todo}", flush=True)
+
+        from copr_client import get_build
         def _log_fn(msg): print(f"[sync_copr][{job_id}] {msg}", flush=True)
 
-        # 查当前状态，如果还在跑就等完
-        data = get_build(build_id, login, token)
-        state = data.get("state", "unknown")
-
-        # 校验包名：防止 pkg-builder 提交了错误的包
+        # 查当前状态（按 build_id 去重），并校验包名：防止 pkg-builder 提交了错误的包
         # COPR 返回 source_package.name 是 RPM 包名（python-xxx / python3-xxx），
         # pkgname 是上游名（setuptools）。用 upstream_from_srpm_name 剥离
         # 语言前缀还原为上游名后再比对，兼容 python- 和 python3- 两种前缀。
-        actual_pkg = data.get("source_package", {}).get("name", "")
-        if actual_pkg and actual_pkg != pkgname:
-            expected = pkgname
-            try:
-                import sys as _sys
-                _scripts_dir = str(Path(SKILLS_DIR) / "build-rpm/scripts")
-                if _scripts_dir not in _sys.path:
-                    _sys.path.insert(0, _scripts_dir)
-                from rpm_naming import upstream_from_srpm_name, rpm_name_from_gav
-                gate_path = session_dir / f"pkgs/{pkgname}/gate_result_{pkgname}.json"
-                lang = ""
-                if gate_path.exists():
-                    gate_data = _json.loads(gate_path.read_text())
-                    lang = gate_data.get("lang", "") or gate_data.get("result", {}).get("lang", "")
-                # 从 RPM 名剥离前缀还原上游名（python3-setuptools → setuptools）
-                # lang 为空时默认 "python"——Python 是最常见的包语言
-                normalized = upstream_from_srpm_name(actual_pkg, lang or "python")
-                # Java：pkgname 是 Maven GAV（com.google.j2objc:j2objc-annotations），
-                # SRPM 名是 artifactId（j2objc-annotations），expected 侧需归一
-                if lang == "java":
-                    expected = rpm_name_from_gav(pkgname)
-            except Exception:
-                normalized = actual_pkg
-            if normalized != expected:
-                br["status"] = "failed"
-                br["failure_reason"] = (
-                    f"Package name mismatch: build {build_id} "
-                    f"is '{actual_pkg}', expected '{pkgname}'"
-                )
-                br_path.write_text(_json.dumps(br, indent=2, ensure_ascii=False))
-                # MISMATCH 计数写入 fix_state.json：supervisor 对第 2 次 MISMATCH
-                # 直接 fail（重生成一次仍 mismatch = 根因不在 spec 文本）
+        seen_bids = []
+        for _, bid in todo:
+            if bid not in seen_bids:
+                seen_bids.append(bid)
+        build_data = {}
+        for bid in seen_bids:
+            data = get_build(bid, login, token)
+            build_data[bid] = data
+            actual_pkg = data.get("source_package", {}).get("name", "")
+            if actual_pkg and actual_pkg != pkgname:
+                expected = pkgname
                 try:
-                    fs_path = session_dir / "pkgs" / pkgname / "fix_state.json"
-                    fs = _json.loads(fs_path.read_text()) if fs_path.exists() else {}
-                    fs["mismatch_count"] = int(fs.get("mismatch_count", 0) or 0) + 1
-                    fs_path.parent.mkdir(parents=True, exist_ok=True)
-                    fs_path.write_text(_json.dumps(fs, indent=2, ensure_ascii=False))
-                except Exception as e:
-                    print(f"[sync_copr][{job_id}] warn: mismatch_count 写入失败: {e}", flush=True)
-                print(f"[sync_copr][{job_id}] MISMATCH: build {build_id} is {actual_pkg}, expected {pkgname}",
-                      flush=True)
-                _extract_build_failure(session_dir, pkgname, job_id)
-                return
+                    import sys as _sys
+                    _scripts_dir = str(Path(SKILLS_DIR) / "build-rpm/scripts")
+                    if _scripts_dir not in _sys.path:
+                        _sys.path.insert(0, _scripts_dir)
+                    from rpm_naming import upstream_from_srpm_name, rpm_name_from_gav
+                    gate_path = session_dir / f"pkgs/{pkgname}/gate_result_{pkgname}.json"
+                    lang = ""
+                    if gate_path.exists():
+                        gate_data = _json.loads(gate_path.read_text())
+                        lang = gate_data.get("lang", "") or gate_data.get("result", {}).get("lang", "")
+                    # 从 RPM 名剥离前缀还原上游名（python3-setuptools → setuptools）
+                    # lang 为空时默认 "python"——Python 是最常见的包语言
+                    normalized = upstream_from_srpm_name(actual_pkg, lang or "python")
+                    # Java：pkgname 是 Maven GAV（com.google.j2objc:j2objc-annotations），
+                    # SRPM 名是 artifactId（j2objc-annotations），expected 侧需归一
+                    if lang == "java":
+                        expected = rpm_name_from_gav(pkgname)
+                except Exception:
+                    normalized = actual_pkg
+                if normalized != expected:
+                    br["status"] = "failed"
+                    br["failure_reason"] = (
+                        f"Package name mismatch: build {bid} "
+                        f"is '{actual_pkg}', expected '{pkgname}'"
+                    )
+                    br_path.write_text(_json.dumps(br, indent=2, ensure_ascii=False))
+                    # MISMATCH 计数写入 fix_state.json：supervisor 对第 2 次 MISMATCH
+                    # 直接 fail（重生成一次仍 mismatch = 根因不在 spec 文本）
+                    try:
+                        fs_path = session_dir / "pkgs" / pkgname / "fix_state.json"
+                        fs = _json.loads(fs_path.read_text()) if fs_path.exists() else {}
+                        fs["mismatch_count"] = int(fs.get("mismatch_count", 0) or 0) + 1
+                        fs_path.parent.mkdir(parents=True, exist_ok=True)
+                        fs_path.write_text(_json.dumps(fs, indent=2, ensure_ascii=False))
+                    except Exception as e:
+                        print(f"[sync_copr][{job_id}] warn: mismatch_count 写入失败: {e}", flush=True)
+                    print(f"[sync_copr][{job_id}] MISMATCH: build {bid} is {actual_pkg}, expected {pkgname}",
+                          flush=True)
+                    _extract_build_failure(session_dir, pkgname, job_id)
+                    return
 
         terminal = {"succeeded", "failed", "canceled", "skipped"}
-        if state not in terminal:
-            state = poll_build_until_done(build_id, login, token, _log_fn)
-
-        # 拉 builder-live.log
-        backend_url = "http://copr-backend:5002"
         import urllib.request, re, gzip as _gzip
-        dir_url = f"{backend_url}/results/{owner}/{project}/{copr_chroot}/"
-        build_prefix = f"{build_id:08d}-"
-        build_log = ""
-        try:
-            with urllib.request.urlopen(dir_url, timeout=10) as resp:
-                content = resp.read().decode()
-            dirs = re.findall(rf'href="({build_prefix}[^"]+/)"', content)
-            if dirs:
-                build_dir = dir_url + dirs[0]
-                for log_name in ("builder-live.log.gz", "builder-live.log"):
-                    try:
-                        with urllib.request.urlopen(build_dir + log_name, timeout=30) as resp:
-                            raw = resp.read()
-                            build_log = (_gzip.decompress(raw) if log_name.endswith(".gz") else raw).decode("utf-8", errors="replace")
-                            break
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+        backend_url = "http://copr-backend:5002"
+        for c, bid in todo:
+            data = build_data[bid]
+            state = (data.get("chroots", {}) or {}).get(c) or data.get("state", "unknown")
 
-        br["copr_status"] = state
-        br["build_log"] = build_log[-8000:] if build_log else ""
-        br["build_log_tail"] = build_log[-2000:] if build_log else ""
-        if state == "succeeded":
+            # 如果该 chroot 还在跑就等完
+            if state not in terminal:
+                state = _poll_chroot_until_done(bid, c, login, token, _log_fn)
+
+            # 拉该 chroot 的 builder-live.log
+            dir_url = f"{backend_url}/results/{owner}/{project}/{c}/"
+            build_prefix = f"{bid:08d}-"
+            build_log = ""
+            try:
+                with urllib.request.urlopen(dir_url, timeout=10) as resp:
+                    content = resp.read().decode()
+                dirs = re.findall(rf'href="({build_prefix}[^"]+/)"', content)
+                if dirs:
+                    build_dir = dir_url + dirs[0]
+                    for log_name in ("builder-live.log.gz", "builder-live.log"):
+                        try:
+                            with urllib.request.urlopen(build_dir + log_name, timeout=30) as resp:
+                                raw = resp.read()
+                                build_log = (_gzip.decompress(raw) if log_name.endswith(".gz") else raw).decode("utf-8", errors="replace")
+                                break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # 逐 chroot 归档
+            chroot_results[c] = {
+                "build_id": bid,
+                "state": state,
+                "build_log": build_log[-8000:] if build_log else "",
+                "build_log_tail": build_log[-2000:] if build_log else "",
+            }
+
+            # ── 时间线：构建结束（逐 chroot） ───────────────────────────
+            write_event(session_dir, "build.completed", pkgname, {
+                "build_id": str(bid) if bid else "",
+                "status": state,
+                "duration_s": round(time.time() - sync_start, 1),
+                "copr_chroot": c,
+            })
+        br["chroot_results"] = chroot_results
+
+        # legacy 单值字段镜像主 chroot；整体状态按全部 chroot 聚合
+        merged_states = {c: (chroot_results.get(c) or {}).get("state", "") for c in chroots}
+        primary_res = chroot_results.get(primary) or {}
+        primary_state = primary_res.get("state", "")
+        br["copr_status"] = primary_state
+        br["build_log"] = primary_res.get("build_log", "")
+        br["build_log_tail"] = primary_res.get("build_log_tail", "")
+        failed_chroots = [c for c, st in merged_states.items() if st != "succeeded"]
+        if not failed_chroots:
             br["status"] = "success"
         else:
             br["status"] = "failed"
-            br["failure_reason"] = br.get("failure_reason") or f"copr build {state}"
+            br["failure_reason"] = br.get("failure_reason") or (
+                f"copr build {primary_state}" if len(chroots) <= 1
+                else "copr build failed chroots: " + ", ".join(failed_chroots)
+            )
 
         br_path.write_text(_json.dumps(br, indent=2, ensure_ascii=False))
-        print(f"[sync_copr][{job_id}] {pkgname}: state={state} → build_rpm_result.status={br['status']}", flush=True)
-
-        # ── 时间线：构建结束 ────────────────────────────────────────────
-        write_event(session_dir, "build.completed", pkgname, {
-            "build_id": str(build_id) if build_id else "",
-            "status": state,
-            "duration_s": round(time.time() - sync_start, 1),
-            "copr_chroot": copr_chroot,
-        })
+        if len(chroots) <= 1:
+            print(f"[sync_copr][{job_id}] {pkgname}: state={primary_state} → build_rpm_result.status={br['status']}", flush=True)
+        else:
+            print(f"[sync_copr][{job_id}] {pkgname}: states={merged_states} → build_rpm_result.status={br['status']}", flush=True)
 
         if br["status"] == "failed":
             _extract_build_failure(session_dir, pkgname, job_id)
@@ -336,7 +552,8 @@ def run_job(r, proj, job_id):
     owner, coprname = proj.split("/", 1)
     copr_login  = job.get("copr_login", "")
     copr_token  = job.get("copr_token", "")
-    copr_chroot = job.get("copr_chroot", "")
+    # 多 chroot：`copr_chroots`（JSON 数组）优先，fallback 旧 `copr_chroot` 单值
+    copr_chroots = _parse_job_chroots(job)
 
     # 防御：任务在排队期间被取消，直接退出
     if job.get("status") == "cancelled":
@@ -348,15 +565,18 @@ def run_job(r, proj, job_id):
         _log(r, job_id, "ERROR: job 缺少 copr_login/copr_token")
         _finish(r, job_id, "failed", "missing credentials")
         return
-    if not copr_chroot:
+    if not copr_chroots:
         _log(r, job_id, "ERROR: job 缺少 copr_chroot")
         _finish(r, job_id, "failed", "missing chroot")
         return
+    # 主 chroot（§7.3）：排序后 x86_64 优先；兼容字段 COPR_CHROOT / session.json 均用它
+    copr_chroot = _primary_chroot(copr_chroots)
 
     r.hset(f"{JOB_PREFIX}{job_id}", "status", "running")
     _log(r, job_id, f"[引包] pkgname={pkgname}  url={url}"
                     + (f"  version={version}" if version else ""))
-    _log(r, job_id, f"[引包] 目标: {proj}  chroot: {copr_chroot}")
+    _log(r, job_id, f"[引包] 目标: {proj}  chroot: {copr_chroot}"
+                    + (f"  chroots: {','.join(copr_chroots)}" if len(copr_chroots) > 1 else ""))
 
     # ── 1. 初始化 session 目录 ────────────────────────────────────────────
     session_dir = SESSIONS_BASE / job_id
@@ -375,6 +595,7 @@ def run_job(r, proj, job_id):
         "copr_login":   copr_login,
         "copr_token":   copr_token,
         "copr_chroot":  copr_chroot,
+        "copr_chroots": copr_chroots,
         "repo_local":   str(session_dir / "repo"),
     }
     (session_dir / "session.json").write_text(
@@ -395,26 +616,28 @@ def run_job(r, proj, job_id):
         "version": version,
         "copr_project": proj,
         "copr_chroot": copr_chroot,
+        "copr_chroots": copr_chroots,
     })
 
     # ── 1.5 异步预热 repo 缓存 + 生成构建工具链 manifest ────────────────────
-    if copr_chroot:
+    # 多 chroot：每个 chroot 各起一对后台线程（线程内异常不影响主流程，沿用现有容错风格）
+    for _chroot in copr_chroots:
         _warm_script = Path("/app/.claude/skills/build-rpm/scripts/warm_repo_cache.py")
         if _warm_script.exists():
             threading.Thread(
-                target=lambda: subprocess.run(
-                    [sys.executable, str(_warm_script), copr_chroot],
+                target=lambda c=_chroot: subprocess.run(
+                    [sys.executable, str(_warm_script), c],
                     capture_output=False,
                     timeout=660,
                 ),
                 daemon=True,
             ).start()
-        # 同时生成当前 chroot 的构建工具链版本清单，作为全局约束
+        # 同时生成该 chroot 的构建工具链版本清单，作为全局约束
         _toolchain_script = Path("/app/.claude/skills/build-rpm/scripts/chroot_toolchain.py")
         if _toolchain_script.exists():
             threading.Thread(
-                target=lambda: subprocess.run(
-                    [sys.executable, str(_toolchain_script), copr_chroot,
+                target=lambda c=_chroot: subprocess.run(
+                    [sys.executable, str(_toolchain_script), c,
                      "--session-dir", str(session_dir)],
                     capture_output=False,
                     timeout=300,
@@ -434,6 +657,7 @@ def run_job(r, proj, job_id):
         "COPR_API_LOGIN":     copr_login,
         "COPR_API_TOKEN":     copr_token,
         "COPR_CHROOT":        copr_chroot,
+        "COPR_CHROOTS":       ",".join(copr_chroots),
         "SESSIONS_BASE":      str(SESSIONS_BASE),
     }
 
@@ -765,6 +989,16 @@ def run_job(r, proj, job_id):
             _finish_with_timeline(r, job_id, session_dir, "failed",
                                   "supervisor returned no action", start)
             return
+
+        # 多 chroot 派发（§8.1/§8.2）：supervisor 输出的本轮可提交子集 / 目标 chroot
+        # 注入 claude 子进程 env（构建脚本侧回退 COPR_BUILD_CHROOTS > COPR_CHROOTS
+        # > COPR_CHROOT）。每轮先清理，避免上一轮残留。
+        env.pop("COPR_BUILD_CHROOTS", None)
+        env.pop("CHROOT", None)
+        if sv.get("copr_build_chroots"):
+            env["COPR_BUILD_CHROOTS"] = sv["copr_build_chroots"]
+        if sv.get("chroot"):
+            env["CHROOT"] = sv["chroot"]
 
         # 需要 claude 的 action：启动 claude -p /import-package-step
         action_start = time.time()

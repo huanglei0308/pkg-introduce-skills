@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+from copr_client import parse_chroots, primary_chroot
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
 PRE_CHECK_SCRIPT = SCRIPTS_DIR / "pre_check_deps.py"
@@ -155,6 +158,7 @@ def main() -> int:
             session = _json.loads(session_json_path.read_text(encoding="utf-8"))
             for key, env_var in [
                 ("copr_chroot",  "COPR_CHROOT"),
+                ("copr_chroots", "COPR_CHROOTS"),
                 ("copr_url",     "COPR_FRONTEND_URL"),
                 ("copr_owner",   "COPR_OWNER"),
                 ("copr_project", "COPR_PROJECT"),
@@ -162,10 +166,25 @@ def main() -> int:
                 ("copr_token",   "COPR_API_TOKEN"),
             ]:
                 val = session.get(key, "")
+                if isinstance(val, list):
+                    val = ",".join(str(v) for v in val)
                 if val and not os.environ.get(env_var):
                     os.environ[env_var] = val
         except Exception:
             pass
+
+    # 多 chroot：本轮可提交集合优先级 COPR_BUILD_CHROOTS > COPR_CHROOTS > COPR_CHROOT，
+    # 归一化后回写环境（COPR_CHROOT=主 chroot），供 precheck / CI / 提交流程消费。
+    # 单 chroot 时解析结果即原单值，行为不变。
+    build_chroots: list[str] = []
+    for _var in ("COPR_BUILD_CHROOTS", "COPR_CHROOTS", "COPR_CHROOT"):
+        build_chroots = parse_chroots(os.environ.get(_var, ""))
+        if build_chroots:
+            break
+    if build_chroots:
+        os.environ["COPR_CHROOT"] = primary_chroot(build_chroots)
+        if not os.environ.get("COPR_CHROOTS"):
+            os.environ["COPR_CHROOTS"] = ",".join(build_chroots)
 
     def _abs(p: str, default: str = "") -> Path:
         s = p or default
