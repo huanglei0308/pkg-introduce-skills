@@ -60,6 +60,31 @@ echo "[step] loop=$LOOP action=$ACTION($TARGET)"
 ```bash
 case "$ACTION" in
 
+ros_prep)
+  # ROS 链第一步：定位 + 官方判定 + manifest + 伪 gate_result（脚本确定性完成）
+  Agent(
+    subagent_type="ros-prepper",
+    prompt=f"task: prep\npkgname: {TARGET}\nsession_dir: {SESSION_DIR}"
+  )
+  # 无读回：ros_prep 已写 manifest + 伪 gate_result，supervisor 靠状态文件判定推进
+  ;;
+
+ros_fetch)
+  # ROS 源码获取：upstream cache → sources/（cache 未命中时直接 clone）
+  Agent(
+    subagent_type="ros-prepper",
+    prompt=f"task: fetch\npkgname: {TARGET}\nsession_dir: {SESSION_DIR}"
+  )
+  ;;
+
+ros_spec)
+  # ROS spec 生成：读 manifest + spec-rules-ros.md + reference/ 基线 + package_fix 修正
+  Agent(
+    subagent_type="ros-prepper",
+    prompt=f"task: spec\npkgname: {TARGET}\nsession_dir: {SESSION_DIR}"
+  )
+  ;;
+
 evaluate_main)
   # 主包首次 evaluate（与 dep evaluate 相同逻辑，但 mode=top-level）
   Agent(

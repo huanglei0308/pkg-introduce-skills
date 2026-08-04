@@ -539,14 +539,19 @@ def _run_supervisor(session_dir: Path, job_id: str = "") -> dict:
 
 def run_job(r, proj, job_id):
     job        = r.hgetall(f"{JOB_PREFIX}{job_id}")
+    mode       = job.get("mode", "normal")
+    ros_distro = job.get("ros_distro", "")
+    deep_dependency = job.get("deep_dependency", "0") == "1"
     pkgname    = job["pkgname"]
     # 归一化：用户可能误传入 RPM 包名（python-numpy），剥离语言前缀还原为上游名
-    for _pfx in ["python3-", "python-", "nodejs-"]:
-        if pkgname.startswith(_pfx):
-            _normalized = pkgname[len(_pfx):]
-            _log(r, job_id, f"[归一化] pkgname '{pkgname}' → '{_normalized}'")
-            pkgname = _normalized
-            break
+    # ROS 模式跳过：ROS 包名无语言前缀，剥离逻辑会误伤（前端已按 ROS 语义校验）
+    if mode != "ros":
+        for _pfx in ["python3-", "python-", "nodejs-"]:
+            if pkgname.startswith(_pfx):
+                _normalized = pkgname[len(_pfx):]
+                _log(r, job_id, f"[归一化] pkgname '{pkgname}' → '{_normalized}'")
+                pkgname = _normalized
+                break
     url        = job["url"]
     version    = job.get("version", "")
     owner, coprname = proj.split("/", 1)
@@ -589,6 +594,10 @@ def run_job(r, proj, job_id):
         "pkgname":      pkgname,
         "upstream_url": url,
         "version":      version,
+        "import_type":  "ros" if mode == "ros" else "normal",
+        "mode":         mode,
+        "ros_distro":   ros_distro,
+        "deep_dependency": deep_dependency,
         "copr_url":     os.environ.get("COPR_API_URL", "http://copr-frontend:5000"),
         "copr_owner":   owner,
         "copr_project": coprname,
@@ -659,6 +668,8 @@ def run_job(r, proj, job_id):
         "COPR_CHROOT":        copr_chroot,
         "COPR_CHROOTS":       ",".join(copr_chroots),
         "SESSIONS_BASE":      str(SESSIONS_BASE),
+        "ROS_DISTRO":         ros_distro,
+        "ROS_UPSTREAM_CACHE": os.environ.get("ROS_UPSTREAM_CACHE", "/app/upstream_cache"),
     }
 
     # ── 3. Supervisor 先行 + claude 按需启动循环 ──────────────────────────
@@ -673,9 +684,21 @@ def run_job(r, proj, job_id):
             _finish_with_timeline(r, job_id, session_dir, "failed",
                                   f"timeout after {int(elapsed)}s", start)
             return
-        if loop >= MAX_LOOPS:
+        # ROS 任务循环上限按依赖规模缩放：deep 展开后循环次数随包数线性消耗
+        if mode == "ros":
+            _dep_n = 0
+            _reg_path = session_dir / "dep_registry.json"
+            if _reg_path.exists():
+                try:
+                    _dep_n = len(json.loads(_reg_path.read_text()))
+                except Exception:
+                    pass
+            max_loops = max(MAX_LOOPS, 50 * (_dep_n + 1))
+        else:
+            max_loops = MAX_LOOPS
+        if loop >= max_loops:
             _finish_with_timeline(r, job_id, session_dir, "failed",
-                                  f"max_loops {MAX_LOOPS} exceeded", start)
+                                  f"max_loops {max_loops} exceeded", start)
             return
 
         # ── 时间线：新一轮循环开始 ───────────────────────────────────────
@@ -726,6 +749,14 @@ def run_job(r, proj, job_id):
                 r.hset(f"{JOB_PREFIX}{job_id}", "reused_pkgs", " ".join(wf.get("reused_pkgs", [])))
                 r.hset(f"{JOB_PREFIX}{job_id}", "loop_count",  str(wf.get("loop_count", "")))
                 r.hset(f"{JOB_PREFIX}{job_id}", "error",       error)
+                # ROS explicit 缺口：读 missing_deps 清单回写 hash（前端渲染可点击 tag）
+                if mode == "ros":
+                    _missing_path = session_dir / f"pkgs/{pkgname}/missing_deps_{pkgname}.txt"
+                    if _missing_path.exists():
+                        _missing = [l.strip() for l in _missing_path.read_text(
+                            encoding="utf-8", errors="ignore").splitlines() if l.strip()]
+                        if _missing:
+                            r.hset(f"{JOB_PREFIX}{job_id}", "missing_pkgs", " ".join(_missing))
                 # 读失败 summary 报告写入 Redis
                 if pkgname:
                     report_path = session_dir / f"pkgs/{pkgname}/{pkgname}_introduction_report.md"
