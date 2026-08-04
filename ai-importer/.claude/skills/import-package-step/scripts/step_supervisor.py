@@ -807,9 +807,70 @@ def _dispatch_dep_build(sd: Path, wf: dict, reg: dict, tracking: bool, targets: 
     return ("build_dep", dep, build_delay(lang))
 
 
+# ── ROS 模式分流 ─────────────────────────────────────────────────────────────
+def _is_ros_session(sd: Path) -> bool:
+    """session 是否为 ROS 引包任务（前端 mode=ros → session.json import_type=ros）。"""
+    s = _read_session(sd)
+    return s.get("import_type") == "ros" or s.get("mode") == "ros"
+
+
+def _ros_route(sd: Path, wf: dict, PKGNAME: str, reg: dict):
+    """ROS 链优先级：ros_prep → ros_fetch → ros_spec → 复用通用 build/fix 链。
+
+    返回 None 表示落到通用链继续判定（build_main/wait/fix_failure 等复用）。
+    伪 gate_result 是分流支点：ros_prep 产出 decision∈(introduce_new, reuse_*)
+    的伪 gate_result 后，通用链的 gate_valid 检查自然放行。
+    """
+    gate_path = sd / f"pkgs/{PKGNAME}/gate_result_{PKGNAME}.json"
+
+    # 1. 伪 gate_result 未就绪 → ros_prep（定位 + 官方判定 + manifest + 伪 gate）
+    if not gate_path.exists():
+        return ("ros_prep", PKGNAME, 0)
+    try:
+        g = read_json(gate_path)
+        if g.get("overall_status") != "done":
+            return ("fail", g.get("error", "ROS 预检未完成"), None)
+    except Exception:
+        return ("fail", f"gate_result_{PKGNAME}.json 损坏", None)
+
+    # 2. reuse 主包：goal_achieved 已由 ros_prep 代写 → 直接 done
+    if wf.get("goal_achieved") is True:
+        return ("done", PKGNAME, None)
+
+    # 3. explicit 缺口：缺口清单存在 → 终止（闭环=用户把缺口包追加进列表重提）
+    missing_path = sd / f"pkgs/{PKGNAME}/missing_deps_{PKGNAME}.txt"
+    if missing_path.exists():
+        missing = missing_path.read_text(encoding="utf-8", errors="ignore").split()
+        if missing:
+            return ("fail", "缺少官方源依赖，需先引入后重提: " + " ".join(missing), None)
+
+    # 4. 源码未就绪 → ros_fetch（cache → sources/）
+    src_dir = sd / "sources" / PKGNAME
+    if not (src_dir.is_dir() and any(src_dir.iterdir())):
+        return ("ros_fetch", PKGNAME, 0)
+
+    # 5. spec 已就绪 → 通用链（build_main/resubmit/修复闭环）
+    if (sd / f"pkgs/{PKGNAME}/{PKGNAME}.spec").exists():
+        return None
+
+    # 6. spec 未就绪且无构建结果 → ros_spec（生成 spec，后续通用链提交构建）
+    main_result_path = sd / f"pkgs/{PKGNAME}/build_rpm_result.json"
+    if not main_result_path.exists():
+        return ("ros_spec", PKGNAME, 0)
+
+    # 7. 其余（构建轮询/失败修复/verify/feedback/收尾）→ 通用链
+    return None
+
+
 def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | None]:
     """返回 (action, target, delay_seconds)。delay=None 表示停止循环。"""
     PKGNAME = wf["pkgname"]
+
+    # ── ROS 模式分流（全方案唯一的结构性侵入点）────────────────────────────
+    if _is_ros_session(sd):
+        ros_action = _ros_route(sd, wf, PKGNAME, reg)
+        if ros_action is not None:
+            return ros_action
 
     # 优先级 -1：evaluate_main 失败，等待 AI 分析
     if wf.get("evaluate_failed"):
@@ -916,6 +977,28 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
             for d in vendor_eval:
                 reg[d]["status"] = "vendor_only"
                 print(f"[supervisor] {d} lang ∈ {sorted(VENDOR_LANGS)}，置 vendor_only（父包 vendor 解决）",
+                      file=sys.stderr)
+            write_json(sd / "dep_registry.json", reg)
+            return determine_action(sd, wf, reg)
+        # ROS 依赖拦截（deep 模式）：ros_prep 已完成官方源判定并注册，
+        # 无 URL、不走普通 gate——注册即视为已评估，直接 evaluate_done 进构建链。
+        ros_eval = [k for k in pending_eval
+                    if str(reg[k].get("lang", "")).lower() == "ros"]
+        if ros_eval:
+            for d in ros_eval:
+                reg[d]["status"] = "evaluate_done"
+                # 补伪 gate_result（lang/version 供 pkg-builder 读取，版本由
+                # analyze_ros_deps 的 package.xml 解析兜底）
+                dep_gate = sd / f"pkgs/{d}/gate_result_{d}.json"
+                if not dep_gate.exists():
+                    write_json(dep_gate, {
+                        "pkgname": d, "lang": "ros", "version": "",
+                        "overall_status": "done",
+                        "result": {"lang": "ros", "version": "",
+                                   "decision": "introduce_new",
+                                   "reason": "ROS 依赖由 ros_prep 注册，评估在预检完成"},
+                    })
+                print(f"[supervisor] {d} lang=ros，跳过普通 evaluate（已在 ros_prep 判定）",
                       file=sys.stderr)
             write_json(sd / "dep_registry.json", reg)
             return determine_action(sd, wf, reg)

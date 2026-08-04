@@ -63,6 +63,7 @@ ANALYZERS = {
     "cpp":    {"script": "analyze_cpp_deps.py",    "extra_args": []},
     "nodejs": {"script": "analyze_nodejs_deps.py", "extra_args": []},
     "java":   {"script": "analyze_java_deps.py",   "extra_args": []},
+    "ros":    {"script": "analyze_ros_deps.py",    "extra_args": []},
 }
 
 # vendor 语言闭集：这些语言的语言级依赖（crate/module）由 vendor 解决，

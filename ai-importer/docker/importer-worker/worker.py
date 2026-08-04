@@ -24,6 +24,9 @@ LOCK_PREFIX  = "lock:ai:"
 JOB_PREFIX   = "job:ai:"
 LOGS_PREFIX  = "logs:ai:"
 LOCK_TTL     = 7200
+# ROS 批量任务（依赖展开 + 串行构建）必然超过 2h，锁按 mode 延长，
+# 否则多副本部署下锁过期会重复拉起同一 job
+LOCK_TTL_ROS = 21600
 
 
 def make_redis():
@@ -96,12 +99,15 @@ def main():
                 continue
 
             # 检查任务是否已被取消（排队中被取消的任务仍在队列中）
-            job_status = r.hget(f"{JOB_PREFIX}{job_id}", "status")
+            job_meta = r.hgetall(f"{JOB_PREFIX}{job_id}")
+            job_status = job_meta.get("status")
             if job_status == "cancelled":
                 log.info("Job %s was cancelled while queued, skipping", job_id)
                 continue
 
-            locked = r.set(f"{LOCK_PREFIX}{job_id}", "1", nx=True, ex=LOCK_TTL)
+            # ROS 任务锁 TTL 按 mode 延长（批量 ROS 任务必然超过普通 2h）
+            _ttl = LOCK_TTL_ROS if job_meta.get("mode") == "ros" else LOCK_TTL
+            locked = r.set(f"{LOCK_PREFIX}{job_id}", "1", nx=True, ex=_ttl)
             if not locked:
                 log.warning("Job %s lock conflict (should not happen), skipping", job_id)
                 continue

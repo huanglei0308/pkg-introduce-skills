@@ -219,6 +219,7 @@ fi
 - `c` / `cpp`：Read `/app/.claude/skills/build-rpm/spec-rules-cpp.md`
 - `go`：Read `/app/.claude/skills/build-rpm/spec-rules-go.md`
 - `rust`：Read `/app/.claude/skills/build-rpm/spec-rules-rust.md`
+- `ros`：Read `/app/.claude/skills/build-rpm/spec-rules-ros.md`
 
 **使用预检结果填写 BuildRequires：** 读 `./pkgs/<pkgname>/pre_check.json` 的 `resolved[].rpm_requirement` 直接填入。
 
