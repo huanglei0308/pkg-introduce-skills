@@ -12,6 +12,7 @@
 """
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -90,6 +91,10 @@ def main():
         # 构建工具链不得注册为依赖
         if is_toolchain(name):
             print(f"[update-dep-registry] skip toolchain: {name}")
+            continue
+        # 白名单校验：dep 名称只允许合法包名字符，防止换行注入污染 agent prompt
+        if not re.fullmatch(r'[a-zA-Z0-9._+\-]{1,128}', name):
+            print(f"[update-dep-registry] skip invalid dep name: {name!r}")
             continue
         new_constraint = dep.get("constraint", "")
         if name not in reg:
