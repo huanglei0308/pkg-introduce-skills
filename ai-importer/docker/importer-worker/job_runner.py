@@ -574,6 +574,11 @@ def run_job(r, proj, job_id):
         _finish(r, job_id, "failed", f"invalid url: {url!r}")
         return
     version    = job.get("version", "")
+    # 校验 version：只允许合法版本号字符，防止 shell 元字符注入
+    if version and not re.fullmatch(r'[a-zA-Z0-9._+\-]{1,64}', version):
+        _log(r, job_id, f"[安全] version 格式非法，拒绝执行: {version!r}")
+        _finish(r, job_id, "failed", f"invalid version: {version!r}")
+        return
     owner, coprname = proj.split("/", 1)
     copr_login  = job.get("copr_login", "")
     copr_token  = job.get("copr_token", "")

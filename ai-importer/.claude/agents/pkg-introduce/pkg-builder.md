@@ -106,7 +106,7 @@ done
 ## 阶段一：调用 build-rpm skill 生成 spec + SRPM
 
 ```
-/build-rpm ${PKGNAME} ${LANG} ${UPSTREAM_URL} ${VERSION} ${LESSONS_ARG}
+/build-rpm "${PKGNAME}" "${LANG}" "${UPSTREAM_URL}" "${VERSION}" ${LESSONS_ARG}
 ```
 
 build-rpm skill 在 COPR 模式下（无 `SESSION_CONTAINER`）：
@@ -149,7 +149,7 @@ build-rpm skill 在 COPR 模式下（无 `SESSION_CONTAINER`）：
 预检通过但构建未完成。跳过预检直接进入构建：
 
 ```bash
-/build-rpm ${PKGNAME} ${LANG} ${UPSTREAM_URL} ${VERSION} ${LESSONS_ARG} \
+/build-rpm "${PKGNAME}" "${LANG}" "${UPSTREAM_URL}" "${VERSION}" ${LESSONS_ARG} \
   --phase build \
   --precheck-json ./pkgs/${PKGNAME}/pre_check.json
 ```
