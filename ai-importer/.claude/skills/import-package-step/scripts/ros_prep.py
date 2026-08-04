@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""
+ROS 引包预检：定位 + gate 判定 + manifest + 伪 gate_result（ROS 链第一步）
+
+替代 run_check+run_gate 在 ROS 语境的角色，一个脚本完成：
+
+  1. 查 ros-projects.list：包名存在性校验、`-`/`_` 归一化、定位上游仓库
+  2. sibling 展开（同仓库其他包，EUR 按仓库整体构建）
+  3. gate 判定：cascade 查询 ros-humble-<pkg>（EUR → 官方源 → gitcode）
+     → 官方已有且版本满足 = reuse；落后 = upgrade；没有 = introduce_new
+  4. 依赖分拣（复用 analyze_ros_deps.classify_deps）：
+     - explicit：官方没有的依赖 → 缺口清单 missing_deps_<pkg>.txt（终止+重提闭环）
+     - deep：官方没有的依赖 → register-dep 注册（lang=ros，走现有 build 链）
+     - 官方已有的依赖 → manifest 的 official_deps（BuildRequires 候选）
+  5. 产出三样：
+     - ros_pkg_manifest.json
+     - 伪 gate_result_<pkg>.json（decision=introduce_new, lang=ros, version=清单版本）
+     - missing_deps_<pkg>.txt（explicit 缺口）
+
+伪 gate_result 是融入方案的支点：supervisor 的 gate_valid 检查只认
+decision ∈ (introduce_new, reuse_*, ...) 且 overall_status=done，伪 gate_result
+让 build/fix 整条链零改动复用。
+
+用法：
+  python3 ros_prep.py --pkg <pkgname> --session-dir <sd>
+  python3 ros_prep.py --pkg <pkgname> --session-dir <sd> --deep
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+# 复用 analyze_ros_deps（解析/分拣）与 cascade_package_check（EUR/官方源查询）
+BUILD_RPM_SCRIPTS = SCRIPT_DIR.parents[1] / "build-rpm" / "scripts"
+for _p in (str(BUILD_RPM_SCRIPTS), str(SCRIPT_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from analyze_ros_deps import classify_deps, load_projects, load_remap  # noqa: E402
+from cascade_package_check import check_package_existence  # noqa: E402
+
+# 官方 ROS 基座包（ROS SIG repo 提供，永不注册/报缺口，直接 BuildRequires）
+ROS_BASE_PKGS = {
+    "ament_cmake", "ament_cmake_core", "ament_cmake_export_dependencies",
+    "ament_cmake_python", "ament_lint_auto", "ament_lint_common",
+    "ament_package", "ament_index_python", "ros_workspace", "rcutils",
+    "rclpy", "rosidl_cmake", "rosidl_default_generators", "rosidl_default_runtime",
+    "rosidl_runtime_c", "rosidl_typesupport_interface", "python3_rosdistro",
+    "urdfdom", "console_bridge", "tinyxml_vendor", "eigen3_cmake_module",
+}
+
+
+def _norm_name(pkg: str) -> str:
+    """`-`/`_` 归一化查表：用户可能把 RPM 名（ros-humble-x）或变体输进来。"""
+    pkg = pkg.strip()
+    for pfx in ("ros-humble-", "ros2-"):
+        if pkg.startswith(pfx):
+            return pkg[len(pfx):].replace("_", "-")
+    return pkg.replace("_", "-")
+
+
+def _read_session(sd: Path) -> dict:
+    path = sd / "session.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _cmp_version(listed: str, official: str) -> int:
+    """简单版本比较：≥ 返回 1，< 返回 -1，无法比较返回 0。"""
+    try:
+        def _k(v):
+            return [int(x) if x.isdigit() else x for x in v.replace("-", ".").split(".")]
+        a, b = _k(listed), _k(official)
+        return (a > b) - (a < b)
+    except Exception:
+        return 0
+
+
+def _cascade_query(pkg_rpm: str, chroot: str, session: dict,
+                   version: str = "") -> dict:
+    """复用普通链的 4 级级联查询判定 ros-humble-<pkg> 的存在状态。"""
+    import os
+    copr_url = session.get("copr_url", os.environ.get("COPR_FRONTEND_URL",
+                                                      "http://copr-frontend:5000"))
+    try:
+        return check_package_existence(
+            pkg_rpm, lang="ros", version=version, requirement="",
+            target=chroot, copr_url=copr_url,
+            copr_owner=session.get("copr_owner", ""),
+            copr_project=session.get("copr_project", ""),
+            copr_login=session.get("copr_login", ""),
+            copr_token=session.get("copr_token", ""),
+        )
+    except Exception as exc:
+        # 查询失败保守处理：按"未找到"走引入链（构建失败由修复循环兜底）
+        print(f"[ros_prep] WARN cascade query failed for {pkg_rpm}: {exc}", file=sys.stderr)
+        return {"decision": "introduce_new", "level": 0}
+
+
+def _is_official(decision: str) -> bool:
+    return decision in ("reuse_official", "reuse_eur_srpm", "reuse_copr_project")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="ROS 引包预检")
+    parser.add_argument("--pkg", required=True, help="ROS 包名")
+    parser.add_argument("--session-dir", required=True)
+    parser.add_argument("--ros-distro", default="humble", help="ROS 发行版（默认 humble）")
+    parser.add_argument("--deep", action="store_true", help="deep 模式：缺口自动注册依赖")
+    args = parser.parse_args()
+
+    sd = Path(args.session_dir)
+    session = _read_session(sd)
+    ros_distro = session.get("ros_distro") or args.ros_distro
+    chroot = session.get("copr_chroot", "")
+
+    pkg = _norm_name(args.pkg)
+    pkg_dir = sd / "pkgs" / pkg
+    pkg_dir.mkdir(parents=True, exist_ok=True)
+    gate_path = pkg_dir / f"gate_result_{pkg}.json"
+    manifest_path = pkg_dir / "ros_pkg_manifest.json"
+    missing_path = pkg_dir / f"missing_deps_{pkg}.txt"
+
+    def _fail(reason: str) -> int:
+        _write_json(gate_path, {
+            "pkgname": pkg, "lang": "ros", "version": "",
+            "overall_status": "failed", "error": reason, "result": None,
+        })
+        print(json.dumps({"status": "failed", "reason": reason}, ensure_ascii=False))
+        return 1
+
+    # ── 1. 清单定位 ─────────────────────────────────────────────────────────
+    projects = load_projects(ros_distro)
+    if not projects:
+        return _fail(f"ros-projects.list 为空或不存在（distro={ros_distro}）")
+    if pkg not in projects:
+        return _fail(f"包不在 ros-projects.list 中: {pkg}（请核对包名/ros_distro）")
+
+    repo_url, status, listed_ver = projects[pkg]
+    siblings = sorted(k for k, v in projects.items() if v[0] == repo_url and k != pkg)
+
+    # ── 2. gate 判定（主包）────────────────────────────────────────────────
+    pkg_rpm = f"ros-{ros_distro}-{pkg}"
+    cascade = _cascade_query(pkg_rpm, chroot, session, version=listed_ver)
+    decision = cascade["decision"]
+    match = cascade.get("match") or {}
+    official_ver = match.get("version", "")
+
+    # decision → 伪 gate_result 映射
+    if _is_official(decision):
+        # 官方已有：版本一致 → reuse（写 goal_achieved，直接 done）；
+        # 落后 → upgrade（以官方 spec 为参考重建，introduce_new_with_ref）
+        if official_ver and _cmp_version(listed_ver, official_ver) < 0:
+            gate_decision = "introduce_new_with_ref"
+            gate_reason = (f"官方已有 ros-{ros_distro}-{pkg} {official_ver}，"
+                           f"清单版本 {listed_ver} 落后，以官方 spec 为参考升级构建")
+        else:
+            gate_decision = "reuse_official"
+            gate_reason = f"官方已有 ros-{ros_distro}-{pkg} {official_ver or listed_ver}，直接复用"
+    elif decision == "introduce_new_with_ref":
+        gate_decision = "introduce_new_with_ref"
+        ref = cascade.get("reference") or {}
+        gate_reason = (f"以参考 spec 为起点构建："
+                       f"{ref.get('source', 'unknown')} {ref.get('gitcode_repo', '')}")
+    else:
+        gate_decision = "introduce_new"
+        gate_reason = "官方源未找到，从头构建"
+
+    # ── 3. 依赖分拣（package.xml 可能尚缺：deep 模式由递归 evaluate 补全）────
+    # sources/ 就绪后由 ros_fetch 前的 analyze 补充；此处依赖信息来自
+    # 已有 manifest 或解析（若源码已在 session 中）。
+    manifest = {
+        "pkgname": pkg,
+        "ros_distro": ros_distro,
+        "repo_url": repo_url,
+        "repo_status": status,
+        "listed_version": listed_ver,
+        "siblings": siblings,
+        "gate_decision": gate_decision,
+        "official_deps": [],
+        "missing_deps": [],
+        "registered_deps": [],
+        "official_deps_rpm": [],
+    }
+
+    # 源码已在 session（重跑/断点续跑）→ 现场解析依赖
+    src_candidates = [sd / "sources" / pkg, sd / "sources" / repo_url.split("/")[-1]]
+    src_dir = next((s for s in src_candidates if s.is_dir()), None)
+    if src_dir is not None:
+        try:
+            from analyze_ros_deps import parse_package_xml
+            parsed = parse_package_xml(str(src_dir), pkg)
+            if parsed["found"]:
+                remap = load_remap()
+                cls = classify_deps(parsed["deps"] + parsed["buildtool_deps"],
+                                    projects, remap)
+                deps = sorted(set(cls["ros_deps"]))
+                for d in deps:
+                    if d in ROS_BASE_PKGS:
+                        manifest["official_deps_rpm"].append(f"ros-{ros_distro}-{d}")
+                        continue
+                    c = _cascade_query(f"ros-{ros_distro}-{d}", chroot, session)
+                    if _is_official(c["decision"]):
+                        manifest["official_deps"].append(d)
+                        manifest["official_deps_rpm"].append(f"ros-{ros_distro}-{d}")
+                    elif args.deep:
+                        rc = subprocess.run(
+                            [sys.executable, str(SCRIPT_DIR / "register-dep.py"),
+                             "--session-dir", str(sd), "--pkg", f"ros-{ros_distro}-{d}",
+                             "--url", projects[d][0], "--lang", "ros",
+                             "--required-by", pkg],
+                            capture_output=True, text=True, timeout=30,
+                        )
+                        if rc.returncode == 0:
+                            manifest["registered_deps"].append(d)
+                        else:
+                            manifest["missing_deps"].append(d)
+                            print(f"[ros_prep] WARN register {d} failed: "
+                                  f"{rc.stderr.strip()[:200]}", file=sys.stderr)
+                    else:
+                        manifest["missing_deps"].append(d)
+        except Exception as exc:
+            print(f"[ros_prep] WARN dep analysis skipped: {exc}", file=sys.stderr)
+
+    _write_json(manifest_path, manifest)
+
+    # explicit 缺口清单（随任务结束写入报告，前端渲染可点击 tag）
+    if manifest["missing_deps"]:
+        missing_path.write_text("\n".join(
+            f"ros-{ros_distro}-{d}" for d in manifest["missing_deps"]
+        ) + "\n", encoding="utf-8")
+
+    # ── 4. 伪 gate_result ───────────────────────────────────────────────────
+    # reuse 主包：直接置 goal_achieved（现有链 reuse 语义由 pkg-evaluator 写，
+    # ROS 链没有该 agent，这里代写）
+    if gate_decision == "reuse_official":
+        wf_files = list(sd.glob("workflow_*.json"))
+        if wf_files:
+            try:
+                wf = json.loads(wf_files[0].read_text(encoding="utf-8"))
+                wf["goal_achieved"] = True
+                wf.setdefault("reused_pkgs", []).append(pkg)
+                wf_files[0].write_text(json.dumps(wf, ensure_ascii=False, indent=2),
+                                       encoding="utf-8")
+            except Exception:
+                pass
+
+    _write_json(gate_path, {
+        "pkgname": pkg,
+        "lang": "ros",
+        "version": listed_ver,
+        "overall_status": "done",
+        "result": {
+            "lang": "ros",
+            "version": listed_ver,
+            "decision": gate_decision,
+            "reason": gate_reason,
+            "repo_url": repo_url,
+        },
+        "reference": cascade.get("reference") or {},
+        "steps": {"existing_check": {"status": "done", "decision": gate_decision,
+                                     "reason": gate_reason}},
+    })
+
+    print(json.dumps({
+        "status": "done",
+        "pkgname": pkg,
+        "gate_decision": gate_decision,
+        "listed_version": listed_ver,
+        "official_deps": manifest["official_deps"],
+        "missing_deps": manifest["missing_deps"],
+        "registered_deps": manifest["registered_deps"],
+    }, ensure_ascii=False, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
