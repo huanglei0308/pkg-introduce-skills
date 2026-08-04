@@ -16,6 +16,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import urlparse
 
 JOB_PREFIX  = "job:ai:"
 LOGS_PREFIX = "logs:ai:"
@@ -563,6 +564,15 @@ def run_job(r, proj, job_id):
         _finish(r, job_id, "failed", f"invalid pkgname: {pkgname!r}")
         return
     url        = job["url"]
+    # 校验 url：只允许 http/https，禁止换行（防 prompt 换行注入），长度上限 512
+    try:
+        _parsed = urlparse(url)
+        if _parsed.scheme not in ("http", "https") or "\n" in url or "\r" in url or len(url) > 512:
+            raise ValueError
+    except ValueError:
+        _log(r, job_id, f"[安全] url 格式非法，拒绝执行: {url!r}")
+        _finish(r, job_id, "failed", f"invalid url: {url!r}")
+        return
     version    = job.get("version", "")
     owner, coprname = proj.split("/", 1)
     copr_login  = job.get("copr_login", "")
