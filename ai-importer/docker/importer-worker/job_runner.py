@@ -9,6 +9,7 @@ job_runner 做三件事：
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -547,6 +548,12 @@ def run_job(r, proj, job_id):
             _log(r, job_id, f"[归一化] pkgname '{pkgname}' → '{_normalized}'")
             pkgname = _normalized
             break
+    # 白名单校验：pkgname 只允许合法包名字符，拒绝换行等可用于 prompt 注入的字符
+    if not re.fullmatch(r'[a-zA-Z0-9._+\-]{1,128}', pkgname):
+        _log(r, job_id, f"[安全] pkgname 格式非法，拒绝执行: {pkgname!r}")
+        _finish(r, job_id, "failed", f"invalid pkgname: {pkgname!r}")
+        return
+
     url        = job["url"]
     version    = job.get("version", "")
     owner, coprname = proj.split("/", 1)

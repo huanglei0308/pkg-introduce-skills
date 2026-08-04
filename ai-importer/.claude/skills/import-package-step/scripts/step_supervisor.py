@@ -1853,6 +1853,14 @@ def main() -> int:
         entry = reg[target]
         constraint = entry.get("constraint", "") if isinstance(entry, dict) else ""
 
+    # 白名单校验：包名类 action 的 target 只允许合法包名字符，防止换行注入污染 agent prompt
+    _PKG_ACTIONS = {"evaluate_main", "evaluate", "resolve_upstream",
+                    "build_main", "build_dep", "fix_failure", "fix_failure_dep",
+                    "verify_install", "feedback", "analyze_evaluate_main", "analyze_evaluate"}
+    if action in _PKG_ACTIONS and not re.fullmatch(r'[a-zA-Z0-9._+\-]{1,128}', target):
+        print(f"[security] target 格式非法，强制 fail: {target!r}", file=sys.stderr)
+        action, target, delay = "fail", f"invalid target name: {target!r}", None
+
     result = {"action": action, "target": target, "delay": delay, "loop": loop, "pkgname": PKGNAME, "constraint": constraint, "submode": submode}
     # 多 chroot 派发参数（§8.1/§8.2）：build 步骤输出本轮可提交子集
     # COPR_BUILD_CHROOTS，fix/analyze 步骤输出失败 chroot CHROOT；
