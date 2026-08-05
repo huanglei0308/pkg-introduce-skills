@@ -391,6 +391,11 @@ def _sync_copr_result(session_dir: Path, pkgname: str, job_id: str = "") -> None
         for _, bid in todo:
             if bid not in seen_bids:
                 seen_bids.append(bid)
+        # ROS 模式期望名：RPM 名强制带 ros-<distro>- 前缀（spec-rules-ros.md §1
+        # 包名纪律），与上游名必然不同——直接构造期望名比对，不套用 python 前缀剥离。
+        import_type = session.get("import_type", "")
+        ros_distro  = session.get("ros_distro", "")
+        mismatch_detail = ""
         build_data = {}
         for bid in seen_bids:
             data = get_build(bid, login, token)
@@ -398,33 +403,35 @@ def _sync_copr_result(session_dir: Path, pkgname: str, job_id: str = "") -> None
             actual_pkg = data.get("source_package", {}).get("name", "")
             if actual_pkg and actual_pkg != pkgname:
                 expected = pkgname
-                try:
-                    import sys as _sys
-                    _scripts_dir = str(Path(SKILLS_DIR) / "build-rpm/scripts")
-                    if _scripts_dir not in _sys.path:
-                        _sys.path.insert(0, _scripts_dir)
-                    from rpm_naming import upstream_from_srpm_name, rpm_name_from_gav
-                    gate_path = session_dir / f"pkgs/{pkgname}/gate_result_{pkgname}.json"
-                    lang = ""
-                    if gate_path.exists():
-                        gate_data = _json.loads(gate_path.read_text())
-                        lang = gate_data.get("lang", "") or gate_data.get("result", {}).get("lang", "")
-                    # 从 RPM 名剥离前缀还原上游名（python3-setuptools → setuptools）
-                    # lang 为空时默认 "python"——Python 是最常见的包语言
-                    normalized = upstream_from_srpm_name(actual_pkg, lang or "python")
-                    # Java：pkgname 是 Maven GAV（com.google.j2objc:j2objc-annotations），
-                    # SRPM 名是 artifactId（j2objc-annotations），expected 侧需归一
-                    if lang == "java":
-                        expected = rpm_name_from_gav(pkgname)
-                except Exception:
+                if import_type == "ros":
+                    expected = f"ros-{ros_distro}-{pkgname}" if ros_distro else pkgname
                     normalized = actual_pkg
+                else:
+                    try:
+                        import sys as _sys
+                        _scripts_dir = str(Path(SKILLS_DIR) / "build-rpm/scripts")
+                        if _scripts_dir not in _sys.path:
+                            _sys.path.insert(0, _scripts_dir)
+                        from rpm_naming import upstream_from_srpm_name, rpm_name_from_gav
+                        gate_path = session_dir / f"pkgs/{pkgname}/gate_result_{pkgname}.json"
+                        lang = ""
+                        if gate_path.exists():
+                            gate_data = _json.loads(gate_path.read_text())
+                            lang = gate_data.get("lang", "") or gate_data.get("result", {}).get("lang", "")
+                        # 从 RPM 名剥离前缀还原上游名（python3-setuptools → setuptools）
+                        # lang 为空时默认 "python"——Python 是最常见的包语言
+                        normalized = upstream_from_srpm_name(actual_pkg, lang or "python")
+                        # Java：pkgname 是 Maven GAV（com.google.j2objc:j2objc-annotations），
+                        # SRPM 名是 artifactId（j2objc-annotations），expected 侧需归一
+                        if lang == "java":
+                            expected = rpm_name_from_gav(pkgname)
+                    except Exception:
+                        normalized = actual_pkg
                 if normalized != expected:
-                    br["status"] = "failed"
-                    br["failure_reason"] = (
+                    mismatch_detail = (
                         f"Package name mismatch: build {bid} "
-                        f"is '{actual_pkg}', expected '{pkgname}'"
+                        f"is '{actual_pkg}', expected '{expected}'"
                     )
-                    br_path.write_text(_json.dumps(br, indent=2, ensure_ascii=False))
                     # MISMATCH 计数写入 fix_state.json：supervisor 对第 2 次 MISMATCH
                     # 直接 fail（重生成一次仍 mismatch = 根因不在 spec 文本）
                     try:
@@ -435,10 +442,10 @@ def _sync_copr_result(session_dir: Path, pkgname: str, job_id: str = "") -> None
                         fs_path.write_text(_json.dumps(fs, indent=2, ensure_ascii=False))
                     except Exception as e:
                         print(f"[sync_copr][{job_id}] warn: mismatch_count 写入失败: {e}", flush=True)
-                    print(f"[sync_copr][{job_id}] MISMATCH: build {bid} is {actual_pkg}, expected {pkgname}",
+                    print(f"[sync_copr][{job_id}] MISMATCH: build {bid} is {actual_pkg}, expected {expected}",
                           flush=True)
-                    _extract_build_failure(session_dir, pkgname, job_id)
-                    return
+                    # 不再 return：真实 build log 仍要拉取——名字不匹配只是二次症状，
+                    # 真实失败原因（依赖缺失等）必须留给 pkg-fixer 诊断。
 
         terminal = {"succeeded", "failed", "canceled", "skipped"}
         import urllib.request, re, gzip as _gzip
@@ -500,10 +507,17 @@ def _sync_copr_result(session_dir: Path, pkgname: str, job_id: str = "") -> None
         br["build_log"] = primary_res.get("build_log", "")
         br["build_log_tail"] = primary_res.get("build_log_tail", "")
         failed_chroots = [c for c, st in merged_states.items() if st != "succeeded"]
-        if not failed_chroots:
+        if not failed_chroots and not mismatch_detail:
             br["status"] = "success"
         else:
             br["status"] = "failed"
+            if mismatch_detail:
+                # 构建本身成功但包名错（唯一可用信息）→ 用 mismatch 作失败原因；
+                # 构建失败时保留聚合默认原因，真实根因由 extract-build-failure
+                # 解析 chroot_results 里的真实 build log 得出（不再被短路掩盖）
+                if not failed_chroots:
+                    br["failure_reason"] = mismatch_detail
+                br["pkgname_mismatch"] = mismatch_detail
             br["failure_reason"] = br.get("failure_reason") or (
                 f"copr build {primary_state}" if len(chroots) <= 1
                 else "copr build failed chroots: " + ", ".join(failed_chroots)
