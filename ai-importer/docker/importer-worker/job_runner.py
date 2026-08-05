@@ -107,7 +107,7 @@ def _parse_job_chroots(job: dict) -> list:
 
 
 def _primary_chroot(chroots: list) -> str:
-    """主 chroot（设计 §7.3）：排序后优先取第一个 -x86_64 结尾的，否则取排序后第一个。"""
+    """主 chroot：排序后优先取第一个 -x86_64 结尾的，否则取排序后第一个。"""
     ordered = sorted(chroots)
     for c in ordered:
         if c.endswith("-x86_64"):
@@ -126,9 +126,9 @@ def _safe_int(v):
 
 
 def _collect_chroot_status(session_dir: Path, job_status: str = "") -> dict:
-    """聚合 per-chroot 终态（设计 §3.4 chroot_status）：
+    """聚合 per-chroot 终态：
     {chroot: {"status": "succeeded"|"failed"|"skipped", "build_id": ...}}。
-    数据来自 session.json 的 chroot 列表 + dep_registry.json 条目的 chroots 映射（§8.1）；
+    数据来自 session.json 的 chroot 列表 + dep_registry.json 条目的 chroots 映射；
     读不到 per-chroot 数据时降级为只含主 chroot（状态按 job 终态映射）。"""
     try:
         sess_path = session_dir / "session.json"
@@ -331,7 +331,7 @@ def _sync_copr_result(session_dir: Path, pkgname: str, job_id: str = "") -> None
         if not chroots and legacy_chroot:
             chroots = [legacy_chroot]
 
-        # fallback：从 dep_registry.json 里找 chroot → build_id 映射（§8.1 schema）
+        # fallback：从 dep_registry.json 里找 chroot → build_id 映射
         dep_reg_path = session_dir / "dep_registry.json"
         if dep_reg_path.exists():
             dep_reg = _json.loads(dep_reg_path.read_text())
@@ -604,7 +604,7 @@ def run_job(r, proj, job_id):
         _log(r, job_id, "ERROR: job 缺少 copr_chroot")
         _finish(r, job_id, "failed", "missing chroot")
         return
-    # 主 chroot（§7.3）：排序后 x86_64 优先；兼容字段 COPR_CHROOT / session.json 均用它
+    # 主 chroot：排序后 x86_64 优先；兼容字段 COPR_CHROOT / session.json 均用它
     copr_chroot = _primary_chroot(copr_chroots)
 
     r.hset(f"{JOB_PREFIX}{job_id}", "status", "running")
@@ -1051,7 +1051,7 @@ def run_job(r, proj, job_id):
                                   "supervisor returned no action", start)
             return
 
-        # 多 chroot 派发（§8.1/§8.2）：supervisor 输出的本轮可提交子集 / 目标 chroot
+        # 多 chroot 派发：supervisor 输出的本轮可提交子集 / 目标 chroot
         # 注入 claude 子进程 env（构建脚本侧回退 COPR_BUILD_CHROOTS > COPR_CHROOTS
         # > COPR_CHROOT）。每轮先清理，避免上一轮残留。
         env.pop("COPR_BUILD_CHROOTS", None)

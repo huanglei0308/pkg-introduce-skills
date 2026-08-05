@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""dep_registry per-chroot 就绪状态的共享 helper（多 chroot 构建，设计见
-report731/multi_chroot_build_design.md §8.1）。
+"""dep_registry per-chroot 就绪状态的共享 helper（多 chroot 构建）。
 
 Schema：条目保留包级字段（url/constraint/required_by/status），新增可选键
     "chroots": {<chroot>: {"status": ..., "build_id": <int 可选>}}

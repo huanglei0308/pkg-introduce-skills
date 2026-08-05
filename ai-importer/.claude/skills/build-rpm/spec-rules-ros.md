@@ -61,7 +61,7 @@ export PKG_CONFIG_PATH=/opt/ros/%{ros_distro}/lib/pkgconfig${PKG_CONFIG_PATH:+:$
 | 纯 cmake（3rdparty） | 无 ament 标记，上游纯 CMake | 标准 `%cmake` 流程 + §3 前缀 |
 | vendor 包 | `_vendor` 后缀 / manifest 标 3rdparty | 见 §7 参考资产 |
 
-**禁用测试优先转构建参数，而非 patch**（report730 §4.2 认知）：
+**禁用测试优先转构建参数，而非 patch**：
 - 优先 `-DBUILD_TESTING=OFF -DTESTING=OFF -DCMAKE_SUPPRESS_REGENERATION=ON` 等参数关闭
 - 参数无法关闭时，其次考虑 `%cmake_build` 后删除测试目标；**最后**才用 patch
 - 测试依赖（package.xml `<test_depend>`）**不写 BuildRequires**

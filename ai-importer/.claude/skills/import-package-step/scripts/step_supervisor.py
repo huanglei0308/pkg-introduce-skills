@@ -86,7 +86,7 @@ DEP_READY_STATUSES = {"build_done", "reused", "vendor_only"}
 # dep_registry 中表示"等待自身前置依赖就绪"的状态
 DEP_WAITING_STATUS = "pending_deps"
 
-# ── 多 chroot 支持（设计：report731/multi_chroot_build_design.md §3.3 第 4 项、§8.1、§8.2） ──
+# ── 多 chroot 支持 ──
 # 一个 job 一个 COPR build 覆盖 N 个 chroot；失败只增量重交失败的 chroot；
 # 依赖就绪按 chroot 判定。所有 per-chroot 逻辑只在"新 session"（session.json 显式
 # 带 copr_chroots 列表）下启用；旧 session（仅 copr_chroot 单值）与无 chroots 键的

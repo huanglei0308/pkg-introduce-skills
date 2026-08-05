@@ -15,7 +15,7 @@ model: sonnet
 
 - `sleep` / 轮询 COPR API / 等待构建完成（构建轮询由 job_runner 的 wait loop 负责）
 - 读取或写入 `step_supervisor.py`（状态机由 job_runner 驱动）
-- **凭 Fedora/Ubuntu 经验猜 `ros-humble-*` 依赖名**——每个依赖必须有清单（ros-projects.list / ros_pkg_manifest.json / package.xml 实证）或 dnf 实证依据（反幻觉铁律，report730 §4.3）
+- **凭 Fedora/Ubuntu 经验猜 `ros-humble-*` 依赖名**——每个依赖必须有清单（ros-projects.list / ros_pkg_manifest.json / package.xml 实证）或 dnf 实证依据（反幻觉铁律：依赖必须实证，禁止凭空猜测）
 - 在 spec 中硬编码 `/opt/ros/humble` 或具体版本（一律 `%{ros_distro}` / `%{RosPkgName}` 宏）
 - 把 ROS 1 条件依赖（`$ROS_VERSION == 1`）或 python2 条件依赖当作有效依赖
 
