@@ -565,9 +565,14 @@ def run_job(r, proj, job_id):
         return
     url        = job["url"]
     # 校验 url：只允许 http/https，禁止换行（防 prompt 换行注入），长度上限 512
+    # 注：ROS 模式 url 允许为空（源码由 rosdistro 索引定位，见 ros_fetch.py），
+    # 非空时同样执行格式校验；普通模式空 url 依旧拒绝（scheme '' 不在白名单）
     try:
-        _parsed = urlparse(url)
-        if _parsed.scheme not in ("http", "https") or "\n" in url or "\r" in url or len(url) > 512:
+        if url:
+            _parsed = urlparse(url)
+            if _parsed.scheme not in ("http", "https") or "\n" in url or "\r" in url or len(url) > 512:
+                raise ValueError
+        elif job.get("mode") != "ros":
             raise ValueError
     except ValueError:
         _log(r, job_id, f"[安全] url 格式非法，拒绝执行: {url!r}")
