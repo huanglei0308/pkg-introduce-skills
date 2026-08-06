@@ -264,6 +264,16 @@ def run_install_check(pkgs: list[str], chroot: str, copr_result_url: str,
 
     # 与 builddep 同模式：空 installroot + --releasever=/，与宿主 pod 解耦
     installroot = tempfile.mkdtemp(prefix="ci-install-")
+    # 预建 usrmerge 软链：空 installroot 里若 libgcc 先于 filesystem 解包，
+    # rpm 会把 /lib64 自动建成真实目录，filesystem 的 /lib64->usr/lib64
+    # 软链无法覆盖目录（cpio: already exists as a directory），整事务回滚
+    # 误报。预建软链后包文件直接落进 usr/lib64，与实际系统布局一致
+    root = Path(installroot)
+    for d in ("usr/bin", "usr/lib", "usr/lib64", "usr/sbin"):
+        (root / d).mkdir(parents=True, exist_ok=True)
+    for link, target in (("bin", "usr/bin"), ("lib", "usr/lib"),
+                         ("lib64", "usr/lib64"), ("sbin", "usr/sbin")):
+        (root / link).symlink_to(target)
     cmd += [f"--installroot={installroot}", "--releasever=/"]
     if base and arch != platform.machine():
         cmd += [f"--forcearch={arch}"]
