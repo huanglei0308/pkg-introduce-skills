@@ -257,6 +257,11 @@ def run_install_check(pkgs: list[str], chroot: str, copr_result_url: str,
 
     cmd = ["dnf", "install", "-y"]
 
+    # CI 源（含 --repofrompath 注入的）均无签名/无密钥可验，repoclosure 与
+    # builddep 的 repo 文件统一 gpgcheck=0；--repofrompath 不支持内联
+    # gpgcheck=0，空 installroot 里默认 gpgcheck=1 会整体误报，这里显式关闭
+    cmd += ["--nogpgcheck"]
+
     # 与 builddep 同模式：空 installroot + --releasever=/，与宿主 pod 解耦
     installroot = tempfile.mkdtemp(prefix="ci-install-")
     cmd += [f"--installroot={installroot}", "--releasever=/"]
