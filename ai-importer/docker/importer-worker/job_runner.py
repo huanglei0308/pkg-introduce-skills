@@ -14,12 +14,26 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
 
 JOB_PREFIX  = "job:ai:"
 LOGS_PREFIX = "logs:ai:"
+
+
+def _strip_unicode_controls(s: str) -> str:
+    """去除零宽字符、双向覆写等 Unicode 控制字符，防止隐藏注入。
+
+    保留 Cc 中的制表符(\\t)和换行(\\n/\\r)——它们由后续白名单校验拦截，
+    这里只清除不可见的格式/控制类字符（Cf 类）及其他 Cc 控制字符。
+    """
+    return "".join(
+        c for c in s
+        if unicodedata.category(c) not in ("Cf", "Cc")
+        or c in ("\n", "\r", "\t")
+    )
 
 SKILLS_DIR    = os.environ.get("SKILLS_DIR", "/app/.claude/skills")
 SESSIONS_BASE = Path(os.environ.get("SESSIONS_BASE", "/tmp/ai-sessions"))
@@ -562,6 +576,7 @@ def run_job(r, proj, job_id):
     ros_distro = job.get("ros_distro", "")
     deep_dependency = job.get("deep_dependency", "0") == "1"
     pkgname    = job["pkgname"]
+    pkgname    = _strip_unicode_controls(pkgname)
     # 归一化：用户可能误传入 RPM 包名（python-numpy），剥离语言前缀还原为上游名
     # ROS 模式跳过：ROS 包名无语言前缀，剥离逻辑会误伤（前端已按 ROS 语义校验）
     if mode != "ros":
@@ -578,6 +593,7 @@ def run_job(r, proj, job_id):
         _finish(r, job_id, "failed", f"invalid pkgname: {pkgname!r}")
         return
     url        = job["url"]
+    url        = _strip_unicode_controls(url)
     # 校验 url：只允许 http/https，禁止换行（防 prompt 换行注入），长度上限 512
     # 注：ROS 模式 url 允许为空（源码由 rosdistro 索引定位，见 ros_fetch.py），
     # 非空时同样执行格式校验；普通模式空 url 依旧拒绝（scheme '' 不在白名单）
@@ -593,6 +609,7 @@ def run_job(r, proj, job_id):
         _finish(r, job_id, "failed", f"invalid url: {url!r}")
         return
     version    = job.get("version", "")
+    version    = _strip_unicode_controls(version)
     # 校验 version：只允许合法版本号字符，防止 shell 元字符注入
     if version and not re.fullmatch(r'[a-zA-Z0-9._+\-]{1,64}', version):
         _log(r, job_id, f"[安全] version 格式非法，拒绝执行: {version!r}")
