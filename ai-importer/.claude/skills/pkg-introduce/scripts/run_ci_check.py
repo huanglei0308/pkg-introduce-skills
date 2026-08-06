@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
-CI 门禁（COPR 模式）：本地执行 repoclosure + dnf builddep，无 Docker。
+CI 门禁（COPR 模式）：本地执行 repoclosure + dnf install + dnf builddep，无 Docker。
 
-验证所有引入包的依赖是否闭合：
+三级检查（强度递进）：
+  - repoclosure：依赖闭合（每个 Requires 在 repo 集合里有提供者）
+  - dnf install：可安装性（干净 installroot 真跑安装事务，装完即删）
+  - dnf builddep：编译期依赖（BuildRequires 可满足）
+
+repo 集合：
   - 官方源：对应 chroot 版本的 openEuler repo
   - COPR project 源：本次构建的包
+  - COPR project additional_repos：项目级外部源（如 ROS SIG 源）
 
 用法：
   python3 run_ci_check.py \
@@ -55,8 +61,26 @@ def _chroot_arch(chroot: str) -> str:
     return "aarch64" if chroot.endswith("-aarch64") else "x86_64"
 
 
-def _get_copr_result_url(session_dir: Path) -> tuple[str, str]:
-    """从 session.json + gate_result 读取 COPR result repo URL 和 chroot。"""
+def _extra_repos(additional_repos: list[str], arch: str) -> list[tuple[str, str]]:
+    """把 COPR project 的 additional_repos 归一化为 (repoid, baseurl) 列表。
+
+    仅支持 http(s) baseurl（copr:// 前缀首期不处理，跳过并告警）；
+    URL 中的 $basearch 替换为目标 chroot 架构。
+    """
+    entries: list[tuple[str, str]] = []
+    for i, url in enumerate(additional_repos or []):
+        if not isinstance(url, str):
+            continue
+        url = url.strip()
+        if not url.startswith(("http://", "https://")):
+            print(f"[CI] 跳过暂不支持的 additional repo: {url}", file=sys.stderr)
+            continue
+        entries.append((f"ci-extra-{i}", url.replace("$basearch", arch)))
+    return entries
+
+
+def _get_copr_result_url(session_dir: Path) -> tuple[str, str, list[str]]:
+    """从 session.json + gate_result 读取 COPR result repo URL、chroot 和 additional_repos。"""
     session = json.loads((session_dir / "session.json").read_text())
     copr_url     = session.get("copr_url", "http://copr-frontend:5000")
     copr_owner   = session.get("copr_owner", "")
@@ -72,10 +96,14 @@ def _get_copr_result_url(session_dir: Path) -> tuple[str, str]:
     req   = urllib.request.Request(url, headers={"Authorization": f"Basic {creds}"})
     chroot = ""
     result_url = ""
+    additional_repos: list[str] = []
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             data = json.loads(r.read())
         chroot_repos = data.get("chroot_repos", {})
+        # 项目级外部源（如 ROS SIG 源），构建时会挂进 chroot，
+        # CI 检查也必须挂，否则基座包依赖被误报缺失
+        additional_repos = data.get("additional_repos", []) or []
         target_chroot = session.get("copr_chroot", "")
         # 优先匹配 session.json 里的 copr_chroot
         if target_chroot and target_chroot in chroot_repos:
@@ -93,7 +121,7 @@ def _get_copr_result_url(session_dir: Path) -> tuple[str, str]:
     except Exception as e:
         print(f"[CI] WARNING: 无法获取 COPR chroot 信息: {e}", file=sys.stderr)
 
-    return chroot, result_url
+    return chroot, result_url, additional_repos
 
 
 def _write_repo_file(repo_path: Path, chroot: str, copr_result_url: str) -> bool:
@@ -154,7 +182,8 @@ def _copr_repo_accessible(copr_result_url: str) -> bool:
         return False
 
 
-def run_repoclosure(pkgs: list[str], chroot: str, copr_result_url: str) -> tuple[bool, str]:
+def run_repoclosure(pkgs: list[str], chroot: str, copr_result_url: str,
+                    additional_repos: list[str]) -> tuple[bool, str]:
     """运行 repoclosure 检查运行时依赖。"""
     check = subprocess.run(["which", "repoclosure"], capture_output=True)
     if check.returncode != 0:
@@ -194,6 +223,9 @@ def run_repoclosure(pkgs: list[str], chroot: str, copr_result_url: str) -> tuple
             "--repo", "ci-copr-result",
         ]
 
+    for repoid, repo_url in _extra_repos(additional_repos, arch):
+        cmd += ["--repofrompath", f"{repoid},{repo_url}", "--repo", repoid]
+
     for pkg in pkgs:
         cmd += ["--check", pkg]
 
@@ -207,7 +239,66 @@ def run_repoclosure(pkgs: list[str], chroot: str, copr_result_url: str) -> tuple
     return True, ""
 
 
-def run_builddep(pkg: str, spec_path: Path, chroot: str, copr_result_url: str) -> tuple[bool, str]:
+def run_install_check(pkgs: list[str], chroot: str, copr_result_url: str,
+                      additional_repos: list[str]) -> tuple[bool, str]:
+    """运行 dnf install 做可安装性检查（干净 installroot 真跑安装事务）。
+
+    repoclosure 只验证依赖闭合（每个 Requires 在 repo 集合里有提供者），
+    不验证包本身可安装——conflicts、文件冲突、事务级错误都查不出。
+    这里在空 installroot 里真装一遍，装完即删。不能用 --assumeno：
+    只解算不执行，证不了 scriptlet 和事务提交。
+    """
+    base = _chroot_repo_base(chroot)
+    arch = _chroot_arch(chroot)
+    use_copr = bool(copr_result_url) and _copr_repo_accessible(copr_result_url)
+    if not use_copr:
+        # 产物源不可访问（尚无已构建的包）时无从安装，跳过而非误报
+        return True, "[SKIP] COPR result repo 不可访问，跳过可安装性检查"
+
+    cmd = ["dnf", "install", "-y"]
+
+    # 与 builddep 同模式：空 installroot + --releasever=/，与宿主 pod 解耦
+    installroot = tempfile.mkdtemp(prefix="ci-install-")
+    cmd += [f"--installroot={installroot}", "--releasever=/"]
+    if base and arch != platform.machine():
+        cmd += [f"--forcearch={arch}"]
+        # 跨架构无法执行目标架构的 scriptlet（%post 等），跳过以免误报；
+        # 代价是 scriptlet 执行失败查不出（同架构检查不带此参数）
+        cmd += ["--setopt=tsflags=noscripts"]
+
+    if base:
+        cmd += [
+            "--repofrompath", f"ci-oe-official,{base}/everything/{arch}/",
+            "--repofrompath", f"ci-oe-update,{base}/update/{arch}/",
+            "--repofrompath", f"ci-oe-epol,{base}/EPOL/main/{arch}/",
+            "--disablerepo=*",
+            "--enablerepo=ci-oe-official",
+            "--enablerepo=ci-oe-update",
+            "--enablerepo=ci-oe-epol",
+        ]
+
+    cmd += [
+        "--repofrompath", f"ci-copr-result,{copr_result_url}",
+        "--enablerepo=ci-copr-result",
+    ]
+
+    for repoid, repo_url in _extra_repos(additional_repos, arch):
+        cmd += ["--repofrompath", f"{repoid},{repo_url}", f"--enablerepo={repoid}"]
+
+    cmd += pkgs
+
+    # 真实安装要下载 RPM 包体（不只是元数据），放宽超时
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    finally:
+        shutil.rmtree(installroot, ignore_errors=True)
+    if result.returncode != 0:
+        return False, (result.stdout + result.stderr).strip()
+    return True, ""
+
+
+def run_builddep(pkg: str, spec_path: Path, chroot: str, copr_result_url: str,
+                 additional_repos: list[str]) -> tuple[bool, str]:
     """运行 dnf builddep 检查编译期依赖。"""
     if not spec_path.exists():
         return True, f"[SKIP] spec 文件不存在: {spec_path}"
@@ -258,6 +349,9 @@ def run_builddep(pkg: str, spec_path: Path, chroot: str, copr_result_url: str) -
             "--enablerepo=ci-copr-result",
         ]
 
+    for repoid, repo_url in _extra_repos(additional_repos, arch):
+        cmd += ["--repofrompath", f"{repoid},{repo_url}", f"--enablerepo={repoid}"]
+
     cmd.append(str(spec_path))
 
     # 空 installroot 需重新下载仓库元数据，放宽超时
@@ -273,7 +367,7 @@ def run_builddep(pkg: str, spec_path: Path, chroot: str, copr_result_url: str) -
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="CI 门禁：repoclosure + dnf builddep（COPR 模式）")
+    parser = argparse.ArgumentParser(description="CI 门禁：repoclosure + dnf install + dnf builddep（COPR 模式）")
     parser.add_argument("--pkgs", nargs="+", required=True, help="待检查的包名列表")
     parser.add_argument("--session-dir", required=True, help="session 目录路径")
     parser.add_argument("--reports-dir", default="", help="报告输出目录")
@@ -288,18 +382,20 @@ def main() -> int:
 
     # 1. 获取 COPR 信息
     print("[CI] 读取 COPR 信息...")
-    chroot, copr_result_url = _get_copr_result_url(session_dir)
+    chroot, copr_result_url, additional_repos = _get_copr_result_url(session_dir)
     if chroot:
         print(f"[CI] chroot: {chroot}")
     if copr_result_url:
         print(f"[CI] COPR result URL: {copr_result_url}")
     else:
         print("[CI] WARNING: 未找到 COPR result URL，将仅检查官方源", file=sys.stderr)
+    if additional_repos:
+        print(f"[CI] additional_repos: {additional_repos}")
 
     try:
-        # 3. repoclosure（所有包一起验证运行时依赖）
+        # 2. repoclosure（所有包一起验证运行时依赖闭合）
         print(f"[CI] 运行 repoclosure（{len(args.pkgs)} 个包）...")
-        ok, msg = run_repoclosure(args.pkgs, chroot, copr_result_url)
+        ok, msg = run_repoclosure(args.pkgs, chroot, copr_result_url, additional_repos)
         if ok:
             if msg.startswith("[SKIP]"):
                 print(f"[CI] ⚠ {msg}")
@@ -310,13 +406,26 @@ def main() -> int:
             print("[CI] ✗ 运行时依赖闭合检查失败", file=sys.stderr)
             errors.append(f"repoclosure 失败:\n{msg}")
 
+        # 3. dnf install（所有包一起验证可安装性，干净 installroot 真装）
+        print(f"[CI] 运行可安装性检查（{len(args.pkgs)} 个包）...")
+        ok, msg = run_install_check(args.pkgs, chroot, copr_result_url, additional_repos)
+        if ok:
+            if msg.startswith("[SKIP]"):
+                print(f"[CI] ⚠ {msg}")
+                warnings.append(msg)
+            else:
+                print("[CI] ✓ 可安装性检查通过")
+        else:
+            print("[CI] ✗ 可安装性检查失败", file=sys.stderr)
+            errors.append(f"可安装性检查失败:\n{msg}")
+
         # 4. dnf builddep（逐包验证编译期依赖）
         # spec 在 reports_dir（= pkgs/$TARGET）下；--pkgs 传的是 SRPM/二进制名，未必等于目录名
         spec_files = sorted(reports_dir.glob("*.spec"))
         for pkg in args.pkgs:
             spec_path = spec_files[0] if spec_files else reports_dir / f"{pkg}.spec"
             print(f"[CI] 运行 dnf builddep（{pkg}）...")
-            ok, msg = run_builddep(pkg, spec_path, chroot, copr_result_url)
+            ok, msg = run_builddep(pkg, spec_path, chroot, copr_result_url, additional_repos)
             if ok:
                 if msg.startswith("[SKIP]"):
                     print(f"[CI] ⚠ {msg}")
@@ -333,7 +442,8 @@ def main() -> int:
     # 5. 写结果文件
     status = "pass" if not errors else "fail"
     result = {"status": status, "errors": errors, "warnings": warnings,
-              "chroot": chroot, "copr_result_url": copr_result_url}
+              "chroot": chroot, "copr_result_url": copr_result_url,
+              "additional_repos": additional_repos}
     out_file = reports_dir / "ci_check_result.json"
     out_file.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[CI] 结果已写入: {out_file}")

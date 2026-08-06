@@ -171,8 +171,8 @@ print('\n'.join(f'{k}: {v}' for k, v in json.load(open('$SESSION_DIR/pkgs/$PKGNA
   ;;
 
 verify_install)
-  # 构建成功后：repoclosure 验证 RPM 可安装性
-  echo "[step] 运行 repoclosure 安装验证..."
+  # 构建成功后：CI 门禁（依赖闭合 + 可安装性 + 编译期依赖）
+  echo "[step] 运行 CI 门禁检查..."
   eval "$(python3 $SCRIPTS_DIR/read-session.py --session-dir $SESSION_DIR)"
   _BID=$(python3 -c "import json; print(json.load(open('$SESSION_DIR/pkgs/$TARGET/build_rpm_result.json')).get('copr_build_id',''))" 2>/dev/null)
   _SRPM=""

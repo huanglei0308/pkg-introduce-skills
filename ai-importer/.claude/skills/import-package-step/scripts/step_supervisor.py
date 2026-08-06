@@ -1515,7 +1515,7 @@ def determine_action(sd: Path, wf: dict, reg: dict) -> tuple[str, str, int | Non
             return ("fail", reason, None)
 
         if main_status == "success":
-            # CI 安装验证：构建成功后必须通过 repoclosure 验证
+            # CI 门禁：构建成功后必须通过（依赖闭合 + 可安装性 + 编译期依赖）
             ci_result_path = sd / f"pkgs/{PKGNAME}/ci_check_result.json"
             if not ci_result_path.exists():
                 # 防死循环：CI 结果写入路径异常时会无限重跑 verify_install
