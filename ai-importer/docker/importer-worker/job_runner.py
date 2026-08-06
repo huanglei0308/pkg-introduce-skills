@@ -576,7 +576,11 @@ def run_job(r, proj, job_id):
     ros_distro = job.get("ros_distro", "")
     deep_dependency = job.get("deep_dependency", "0") == "1"
     pkgname    = job["pkgname"]
-    pkgname    = _strip_unicode_controls(pkgname)
+    # Unicode 控制字符检查：含控制字符直接拒绝，不静默清理（静默清理会绕过后续白名单）
+    if _strip_unicode_controls(pkgname) != pkgname:
+        _log(r, job_id, f"[安全] pkgname 含非法 Unicode 控制字符，拒绝执行")
+        _finish(r, job_id, "failed", "invalid pkgname: contains control characters")
+        return
     # 归一化：用户可能误传入 RPM 包名（python-numpy），剥离语言前缀还原为上游名
     # ROS 模式跳过：ROS 包名无语言前缀，剥离逻辑会误伤（前端已按 ROS 语义校验）
     if mode != "ros":
@@ -593,7 +597,11 @@ def run_job(r, proj, job_id):
         _finish(r, job_id, "failed", f"invalid pkgname: {pkgname!r}")
         return
     url        = job["url"]
-    url        = _strip_unicode_controls(url)
+    # Unicode 控制字符检查：含控制字符直接拒绝
+    if _strip_unicode_controls(url) != url:
+        _log(r, job_id, f"[安全] url 含非法 Unicode 控制字符，拒绝执行")
+        _finish(r, job_id, "failed", "invalid url: contains control characters")
+        return
     # 校验 url：只允许 http/https，禁止换行（防 prompt 换行注入），长度上限 512
     # 注：ROS 模式 url 允许为空（源码由 rosdistro 索引定位，见 ros_fetch.py），
     # 非空时同样执行格式校验；普通模式空 url 依旧拒绝（scheme '' 不在白名单）
@@ -609,7 +617,11 @@ def run_job(r, proj, job_id):
         _finish(r, job_id, "failed", f"invalid url: {url!r}")
         return
     version    = job.get("version", "")
-    version    = _strip_unicode_controls(version)
+    # Unicode 控制字符检查：含控制字符直接拒绝
+    if _strip_unicode_controls(version) != version:
+        _log(r, job_id, f"[安全] version 含非法 Unicode 控制字符，拒绝执行")
+        _finish(r, job_id, "failed", "invalid version: contains control characters")
+        return
     # 校验 version：只允许合法版本号字符，防止 shell 元字符注入
     if version and not re.fullmatch(r'[a-zA-Z0-9._+\-]{1,64}', version):
         _log(r, job_id, f"[安全] version 格式非法，拒绝执行: {version!r}")
